@@ -60,7 +60,8 @@ const TEXT_WIDTH: usize = 10_000;
 pub struct Ticket {
     /// Issue key as Jira reports it (a moved issue reports its new key).
     pub key: String,
-    /// Issue type name, e.g. `Story`, `Bug`, `Sub-task`.
+    /// Issue type name, e.g. `Story`, `Bug`, `Task` (Cloud sub-tasks are often
+    /// typed `Task` with `subtask: true`).
     pub issue_type: String,
     /// Summary with surrounding whitespace trimmed.
     pub summary: String,
@@ -76,9 +77,9 @@ pub fn parse_issue(json: &Value, epic_link_field: Option<&str>) -> Result<Ticket
     let issue_type = string_at(json, "/fields/issuetype/name")
         .with_context(|| format!("{key}: no issue type"))?;
     let summary = string_at(json, "/fields/summary")
-        .with_context(|| format!("{key}: no summary"))?
-        .trim()
-        .to_string();
+        .map(|summary| summary.trim().to_string())
+        .filter(|summary| !summary.is_empty())
+        .with_context(|| format!("{key}: no summary"))?;
     let description = match json.pointer("/renderedFields/description") {
         Some(Value::String(html)) => {
             Some(html_to_text(html).with_context(|| format!("{key}: description"))?)
@@ -523,12 +524,12 @@ mod tests {
 
         assert_eq!(ticket.key, "GRLD-82584");
         assert_eq!(ticket.issue_type, "Bug");
-        assert_eq!(ticket.summary, "Argus Token PreValidation Problem");
+        assert_eq!(ticket.summary, "Argus Export Validierung Problem");
         assert_eq!(ticket.parent_key, None);
         let description = ticket.description.unwrap();
         assert!(
             description.starts_with(
-                "“Ich denke, das problem ist, dass die Token Pre-Validierung im Argus nur schaut"
+                "“Ich denke, das problem ist, dass die Export-Validierung im Argus nur schaut"
             ),
             "{description}"
         );
@@ -561,8 +562,8 @@ mod tests {
             description.starts_with(
                 "Um mögliche Kollisionen von Privilegien zu erkennen, welche in unterschiedlichen \
                  Java Klassen gepflegt werden, sollte jeder Microservice einen entsprechenden \
-                 Unit-Test einbauen.\n\n## Möglichkeit 1\n\nNutzt die grld-starter Bibliothek: \
-                 [https://git.example.com/acme/grld-starter/src/main/]"
+                 Unit-Test einbauen.\n\n## Möglichkeit 1\n\nNutzt die service-starter Bibliothek: \
+                 [https://git.example.com/acme/service-starter/src/main/]"
             ),
             "{description}"
         );
@@ -589,15 +590,15 @@ mod tests {
         );
         assert!(
             description.contains(
-                "* Ein Nutzer-Privileg \"MANAGE_ORGANIZATION\", über das ein OrganizationAdmin"
+                "* Ein Text-Schlüssel \"ORGANIZATION_TITLE\", über den die Einstellungsseite"
             ),
             "{description}"
         );
         assert!(
             description.ends_with(
-                "  * Da Nutzer und Admin nun das gleiche Privileg haben ist es möglich:\n    \
-                 * Für den Nutzer den Admin Endpunkt aufzurufen (andere Schutzmaßnahmen \
-                 erstmal ignoriert)\n    * Für den Admin den Nutzer-Endpunkt aufzurufen"
+                "  * Da beide Seiten nun den gleichen Schlüssel nutzen ist es möglich:\n    \
+                 * Auf der Einstellungsseite den Admin Text anzuzeigen (andere Fallback-Texte \
+                 erstmal ignoriert)\n    * Auf der Übersichtsseite den Nutzer-Text anzuzeigen"
             ),
             "{description}"
         );
@@ -737,6 +738,30 @@ mod tests {
     }
 
     #[test]
+    fn html_table_keeps_cells_without_borders() {
+        let text = html_to_text(
+            "<table><tr><th>Modul</th><th>Status</th></tr>\
+             <tr><td>Login</td><td>Offen</td></tr>\
+             <tr><td>Export</td><td>Geschlossen</td></tr></table>",
+        )
+        .unwrap();
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        for (line, cells) in lines.iter().zip([
+            ["Modul", "Status"],
+            ["Login", "Offen"],
+            ["Export", "Geschlossen"],
+        ]) {
+            assert!(line.starts_with(cells[0]), "{text}");
+            assert!(line.ends_with(cells[1]), "{text}");
+        }
+        for border in ['|', '─', '│', '┼', '-', '+'] {
+            assert!(!text.contains(border), "{border:?} in {text}");
+        }
+    }
+
+    #[test]
     fn long_paragraph_stays_on_one_line() {
         let paragraph = "word ".repeat(400);
         let text = html_to_text(&format!("<p>{paragraph}</p>")).unwrap();
@@ -749,6 +774,13 @@ mod tests {
         let mut json = fixture("story");
         json["fields"].as_object_mut().unwrap().remove("summary");
 
+        let err = parse_issue(&json, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("GRLD-24229: no summary"),
+            "{err:#}"
+        );
+
+        json["fields"]["summary"] = Value::from(" \t\n");
         let err = parse_issue(&json, None).unwrap_err();
         assert!(
             format!("{err:#}").contains("GRLD-24229: no summary"),

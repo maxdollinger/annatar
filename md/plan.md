@@ -97,7 +97,7 @@ Use `reqwest` with the target's auth. Request `expand=renderedFields` and strip 
 Fetch only missing keys. Record 403/404 as unavailable; back off on 429.
 Runs as a stage of the index build (after history, on the build's transaction, before the single commit; audit R9), so it reads the keys from the in-progress `symbol_tickets`.
 *Done when:* a second run makes no Jira calls.
-*Deviation:* proven against a fake `TicketSource` end to end through `build_index` (no real Jira available to the agent); the real-repo second run with a token was the product owner's check (audit §3.1 step 3, `state.md` open #21) — **closed**: on `argus` the first run fetched all 79 keys, the second made 0 Jira requests. Without Jira (or with `--offline`) the stage makes no requests but still copies already-cached tickets into the index `tickets` table, which `show` reads (D-ac, D-ad).
+*Deviation:* proven against a fake `TicketSource` end to end through `build_index`; the real-repo second run with a token was the product owner's check (audit §3.1 step 3, `state.md` open #21) — **closed**: on `argus` the first run fetched all 79 keys, the second made 0 Jira requests. Without Jira (or with `--offline`) the stage makes no requests but still copies already-cached tickets into the index `tickets` table, which `show` reads (D-ac, D-ad).
 
 ## Phase 4 — LLM summaries
 

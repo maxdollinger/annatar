@@ -13,8 +13,8 @@
       "subtask": false,
       "hierarchyLevel": 0
     },
-    "summary": "Argus Token PreValidation Problem",
-    "description": "“Ich denke, das problem ist, dass die Token Pre-Validierung im Argus nur schaut, ob das jwt an sich gültig ist (signatur und expiration date), aber nicht, ob das token auch noch zu den aktuell gültigen tokens in der DB passt...”\n\n\n\nProblem war, dass ganze Log einträge generiert worden sind durch die PreAuthentication. Wie Oben beschrieben, prüft nur auf gültigkeit des JWTs, jedoch nicht ob das Token zu den aktuell tokens gehört.\n\n\n\n!image-20240513-110026.png|width=1536,height=640,alt=\"image-20240513-110026.png\"!\n\n\n\nSollte gefixt werden…",
+    "summary": "Argus Export Validierung Problem",
+    "description": "“Ich denke, das problem ist, dass die Export-Validierung im Argus nur schaut, ob die datei an sich vollständig ist (header und prüfsumme), aber nicht, ob die zeilen auch noch zu den aktuell gültigen einträgen in der DB passen...”\n\n\n\nProblem war, dass ganze Log einträge generiert worden sind durch den Nachtexport. Wie Oben beschrieben, prüft nur auf vollständigkeit der Datei, jedoch nicht ob jede Zeile zu den aktuellen einträgen gehört.\n\n\n\n!image-20240513-110026.png|width=1536,height=640,alt=\"image-20240513-110026.png\"!\n\n\n\nSollte gefixt werden…",
     "status": {
       "self": "https://jira.example.com/rest/api/2/status/6",
       "name": "Geschlossen",
@@ -31,7 +31,7 @@
   "renderedFields": {
     "issuetype": null,
     "summary": null,
-    "description": "<p>“Ich denke, das problem ist, dass die Token Pre-Validierung im Argus nur schaut, ob das jwt an sich gültig ist (signatur und expiration date), aber nicht, ob das token auch noch zu den aktuell gültigen tokens in der DB passt...”</p>\n\n\n\n<p>Problem war, dass ganze Log einträge generiert worden sind durch die PreAuthentication. Wie Oben beschrieben, prüft nur auf gültigkeit des JWTs, jedoch nicht ob das Token zu den aktuell tokens gehört.</p>\n\n\n\n<p><span class=\"image-wrap\" style=\"\"><img src=\"https://jira.example.com/rest/api/3/attachment/content/68533\" alt=\"image-20240513-110026.png\" height=\"640\" width=\"1536\" style=\"border: 0px solid black\" /></span></p>\n\n\n\n<p>Sollte gefixt werden…</p>",
+    "description": "<p>“Ich denke, das problem ist, dass die Export-Validierung im Argus nur schaut, ob die datei an sich vollständig ist (header und prüfsumme), aber nicht, ob die zeilen auch noch zu den aktuell gültigen einträgen in der DB passen...”</p>\n\n\n\n<p>Problem war, dass ganze Log einträge generiert worden sind durch den Nachtexport. Wie Oben beschrieben, prüft nur auf vollständigkeit der Datei, jedoch nicht ob jede Zeile zu den aktuellen einträgen gehört.</p>\n\n\n\n<p><span class=\"image-wrap\" style=\"\"><img src=\"https://jira.example.com/rest/api/3/attachment/content/1\" alt=\"image-20240513-110026.png\" height=\"640\" width=\"1536\" style=\"border: 0px solid black\" /></span></p>\n\n\n\n<p>Sollte gefixt werden…</p>",
     "status": null,
     "created": "13/Mai/24 12:57 PM",
     "updated": "16/Jul/24 7:29 AM"
