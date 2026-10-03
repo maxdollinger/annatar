@@ -488,7 +488,7 @@ Status of each item as it lands. One commit per item (Conventional Commits);
 | H4 | done | — | 48 | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing |
 | H5 | done | — | 49 | `parse_annotations` returns `Result` with the fqn; `text()` warns (kind/span) and returns empty; corrupt-annotations `show` test |
 | H6 | done | — | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
-| H7 | pending | — | — | |
+| H7 | done | — | 51 | one transaction wraps all symbol writes, committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` |
 | H9 | pending | — | — | |
 | H8 | pending | — | — | |
 
@@ -503,3 +503,11 @@ Status of each item as it lands. One commit per item (Conventional Commits);
   silent ignore. The acceptance still holds — dangling parents are rejected,
   never stored — and a future linking bug now fails loudly. This is the
   intended consequence of enabling the constraint (decision D-c).
+
+- **H7.** The item text and §H7 say `Connection::transaction()` is synchronous
+  ("the begin is synchronous — do not `.await` it"). In the installed libsql
+  0.9.30 it is `pub async fn transaction(&self) -> Result<Transaction>`
+  (`connection.rs:206`), so `build_index` `.await`s the begin. Only
+  `execute`/`commit` were expected to be async; the begin is too. The rest of
+  the design is unchanged: one transaction for all symbol writes, committed
+  before `build.commit()`, dropped on error.

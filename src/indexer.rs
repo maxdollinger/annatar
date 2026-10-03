@@ -63,6 +63,12 @@ pub async fn build_index(
     let mut parser = JavaParser::new()?;
     let mut ids: HashMap<String, i64> = HashMap::new();
 
+    let transaction = build
+        .connection()
+        .transaction()
+        .await
+        .context("starting index transaction")?;
+
     for relative in &files {
         let source = match std::fs::read_to_string(repo.join(relative)) {
             Ok(source) => source,
@@ -88,12 +94,16 @@ pub async fn build_index(
         }
         stats.files += 1;
         for symbol in &parsed.symbols {
-            if write_symbol(build.connection(), relative, &source, symbol, &mut ids).await? {
+            if write_symbol(&transaction, relative, &source, symbol, &mut ids).await? {
                 stats.symbols += 1;
             }
         }
     }
 
+    transaction
+        .commit()
+        .await
+        .context("committing index transaction")?;
     build.commit()?;
     tracing::info!(
         files = stats.files,
