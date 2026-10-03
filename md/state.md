@@ -11,11 +11,28 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H6 De-duplicate `Symbol` construction — **done** |
+| Step | H7 Batch symbol writes in a transaction — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H7 Batch symbol writes in a transaction.** `build_index` now begins one
+  transaction on the build connection after `begin_index` and writes every
+  symbol through it, then commits the transaction before `build.commit()`
+  renames the temp file over `index.db`. A write error drops the transaction
+  (rollback) before the temp file is discarded, so a partial index never
+  replaces a good one. `write_symbol` still takes `&Connection`; the
+  `Transaction` is passed via its `Deref<Target = Connection>`. `last_insert_rowid`
+  stays transaction-local and correct. Kept a local transaction in `build_index`
+  rather than an `IndexBuild::transaction()` guard: ordering stays a readable
+  two-liner and `store.rs` production code is untouched. New store test proves a
+  dropped transaction rolls back (row invisible on the build connection) and the
+  later file-level commit does not resurrect it; the existing indexer tests
+  exercise the committed path and the duplicate-fqn test keeps
+  `UNIQUE` + `INSERT OR IGNORE` inside a transaction green. Note: in libsql
+  0.9.30 `Connection::transaction()` is `async` (contrary to the plan text), so
+  the begin is `.await`ed. Decision D-g (H7). 51 tests, green.
 
 - **H6 De-duplicate `Symbol` construction.** `src/symbols.rs` gains a single
   `build_symbol` factory used by both the type branch of `collect_symbols` and
@@ -162,7 +179,8 @@ the decisions taken, and the tradeoffs behind them.
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
   items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1
-  through H6 are done; next is **H7** (batch symbol writes in a transaction).
+  through H7 are done; next is **H9** (narrow walker pruning of
+  `build`/`generated`), then H8.
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -185,6 +203,7 @@ the decisions taken, and the tradeoffs behind them.
 | H4 Side-effect-free read path | done | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing; 2 reader tests; decision D-d; 48 tests |
 | H5 Surface decode failures | done | corrupt annotations error with the fqn; `text()` warns with kind/span and returns empty; 1 show test; decision D-e; 49 tests |
 | H6 De-duplicate symbol construction | done | one `build_symbol` factory; annotations walked once (texts + signature + role); dead `record_body`/`program` arms removed; 1 record-body test; decision D-f; 50 tests |
+| H7 Batch symbol writes in a transaction | done | one transaction wraps all symbol writes; committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` (no `IndexBuild::transaction()`); 1 store rollback test; decision D-g; 51 tests |
 
 ## Decisions and tradeoffs
 
@@ -240,6 +259,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-d (H4) | `IndexReader::open(data_dir)` returns a read-only reader; `Store::open_index` is removed; `show` no longer opens `Store` | Keep opening read-write and fix only the doc; or keep both open paths | The read path must not create `cache.db`/the data dir; a single read entry point becomes the contract 6.1 reuses. `_db` anchors the connection (decision 18) |
 | D-e (H5) | Corrupt annotation JSON is an error carrying the symbol fqn; `symbols::text` logs `tracing::warn!` (node kind + byte range) and returns empty | Make every text helper fallible | JSON corruption is a real, cheap-to-propagate failure; a UTF-8 failure is impossible for valid tree-sitter spans, so a log is the proportionate signal instead of rippling `Result` through every parser helper |
 | D-f (H6) | One `build_symbol` factory builds every `Symbol`; a declaration's annotation nodes are walked once and the texts, signature and role all derive from that single list (`signature_of` takes the node list, `role_of` the extracted simple names) | Keep the two field literals and let `annotations_of`/`signature_of`/`role_of` each walk/parse independently | Removes the duplicated 15+ field construction and triple annotation traversal without changing any output; the existing `symbols` tests are the regression net. A record's body is a `class_body` resolved via `child_by_field_name("body")`, so the `record_body` arm and the unreachable `program` arm are dead |
+| D-g (H7) | Wrap the whole build in one transaction (local to `build_index`), committed before the temp file is renamed | Per-file transactions; an `IndexBuild::transaction()` guard | Fewest round trips and the audit's first lever for the 2.3 batched baseline. A local transaction keeps the commit-before-`build.commit()` ordering explicit in one function and leaves `store.rs` production code untouched; a guard type would not really enforce ordering any harder. On error the transaction is dropped (rollback) before the temp file is discarded, so nothing partial is ever renamed over `index.db`. In libsql 0.9.30 `Connection::transaction()` is `async`, so the begin is `.await`ed (the plan text said sync) |
 
 ## Open questions
 

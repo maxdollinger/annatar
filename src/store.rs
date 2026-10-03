@@ -274,6 +274,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_transaction_rolls_back_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+
+        {
+            let transaction = build.connection().transaction().await.unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO symbols
+                        (kind, fqn, file, start_line, end_line, signature, content_hash)
+                     VALUES ('class', 'com.acme.Rolled', 'Rolled.java', 1, 1, 'class Rolled', 'hash')",
+                    (),
+                )
+                .await
+                .unwrap();
+            // Dropped without commit: the transaction must roll back.
+        }
+
+        assert_eq!(
+            symbol_count(&build).await,
+            0,
+            "an uncommitted transaction must leave no rows in the temp index"
+        );
+
+        // The later file-level commit must not resurrect the rolled-back row.
+        build.commit().unwrap();
+        let reader = IndexReader::open(dir.path()).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query("SELECT COUNT(*) FROM symbols", ())
+            .await
+            .unwrap();
+        let count = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        assert_eq!(
+            count, 0,
+            "a rolled-back transaction must never reach index.db"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_build_replaces_index_and_aborted_build_keeps_the_old_one() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
