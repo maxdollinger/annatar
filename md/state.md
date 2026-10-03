@@ -10,12 +10,23 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 2 — History and ticket keys (complete) |
-| Step | 2.3 Measure — **done** |
+| Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
+| Step | R0 State repair and Phase 2 deviations — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R0 State repair and Phase 2 deviations.** Added the Phase 2 audit
+  ([`audit_phase_2.md`](./audit_phase_2.md), 37 findings, all verified) and its
+  remediation plan ([`audit_phase_2_plan.md`](./audit_phase_2_plan.md), items
+  R0–R9 plus Phase 3 decisions J0–J9). Discarded an uncommitted formatter pass
+  that had broken four code spans/table cells in this file (finding 17).
+  Phase 2 is now marked **complete with deviations**: 2.2 was verified on a
+  scratch repo and 2.3 measured a synthetic repo (D-p), not the target repo;
+  `plan.md` 2.2/2.3 carry a *Deviation* note and both are closed by audit item
+  R8 (real-repo run, open #18). Docs only; 69 lib + 1 integration tests green,
+  `clippy --all-targets` clean.
 
 - **2.3 Measure.** Recon confirmed git history is essentially the whole index
   cost (on a real 98k-commit repo `git log -L` was ~89 ms/symbol, while the same
@@ -167,7 +178,6 @@ the decisions taken, and the tradeoffs behind them.
   foreign keys), so a future linking bug fails the insert loudly rather than
   silently skipping the row. Decision D-c (H3).
 
-
 - **H2 Bounds-safe `content_hash`.** `content_hash` now uses
   `as_bytes().get(start..end)` and returns `anyhow::Result<String>`; an
   out-of-range span is a hard error naming the symbol fqn and the span, not a
@@ -262,11 +272,12 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 3.1 Fetch and parse: for any ticket key, a `Ticket` with key, issue
-  type, summary, plain-text description and parent/epic key. `reqwest` against
-  the configured Jira base URL/auth, `expand=renderedFields`, strip the HTML to
-  text. Parsing tested against saved JSON fixtures; an `#[ignore]` test fetches
-  a real ticket. Phase 2 is complete; this starts Phase 3 (Jira).
+- Phase 2 audit remediation **R1**: extract a `symbol_history` helper in the
+  indexer — skip a file with no history once (one warning), degrade cache
+  faults to a miss, add `IndexStats.history_skipped` so
+  `hits + misses + skipped == symbols`. Then R2–R7 per
+  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md); Phase 3.1 starts after
+  that (and needs decisions J1, J2, J9).
 
 ## Step log
 
@@ -292,6 +303,7 @@ the decisions taken, and the tradeoffs behind them.
 | 2.1 History for a span | done | `history::history_for_span` over `git log -L`; control-char `--format`; `Commit {sha,date,subject,body}`, newest first; `-L` follows renames, `--follow` rejected; 6 history tests; decision D-k; 57 tests |
 | 2.2 Store history and ticket keys | done | `symbol_commits` + `symbol_tickets`; per-symbol history in the build transaction; pure `history::ticket_keys`; structure-only degradation when `repo` is not a git work tree; `show` lists commits/tickets; `IndexStats.commits/tickets`; 8 new tests; decisions D-l, D-m; 65 tests |
 | 2.3 Measure | done | `history_cache` in `cache.db` keyed by fqn + content hash + file last-commit sha; `HistoryCache`, `file_last_commit`; `IndexStats.history_hits/misses`; synthetic `tests/benchmark.rs` (`#[ignore]`): cold 9.75 s → warm 1.23 s (~8×), 10 %-edit 1.74 s; decisions D-o, D-p; 69 tests |
+| R0 State repair + Phase 2 deviations | done | phase 2 audit + remediation plan added; formatter damage in `state.md` discarded; Phase 2 marked complete with deviations; `plan.md` 2.2/2.3 deviation notes; docs only, 69 tests |
 
 ## Decisions and tradeoffs
 
@@ -378,4 +390,4 @@ the decisions taken, and the tradeoffs behind them.
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
 | 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | open, defer — queued as a small hygiene step (decision D-n); not mixed into 2.2 to keep the step scoped |
 | 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end. |
-| 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | open — validate on a real repo before the Phase 6 agent trial; may force a decision on #13 |
+| 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | open — Phase 2 is marked *complete with deviations* (R0); closed by audit item R8 (real-repo run: symbols, cold/warm time, ticket coverage) before Phase 3.2; may force a decision on #13 |
