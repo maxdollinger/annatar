@@ -18,7 +18,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use libsql::{Connection, params};
+use regex::Regex;
 
+use crate::history::{self, Commit};
 use crate::store::Store;
 use crate::symbols::{JavaParser, Symbol};
 use crate::walk;
@@ -30,6 +32,10 @@ pub struct IndexStats {
     pub files: usize,
     /// Symbol rows written to `symbols`.
     pub symbols: usize,
+    /// Commit rows written to `symbol_commits`.
+    pub commits: usize,
+    /// Ticket-key rows written to `symbol_tickets`.
+    pub tickets: usize,
     /// Files that parsed cleanly but produced no symbols (`package-info.java`).
     pub empty: usize,
     /// Files tree-sitter could not parse, or for which it produced no tree.
@@ -41,21 +47,38 @@ pub struct IndexStats {
 /// Index every production Java file under `repo` into a fresh `index.db`.
 ///
 /// `path_prefix`, when given, limits the run to a part of the repository.
+/// `ticket_regex` extracts Jira keys from commit subjects and bodies; it is
+/// compiled by the caller so a bad pattern fails before the run starts.
+///
+/// When `repo` is not a git work tree the run degrades to a structure-only
+/// index: one warning, no history tables, no error. When it is a repo, a
+/// per-symbol history lookup that fails (an untracked file, say) warns with the
+/// file and is skipped, so one bad file cannot abort the whole index.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
     path_prefix: Option<&Path>,
+    ticket_regex: &Regex,
 ) -> Result<IndexStats> {
     anyhow::ensure!(
         repo.is_dir(),
         "repository path {} is not a directory",
         repo.display()
     );
+    let is_repo = history::is_repository(repo);
+    if !is_repo {
+        tracing::warn!(
+            repo = %repo.display(),
+            "not a git work tree; indexing structure only (no history)"
+        );
+    }
     let files = walk::java_files(repo, path_prefix)?;
     let build = store.begin_index().await?;
     let mut stats = IndexStats {
         files: 0,
         symbols: 0,
+        commits: 0,
+        tickets: 0,
         empty: 0,
         parse_errors: 0,
         unreadable: 0,
@@ -94,8 +117,27 @@ pub async fn build_index(
         }
         stats.files += 1;
         for symbol in &parsed.symbols {
-            if write_symbol(&transaction, relative, &source, symbol, &mut ids).await? {
-                stats.symbols += 1;
+            let Some(symbol_id) =
+                write_symbol(&transaction, relative, &source, symbol, &mut ids).await?
+            else {
+                continue;
+            };
+            stats.symbols += 1;
+            if !is_repo {
+                continue;
+            }
+            match history::history_for_span(repo, relative, symbol.start_line, symbol.end_line) {
+                Ok(commits) => {
+                    attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats)
+                        .await?;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %relative.display(),
+                        error = %err,
+                        "skipping history for symbol"
+                    );
+                }
             }
         }
     }
@@ -108,6 +150,8 @@ pub async fn build_index(
     tracing::info!(
         files = stats.files,
         symbols = stats.symbols,
+        commits = stats.commits,
+        tickets = stats.tickets,
         empty = stats.empty,
         parse_errors = stats.parse_errors,
         unreadable = stats.unreadable,
@@ -116,7 +160,7 @@ pub async fn build_index(
     Ok(stats)
 }
 
-/// Write one symbol, returning whether a new row was inserted.
+/// Write one symbol, returning its new row id, or `None` on a duplicate fqn.
 ///
 /// `parent_id` is looked up from `ids`, which is populated as the pre-order
 /// walk visits each parent. A duplicate fqn is ignored with a warning: the
@@ -128,7 +172,7 @@ async fn write_symbol(
     source: &str,
     symbol: &Symbol,
     ids: &mut HashMap<String, i64>,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     let parent_id = symbol.parent.as_ref().and_then(|parent| ids.get(parent));
     let annotations = serde_json::to_string(&symbol.annotations)
         .context("serializing symbol annotations as JSON")?;
@@ -159,10 +203,91 @@ async fn write_symbol(
 
     if inserted == 0 {
         tracing::warn!(fqn = %symbol.fqn, "duplicate fqn; keeping the first definition");
-        return Ok(false);
+        return Ok(None);
     }
-    ids.insert(symbol.fqn.clone(), conn.last_insert_rowid());
-    Ok(true)
+    let id = conn.last_insert_rowid();
+    ids.insert(symbol.fqn.clone(), id);
+    Ok(Some(id))
+}
+
+/// Write the commits that touched one symbol and the ticket keys they mention.
+///
+/// One `symbol_commits` row per commit (subject kept as the fallback for a
+/// commit with no ticket) and one `symbol_tickets` row per distinct key drawn
+/// from both the subject and the body. A key's dates come from the commit
+/// order, not from comparing the ISO strings: [`Commit`]s arrive newest first
+/// (`git log` order), so the first commit that mentions a key is its most
+/// recent (`last_date`) and the last commit is its oldest (`first_date`), which
+/// is robust to the timezone offsets `%aI` carries.
+async fn attach_history(
+    conn: &Connection,
+    symbol_id: i64,
+    commits: &[Commit],
+    ticket_regex: &Regex,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    for commit in commits {
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO symbol_commits (symbol_id, sha, date, subject)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    symbol_id,
+                    commit.sha.as_str(),
+                    commit.date.as_str(),
+                    commit.subject.as_str(),
+                ],
+            )
+            .await
+            .with_context(|| format!("writing commit {} for symbol {symbol_id}", commit.sha))?;
+        stats.commits += inserted as usize;
+    }
+
+    for (key, first_date, last_date) in ticket_span(commits, ticket_regex) {
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO symbol_tickets
+                    (symbol_id, ticket_key, first_date, last_date)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![symbol_id, key.as_str(), first_date, last_date],
+            )
+            .await
+            .with_context(|| format!("writing ticket {key} for symbol {symbol_id}"))?;
+        stats.tickets += inserted as usize;
+    }
+    Ok(())
+}
+
+/// The distinct ticket keys mentioned across `commits` (newest first), each
+/// with its oldest (`first_date`) and most recent (`last_date`) date.
+fn ticket_span(commits: &[Commit], ticket_regex: &Regex) -> Vec<(String, String, String)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut dates: HashMap<String, (String, String)> = HashMap::new();
+    for commit in commits {
+        let mut text = commit.subject.clone();
+        text.push('\n');
+        text.push_str(&commit.body);
+        for key in history::ticket_keys(ticket_regex, &text) {
+            match dates.get_mut(&key) {
+                // Seen before, so this commit is older: move the first date back.
+                Some((first, _last)) => *first = commit.date.clone(),
+                // First sighting is the newest commit, so it sets both ends.
+                None => {
+                    order.push(key.clone());
+                    dates.insert(key, (commit.date.clone(), commit.date.clone()));
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let (first, last) = dates
+                .remove(&key)
+                .expect("key was recorded on first sighting");
+            (key, first, last)
+        })
+        .collect()
 }
 
 /// A content hash over the Javadoc and the symbol's source. Including the
@@ -197,12 +322,18 @@ fn relative_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_TICKET_REGEX;
     use crate::store::IndexReader;
     use libsql::params;
+    use std::process::Command;
+
+    fn ticket_regex() -> Regex {
+        Regex::new(DEFAULT_TICKET_REGEX).unwrap()
+    }
 
     async fn build(repo: &Path, data_dir: &Path) -> Result<IndexStats> {
         let store = Store::open(data_dir).await.unwrap();
-        build_index(&store, repo, None).await
+        build_index(&store, repo, None, &ticket_regex()).await
     }
 
     async fn id_of(conn: &Connection, fqn: &str) -> i64 {
@@ -450,6 +581,8 @@ public class UserService {
             IndexStats {
                 files: 0,
                 symbols: 0,
+                commits: 0,
+                tickets: 0,
                 empty: 0,
                 parse_errors: 0,
                 unreadable: 0,
@@ -466,7 +599,7 @@ public class UserService {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
 
-        let err = build_index(&store, Path::new("/does/not/exist"), None)
+        let err = build_index(&store, Path::new("/does/not/exist"), None, &ticket_regex())
             .await
             .expect_err("a missing repo path should fail");
 
@@ -536,5 +669,226 @@ public class UserService {
         let reader = IndexReader::open(data.path()).await.unwrap();
         let conn = reader.connection();
         assert_eq!(count(conn).await, 1);
+    }
+
+    fn git(repo: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Annatar Test")
+            .env("GIT_AUTHOR_EMAIL", "annatar@test.invalid")
+            .env("GIT_COMMITTER_NAME", "Annatar Test")
+            .env("GIT_COMMITTER_EMAIL", "annatar@test.invalid");
+        command
+    }
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let output = git(repo).args(args).output().expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(repo: &Path) {
+        git_ok(repo, &["init", "-q"]);
+        git_ok(repo, &["config", "user.email", "annatar@test.invalid"]);
+        git_ok(repo, &["config", "user.name", "Annatar Test"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit(repo: &Path, message: &str, date: &str) {
+        git_ok(repo, &["add", "-A"]);
+        let output = git(repo)
+            .args(["commit", "-q", "-m", message])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A Java file whose method body changes with `value`, so each rewrite
+    /// touches the same lines and `git log -L` sees every commit.
+    fn java(value: i64) -> String {
+        format!(
+            "package com.acme;\n\npublic class Service {{\n    public int value() {{\n        return {value};\n    }}\n}}\n"
+        )
+    }
+
+    async fn index_git_repo(repo: &Path, data: &Path) -> IndexStats {
+        let store = Store::open(data).await.unwrap();
+        build_index(&store, repo, None, &ticket_regex())
+            .await
+            .unwrap()
+    }
+
+    async fn row_count(conn: &Connection, table: &str, symbol_id: i64) -> i64 {
+        let mut rows = conn
+            .query(
+                &format!("SELECT COUNT(*) FROM {table} WHERE symbol_id = ?1"),
+                params![symbol_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    async fn ticket_dates(conn: &Connection, symbol_id: i64, key: &str) -> (String, String) {
+        let mut rows = conn
+            .query(
+                "SELECT first_date, last_date FROM symbol_tickets
+                 WHERE symbol_id = ?1 AND ticket_key = ?2",
+                params![symbol_id, key],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no ticket {key} for symbol {symbol_id}"));
+        (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn git_history_stores_multiple_ticket_keys_with_their_span() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        commit(
+            repo.path(),
+            "GRLD-1 add service",
+            "2024-01-01T00:00:00+01:00",
+        );
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(2));
+        commit(
+            repo.path(),
+            "GRLD-2 refine service\n\nstill GRLD-1",
+            "2024-02-02T00:00:00+02:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = index_git_repo(repo.path(), data.path()).await;
+        assert!(stats.commits >= 2, "both commits are recorded");
+        assert_eq!(
+            stats.tickets, 4,
+            "the class and the method each get both keys"
+        );
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        let class_id = id_of(conn, "com.acme.Service").await;
+        assert_eq!(row_count(conn, "symbol_commits", class_id).await, 2);
+        assert_eq!(
+            ticket_dates(conn, class_id, "GRLD-1").await,
+            (
+                "2024-01-01T00:00:00+01:00".to_string(),
+                "2024-02-02T00:00:00+02:00".to_string()
+            ),
+            "GRLD-1 spans from its first to its last mention"
+        );
+        assert_eq!(
+            ticket_dates(conn, class_id, "GRLD-2").await,
+            (
+                "2024-02-02T00:00:00+02:00".to_string(),
+                "2024-02-02T00:00:00+02:00".to_string()
+            ),
+            "a key mentioned once has equal first and last dates"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_across_commits_yields_one_row() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        commit(repo.path(), "GRLD-7 add", "2024-01-01T00:00:00+01:00");
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(2));
+        commit(repo.path(), "GRLD-7 fix", "2024-03-03T00:00:00-05:00");
+        let data = tempfile::tempdir().unwrap();
+
+        index_git_repo(repo.path(), data.path()).await;
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        let class_id = id_of(conn, "com.acme.Service").await;
+        assert_eq!(
+            row_count(conn, "symbol_tickets", class_id).await,
+            1,
+            "the repeated key is stored once"
+        );
+        assert_eq!(
+            ticket_dates(conn, class_id, "GRLD-7").await,
+            (
+                "2024-01-01T00:00:00+01:00".to_string(),
+                "2024-03-03T00:00:00-05:00".to_string()
+            ),
+            "first date is the older commit, last date the newer"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_without_a_ticket_keeps_the_commit_but_no_ticket_row() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        commit(
+            repo.path(),
+            "no ticket in this message",
+            "2024-01-01T00:00:00+00:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        index_git_repo(repo.path(), data.path()).await;
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        let class_id = id_of(conn, "com.acme.Service").await;
+        assert_eq!(
+            row_count(conn, "symbol_commits", class_id).await,
+            1,
+            "the commit is still stored as the fallback"
+        );
+        assert_eq!(
+            row_count(conn, "symbol_tickets", class_id).await,
+            0,
+            "no key means no ticket row"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_repo_indexes_structure_without_history() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = build(repo.path(), data.path()).await.unwrap();
+
+        assert_eq!(
+            stats.symbols, 2,
+            "the class and its method are still indexed"
+        );
+        assert_eq!(stats.commits, 0);
+        assert_eq!(stats.tickets, 0);
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(
+            row_count(
+                conn,
+                "symbol_commits",
+                id_of(conn, "com.acme.Service").await
+            )
+            .await,
+            0
+        );
     }
 }

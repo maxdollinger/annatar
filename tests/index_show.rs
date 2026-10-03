@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use annatar::config::DEFAULT_TICKET_REGEX;
 use annatar::indexer;
 use annatar::show;
 use annatar::store::{IndexReader, Store};
+use regex::Regex;
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-project")
@@ -12,8 +14,9 @@ fn fixture() -> PathBuf {
 async fn sample_project_indexes_and_show_lists_children() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).await.unwrap();
+    let ticket_regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
 
-    let stats = indexer::build_index(&store, &fixture(), None)
+    let stats = indexer::build_index(&store, &fixture(), None, &ticket_regex)
         .await
         .unwrap();
     assert_eq!(stats.files, 4, "one file per sample type");
