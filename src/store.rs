@@ -176,6 +176,7 @@ impl IndexBuild {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libsql::params;
 
     async fn first_string(conn: &Connection, sql: &str) -> Option<String> {
         let mut rows = conn.query(sql, ()).await.unwrap();
@@ -192,7 +193,7 @@ mod tests {
             .unwrap();
         build
             .connection()
-            .execute(&format!("INSERT INTO {table} VALUES ('{value}')"), ())
+            .execute(&format!("INSERT INTO {table} VALUES (?1)"), params![value])
             .await
             .unwrap();
         build.commit().unwrap();

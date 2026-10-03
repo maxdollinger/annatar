@@ -490,7 +490,7 @@ Status of each item as it lands. One commit per item (Conventional Commits);
 | H6 | done | — | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
 | H7 | done | — | 51 | one transaction wraps all symbol writes, committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` |
 | H9 | done | — | 52 | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample under source root → `generated/`; 1 new walker test |
-| H8 | pending | — | — | |
+| H8 | done | — | 52 | decision 41 wording fixed + deep-nesting open #15; `minimal_without` presence/removal asserts; store test inserts via `params!`; `relative_path` → `replace('\\', "/")`; `Config::load` clones instead of `mem::take` |
 
 ### Deviations from the plan
 

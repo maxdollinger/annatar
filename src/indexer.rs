@@ -191,10 +191,7 @@ fn content_hash(symbol: &Symbol, source: &str) -> Result<String> {
 /// The repo-relative path with `/` separators, e.g.
 /// `src/main/java/com/acme/User.java`.
 fn relative_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(test)]
