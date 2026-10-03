@@ -10,12 +10,30 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 2 — History and ticket keys |
-| Step | 2.2 Store history and ticket keys — **done** |
+| Phase | 2 — History and ticket keys (complete) |
+| Step | 2.3 Measure — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **2.3 Measure.** Recon confirmed git history is essentially the whole index
+  cost (on a real 98k-commit repo `git log -L` was ~89 ms/symbol, while the same
+  sources indexed structure-only in 0.02 s). Added the plan's history cache: a
+  `history_cache` table in `cache.db` keyed by **fqn + content hash + the file's
+  last commit sha**, storing the commits as JSON. `history::HistoryCache`
+  (`get`/`put`) is consulted per symbol; a hit reuses the stored commits with no
+  `git log -L`, a miss/outdated row recomputes and upserts. `history::file_last_commit`
+  does one `git log -1 --format=%H -- <file>` per file (the cheap half of the
+  key). Cache writes go to the cache connection, not the build transaction, so
+  an aborted index cannot roll them back. `Commit` gained serde derives;
+  `IndexStats` gained `history_hits`/`history_misses` (printed by `index`).
+  **Measurement** (synthetic benchmark, the product owner's chosen target;
+  `tests/benchmark.rs`, `#[ignore]`, 200 files × 4 methods = 1000 symbols,
+  20 ticket commits, macos/18 cpus): cold **9.75 s** (0 hits / 1000 misses),
+  warm **1.23 s** (1000 / 0), 10 %-rewritten **1.74 s** (900 / 100) — ~8× on a
+  repeat run, which is plainly acceptable for daily iteration. Decisions D-o, D-p
+  (2.3). 69 lib + 1 integration tests, benchmark ignored, all green.
 
 - **2.2 Store history and ticket keys.** `build_index` now takes the compiled
   `ticket_regex` and, for every symbol it writes, records the commits that
@@ -244,12 +262,11 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2.3 Measure: a full run on the target repo must be fast enough to
-  iterate on daily. The current pipeline shells out to `git log -L` once per
-  symbol (types *and* members), so this step first measures a real run; if it is
-  too slow, add bounded parallelism (one writer) or a `cache.db` history cache
-  keyed by fqn + content hash + the file's last commit sha. Run time goes in the
-  PR.
+- Phase 3.1 Fetch and parse: for any ticket key, a `Ticket` with key, issue
+  type, summary, plain-text description and parent/epic key. `reqwest` against
+  the configured Jira base URL/auth, `expand=renderedFields`, strip the HTML to
+  text. Parsing tested against saved JSON fixtures; an `#[ignore]` test fetches
+  a real ticket. Phase 2 is complete; this starts Phase 3 (Jira).
 
 ## Step log
 
@@ -274,6 +291,7 @@ the decisions taken, and the tradeoffs behind them.
 | H8 Doc drift, test smells and minor cleanups | done | decision 41 wording corrected, deep-nesting open question added; `minimal_without` asserts presence/removal; store helper inserts via `params!`; `relative_path` uses `replace('\\', "/")`; `Config::load` clones instead of `mem::take`; decision D-i; 52 tests |
 | 2.1 History for a span | done | `history::history_for_span` over `git log -L`; control-char `--format`; `Commit {sha,date,subject,body}`, newest first; `-L` follows renames, `--follow` rejected; 6 history tests; decision D-k; 57 tests |
 | 2.2 Store history and ticket keys | done | `symbol_commits` + `symbol_tickets`; per-symbol history in the build transaction; pure `history::ticket_keys`; structure-only degradation when `repo` is not a git work tree; `show` lists commits/tickets; `IndexStats.commits/tickets`; 8 new tests; decisions D-l, D-m; 65 tests |
+| 2.3 Measure | done | `history_cache` in `cache.db` keyed by fqn + content hash + file last-commit sha; `HistoryCache`, `file_last_commit`; `IndexStats.history_hits/misses`; synthetic `tests/benchmark.rs` (`#[ignore]`): cold 9.75 s → warm 1.23 s (~8×), 10 %-edit 1.74 s; decisions D-o, D-p; 69 tests |
 
 ## Decisions and tradeoffs
 
@@ -336,6 +354,8 @@ the decisions taken, and the tradeoffs behind them.
 | D-l (2.2) | The indexer degrades to a structure-only index when `repo` is not a git work tree (one warning), and skips a symbol whose history lookup fails (one warning naming the file); `history_for_span` itself still errors | Fail the whole run on a non-git repo or on any single file's history failure; or require git and initialize git in every unit-test fixture | Keeps the 57 existing non-git temp-dir tests meaningful without a test-wide git rewrite, and matches the product: structure is still useful without history. A single untracked file must not sink a whole index. The strict contract stays on the leaf function so a caller that truly needs history still gets an error |
 | D-m (2.2) | Ticket `first_date`/`last_date` are derived from git's newest-first commit order (first sighting = most recent, later sightings move the first date back), never by comparing ISO strings | Parse dates / compare `%aI` strings lexicographically | `%aI` carries a timezone offset, so lexicographic comparison is wrong across offsets (e.g. `+01:00` vs `-05:00`); git's ordering is already correct and needs no date library. `symbol_commits`/`symbol_tickets` are `UNIQUE` per symbol so `INSERT OR IGNORE` is idempotent |
 | D-n (2.2 decision, deferred) | The git test helpers (`git`/`git_ok`/`init_repo`/`commit`) are currently duplicated in `history`, `indexer` and `show` test modules; consolidating into a `#[cfg(test)]` support module is queued, not done here | Extract now | Keeps step 2.2 scoped (AGENTS: one step = one small PR, no unrelated refactors). Recorded as open question #16 so the hygiene pass does not lose it |
+| D-o (2.3) | `history_cache` in `cache.db`, keyed by fqn + content hash + the file's last commit sha, storing commits as JSON; one row per fqn (upsert on miss); per-file `git log -1` supplies the sha | Key by fqn + content hash only (zero git on a warm run, but blind to history rewrites); key by fqn + span only; bounded parallelism for the cold run | Follows the plan's stated key. The content hash alone would be faster, but the file's last commit sha is what catches a rewrite/revert that leaves the bytes identical (proved by a test). One `git log -1` (~22 ms on the 98k-commit repo) is ~4× cheaper than `-L` and is paid once per file, not per symbol. Parallelism would help only the one-time cold run and is a larger refactor; deferred (open #17) |
+| D-p (2.3) | The measurement target is a **synthetic benchmark repo** (`tests/benchmark.rs`, `#[ignore]`), not a specific real product repo | Measure against `grld-spring-auth` (single-module) or `grld-core` (multi-module, 98k commits) | Product-owner choice: a controlled repo makes the numbers reproducible and independent of a checkout, and avoids the multi-module test-pruning gap (open #13) confounding the measurement. A real-repo end-to-end validation is deferred to Phase 6 (agent trial) or earlier if wanted. Recon numbers on real repos are recorded in the Done entry as context |
 
 ## Open questions
 
@@ -356,4 +376,6 @@ the decisions taken, and the tradeoffs behind them.
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | partially resolved by 2.1 — renamed files are fine (`git log -L` follows renames by default; verified). Remaining: a **dirty** working tree's stored line numbers come from the working copy, while `-L` resolves the range against committed revisions, so uncommitted edits can mis-attribute. 2.2 runs history before/while writing symbols; decide whether to warn on a dirty tree or accept it for the POC |
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
-| 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer` and `show` test modules (three copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | open, defer — queued as a small hygiene step (decision D-n); not mixed into 2.2 to keep the step scoped |
+| 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | open, defer — queued as a small hygiene step (decision D-n); not mixed into 2.2 to keep the step scoped |
+| 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end. |
+| 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | open — validate on a real repo before the Phase 6 agent trial; may force a decision on #13 |

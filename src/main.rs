@@ -72,11 +72,13 @@ async fn main() -> Result<()> {
                 indexer::build_index(&store, &config.repo, cli.path.as_deref(), &ticket_regex)
                     .await?;
             println!(
-                "indexed {} files, {} symbols, {} commits, {} tickets, {} empty, {} parse errors, {} unreadable",
+                "indexed {} files, {} symbols, {} commits, {} tickets, {} history hits, {} history misses, {} empty, {} parse errors, {} unreadable",
                 stats.files,
                 stats.symbols,
                 stats.commits,
                 stats.tickets,
+                stats.history_hits,
+                stats.history_misses,
                 stats.empty,
                 stats.parse_errors,
                 stats.unreadable
