@@ -35,6 +35,10 @@ use crate::config::{ENV_JIRA_EMAIL, ENV_JIRA_TOKEN, JiraConfig};
 /// Per-request timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout for establishing the connection, so an unreachable host fails
+/// fast instead of using the whole request timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Wrap width handed to the HTML converter; wide enough that paragraphs stay
 /// on one line.
 const TEXT_WIDTH: usize = 10_000;
@@ -222,7 +226,7 @@ fn issue_url(base_url: &str, key: &str) -> String {
 }
 
 /// A key is safe to put in the URL path: ASCII letters, digits, `_` and `-`.
-fn is_plain_key(key: &str) -> bool {
+pub(crate) fn is_plain_key(key: &str) -> bool {
     !key.is_empty()
         && key
             .bytes()
@@ -253,6 +257,7 @@ impl JiraClient {
         let auth = Auth::from_config(config)?;
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("building the HTTP client")?;
         Ok(Self {
