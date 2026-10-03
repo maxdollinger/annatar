@@ -5,6 +5,14 @@
 
 Annatar maps a codebase by **intent**: what each class, method and function does, why it exists, and where it is used. The "why" comes from the tickets and commits that shaped the code.
 
+## POC scope
+
+For this proof of concept, Annatar targets:
+
+- **Language:** Java
+- **Ticket system:** Jira
+- **LLM inference and embeddings:** Ollama, for local inference
+
 ## Goals
 
 - **Faster onboarding** for new engineers
