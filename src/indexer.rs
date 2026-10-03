@@ -13,8 +13,8 @@
 //! id supplies each child's `parent_id`. A file that cannot be read or parsed is
 //! counted in its own bucket, never fatal.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use libsql::{Connection, params};
@@ -69,7 +69,9 @@ pub struct IndexStats {
 /// index: one warning, no history tables, no error. When it is a repo, a file
 /// with no commit (untracked) or whose last-commit lookup fails gets one
 /// warning naming it and is indexed without history; a cache fault is treated
-/// as a miss. Neither can abort the whole index.
+/// as a miss. Neither can abort the whole index. A file with uncommitted
+/// changes still gets history, which may be mis-attributed because `-L`
+/// resolves its span against `HEAD`, but that history is never cached.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
@@ -89,6 +91,11 @@ pub async fn build_index(
         );
     }
     let files = walk::java_files(repo, path_prefix)?;
+    let dirty = if is_repo {
+        dirty_files(repo, &files)
+    } else {
+        HashSet::new()
+    };
     let build = store.begin_index().await?;
     let cache = HistoryCache::new(store.cache());
     let mut stats = IndexStats::default();
@@ -152,6 +159,7 @@ pub async fn build_index(
             None
         };
 
+        let cacheable = !dirty.contains(relative);
         for symbol in &parsed.symbols {
             let content_hash = content_hash(symbol, &source)
                 .with_context(|| format!("hashing symbol {}", symbol.fqn))?;
@@ -168,23 +176,30 @@ pub async fn build_index(
                 stats.history_skipped += 1;
                 continue;
             };
-            let commits =
-                match symbol_history(&cache, repo, relative, symbol, &content_hash, last_commit)
-                    .await
-                {
-                    HistoryOutcome::Hit(commits) => {
-                        stats.history_hits += 1;
-                        commits
-                    }
-                    HistoryOutcome::Miss(commits) => {
-                        stats.history_misses += 1;
-                        commits
-                    }
-                    HistoryOutcome::Failed => {
-                        stats.history_skipped += 1;
-                        continue;
-                    }
-                };
+            let commits = match symbol_history(
+                &cache,
+                repo,
+                relative,
+                symbol,
+                &content_hash,
+                last_commit,
+                cacheable,
+            )
+            .await
+            {
+                HistoryOutcome::Hit(commits) => {
+                    stats.history_hits += 1;
+                    commits
+                }
+                HistoryOutcome::Miss(commits) => {
+                    stats.history_misses += 1;
+                    commits
+                }
+                HistoryOutcome::Failed => {
+                    stats.history_skipped += 1;
+                    continue;
+                }
+            };
             attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats).await?;
         }
     }
@@ -210,6 +225,38 @@ pub async fn build_index(
     Ok(stats)
 }
 
+/// The indexed files with uncommitted changes, logged once per run.
+///
+/// If the check itself fails, every file is treated as dirty: the run still
+/// gets history, it just neither reads nor writes the cache.
+fn dirty_files(repo: &Path, files: &[PathBuf]) -> HashSet<PathBuf> {
+    let changed = match history::dirty_files(repo) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "cannot detect uncommitted changes; history cache disabled for this run"
+            );
+            return files.iter().cloned().collect();
+        }
+    };
+    let dirty: HashSet<PathBuf> = files
+        .iter()
+        .filter(|file| changed.contains(*file))
+        .cloned()
+        .collect();
+    if !dirty.is_empty() {
+        tracing::warn!(
+            files = dirty.len(),
+            "uncommitted changes: their history may be mis-attributed and is not cached"
+        );
+        for file in &dirty {
+            tracing::debug!(path = %file.display(), "uncommitted changes");
+        }
+    }
+    dirty
+}
+
 /// Where one symbol's history came from.
 enum HistoryOutcome {
     /// Reused from `history_cache` without a git call.
@@ -221,7 +268,8 @@ enum HistoryOutcome {
 }
 
 /// The commits for one symbol: from the cache when its key still matches,
-/// otherwise from `git log -L`, which then refills the cache.
+/// otherwise from `git log -L`, which then refills the cache. A symbol in a
+/// dirty file (`cacheable == false`) bypasses the cache both ways.
 ///
 /// The cache is disposable, so a read or decode fault is a miss and a failed
 /// write only loses the reuse; both warn and never abort the run. A failed
@@ -233,16 +281,19 @@ async fn symbol_history(
     symbol: &Symbol,
     content_hash: &str,
     last_commit: &str,
+    cacheable: bool,
 ) -> HistoryOutcome {
-    match cache.get(&symbol.fqn, content_hash, last_commit).await {
-        Ok(Some(commits)) => return HistoryOutcome::Hit(commits),
-        Ok(None) => {}
-        Err(err) => {
-            tracing::warn!(
-                fqn = %symbol.fqn,
-                error = format!("{err:#}"),
-                "unreadable history cache row; treating it as a miss"
-            );
+    if cacheable {
+        match cache.get(&symbol.fqn, content_hash, last_commit).await {
+            Ok(Some(commits)) => return HistoryOutcome::Hit(commits),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    fqn = %symbol.fqn,
+                    error = format!("{err:#}"),
+                    "unreadable history cache row; treating it as a miss"
+                );
+            }
         }
     }
     let commits = match history::history_for_span(repo, file, symbol.start_line, symbol.end_line) {
@@ -257,6 +308,9 @@ async fn symbol_history(
             return HistoryOutcome::Failed;
         }
     };
+    if !cacheable {
+        return HistoryOutcome::Miss(commits);
+    }
     if let Err(err) = cache
         .put(&symbol.fqn, content_hash, last_commit, &commits)
         .await
@@ -1110,6 +1164,60 @@ public class UserService {
             cache_count(data.path(), "history_cache").await,
             2,
             "an untracked file is never cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_file_gets_history_but_is_never_cached() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &java_class("Service", 1),
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Clean.java",
+            &java_class("Clean", 1),
+        );
+        commit(
+            repo.path(),
+            "GRLD-1 add services",
+            "2024-01-01T00:00:00+01:00",
+        );
+        // An uncommitted edit that shifts every line of `Service` down.
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &format!("// moved\n// down\n{}", java_class("Service", 1)),
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let dirty = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(dirty.history_misses, 4, "both files still get history");
+        assert_eq!(
+            cache_count(data.path(), "history_cache").await,
+            2,
+            "only the clean file is cached"
+        );
+        let again = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            (again.history_hits, again.history_misses),
+            (2, 2),
+            "the dirty file never reads the cache either"
+        );
+
+        commit(
+            repo.path(),
+            "GRLD-2 move service",
+            "2024-01-02T00:00:00+01:00",
+        );
+        index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            cache_count(data.path(), "history_cache").await,
+            4,
+            "once committed, the file is cached"
         );
     }
 

@@ -11,11 +11,26 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
-| Step | R1 `symbol_history` helper; skip untracked files once; degrade cache faults — **done** |
+| Step | R2 Dirty working tree: history without caching — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R2 Dirty working tree: history without caching.** New
+  `history::dirty_files` runs one `git diff HEAD --name-only -z --relative
+  --no-renames` per run: staged and unstaged changes, as paths relative to
+  `repo` (so they match the walker even when `repo` is a subdirectory of the
+  work tree; untracked files are excluded, they have no history). `build_index`
+  intersects it with the walked files, logs **one** warning with the count
+  (paths at debug) and passes `cacheable = false` to `symbol_history` for those
+  files: they still get `-L` history (approximate, good enough for the `--path`
+  loop) but never read or write `history_cache`, so a mis-attributed result can
+  no longer be cached under `HEAD`'s sha and reused. If the check itself fails
+  (e.g. no `HEAD` yet), every file is treated as dirty for that run. Finding 3;
+  closes open #14. Decision D-r. 3 new tests (2 `dirty_files`, 1 indexer:
+  dirty file uncached on two runs, cached after commit); 74 lib + 1
+  integration tests green, benchmark green.
 
 - **R1 `symbol_history` helper; skip untracked files once; degrade cache
   faults.** The cache get → `git log -L` → cache put sequence, copied twice in
@@ -304,10 +319,11 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2 audit remediation **R2**: detect dirty files once per run
-  (`git status --porcelain`), compute their history but never read or write
-  the cache for them, one summary warning; closes open #14. Then R3, R4, R6,
-  R7 per [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
+- Phase 2 audit remediation **R3**: Javadoc-inclusive history span
+  (decision J0 taken as recommended: count Javadoc-only commits) — `Symbol`
+  gains `history_start_line`, `-L` covers the Javadoc, and `history_cache` is
+  renamed so stale rows are dropped. Then R4, R6, R7 per
+  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
 
 ## Step log
 
@@ -336,6 +352,7 @@ the decisions taken, and the tradeoffs behind them.
 | R0 State repair + Phase 2 deviations | done | phase 2 audit + remediation plan added; formatter damage in `state.md` discarded; Phase 2 marked complete with deviations; `plan.md` 2.2/2.3 deviation notes; docs only, 69 tests |
 | R5 Shared test helpers | done | one `src/test_support.rs` shared by lib tests and `tests/benchmark.rs` (`#[path]`); exact hit/miss benchmark assertions, no timing assertion; debug-build note; resolves open #16 / D-n; decision D-s; 69 tests |
 | R1 `symbol_history` helper | done | one cache → git → cache path; untracked file: one warning, no `-L`; cache read/decode/write faults warn and degrade; `IndexStats: Default` + `history_skipped`; 2 tests (untracked + corrupt row); decision D-q; 71 tests |
+| R2 Dirty working tree | done | `history::dirty_files` (`git diff HEAD --name-only --relative`), once per run; dirty files get history but bypass the cache; one summary warning; closes open #14; decision D-r; 3 tests; 74 tests |
 
 ## Decisions and tradeoffs
 
@@ -402,6 +419,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-p (2.3) | The measurement target is a **synthetic benchmark repo** (`tests/benchmark.rs`, `#[ignore]`), not a specific real product repo | Measure against `grld-spring-auth` (single-module) or `grld-core` (multi-module, 98k commits) | Product-owner choice: a controlled repo makes the numbers reproducible and independent of a checkout, and avoids the multi-module test-pruning gap (open #13) confounding the measurement. A real-repo end-to-end validation is deferred to Phase 6 (agent trial) or earlier if wanted. Recon numbers on real repos are recorded in the Done entry as context |
 | D-s (R5) | One scratch-git helper file, `src/test_support.rs`: a `#[cfg(test)]` module for the lib, included by integration tests via `#[path = "../src/test_support.rs"]` | A second copy in `tests/common/mod.rs`; a `test-support` cargo feature exposing the helpers publicly | `#[path]` gives a single source without widening the public API or adding a feature. The constraint is that the file may depend on `std` only (no `crate::` paths), which the helpers already satisfy |
 | D-q (R1) | Cache faults degrade: an unreadable/undecodable `history_cache` row is a miss (and is rewritten), a failed write warns and keeps the commits. A file with no commit is skipped once with one warning, counted in `history_skipped` | Propagate cache errors (previous behaviour); count skipped symbols as misses | The cache is disposable by the ground rules, so it must never sink an index — the same degrade-don't-abort policy D-l chose for git. A separate `history_skipped` bucket keeps `history_misses` meaning "paid for a `git log -L`", which is what the benchmark and cold-run estimates need |
+| D-r (R2) | Detect files with uncommitted changes once per run (`git diff HEAD --name-only -z --relative --no-renames`); give them `-L` history but never read or write the cache for them; one summary warning. A failed check treats every file as dirty | Skip history for dirty files; map working-copy lines onto `HEAD` via `git diff`; ignore it (status quo) | Skipping would blank history in exactly the `--path` dev loop; line mapping is a lot of machinery for a POC. Not caching is the minimal fix for the real harm (a wrong result persisted under `HEAD`'s sha and reused). `git diff --relative` instead of `git status --porcelain` because its paths are relative to `repo`, not the work-tree root, so a `repo` below the root still matches the walker |
 
 ## Open questions
 
@@ -420,7 +438,7 @@ the decisions taken, and the tradeoffs behind them.
 | 11 | A valid but symbol-less file (e.g. `package-info.java`) is counted `skipped` like a parse error. Distinguish parse-error vs empty? | 1.5 | resolved by H1 — `ParsedFile.parse_error` separates them; `IndexStats` reports `empty` / `parse_errors` / `unreadable` |
 | 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
-| 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | partially resolved by 2.1 — renamed files are fine (`git log -L` follows renames by default; verified). Remaining: a **dirty** working tree's stored line numbers come from the working copy, while `-L` resolves the range against committed revisions, so uncommitted edits can mis-attribute. 2.2 runs history before/while writing symbols; decide whether to warn on a dirty tree or accept it for the POC |
+| 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | resolved by R2 — dirty files get history but never touch the cache; one warning per run (decision D-r) |
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
 | 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | resolved by R5 — `src/test_support.rs`, shared with `tests/benchmark.rs` via `#[path]` (decision D-s) |
 | 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end. |

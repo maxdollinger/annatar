@@ -22,7 +22,8 @@
 //! with `-L`; git rejects it with `fatal: --follow requires exactly one
 //! pathspec`, and it is unnecessary because `-L` already follows.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -107,6 +108,41 @@ pub fn file_last_commit(repo: &Path, file: &Path) -> Result<Option<String>> {
     } else {
         Ok(Some(sha.to_string()))
     }
+}
+
+/// The files under `repo` whose working copy differs from `HEAD`, staged or
+/// not, as paths relative to `repo`.
+///
+/// Spans come from the working copy while `git log -L` resolves them against
+/// `HEAD`, so a dirty file's history can be attributed to the wrong lines. The
+/// caller uses this set, computed once per run, to keep such history out of the
+/// cache. Untracked files are not listed; they have no history at all. A
+/// non-zero git exit (no `HEAD` yet, say) is an error.
+pub fn dirty_files(repo: &Path) -> Result<HashSet<PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "diff",
+            "HEAD",
+            "--name-only",
+            "-z",
+            "--relative",
+            "--no-renames",
+        ])
+        .output()
+        .with_context(|| format!("running git diff HEAD in {}", repo.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git diff HEAD failed: {}", stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect())
 }
 
 /// The persistent history cache in `cache.db`.
@@ -267,7 +303,43 @@ fn parse_records(stdout: &str) -> Vec<Commit> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{commit, init_repo};
+    use crate::test_support::{commit, git_ok, init_repo};
+
+    #[test]
+    fn dirty_files_lists_staged_and_unstaged_changes_relative_to_repo() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let repo = root.path().join("module");
+        for file in ["a.txt", "b.txt", "clean.txt"] {
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::write(repo.join(file), "1\n").unwrap();
+        }
+        std::fs::write(root.path().join("outside.txt"), "1\n").unwrap();
+        commit(root.path(), "initial", "2024-01-01T00:00:00+00:00");
+        std::fs::write(repo.join("a.txt"), "2\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "2\n").unwrap();
+        git_ok(root.path(), &["add", "module/b.txt"]);
+        std::fs::write(repo.join("untracked.txt"), "1\n").unwrap();
+        std::fs::write(root.path().join("outside.txt"), "2\n").unwrap();
+
+        let dirty = dirty_files(&repo).unwrap();
+
+        assert_eq!(
+            dirty,
+            HashSet::from([PathBuf::from("a.txt"), PathBuf::from("b.txt")]),
+            "unstaged and staged edits, relative to `repo`, nothing outside it"
+        );
+    }
+
+    #[test]
+    fn dirty_files_is_empty_for_a_clean_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "1\n");
+        commit(repo.path(), "initial", "2024-01-01T00:00:00+00:00");
+
+        assert!(dirty_files(repo.path()).unwrap().is_empty());
+    }
 
     fn write(repo: &Path, contents: &str) {
         std::fs::write(repo.join("f.txt"), contents).unwrap();
