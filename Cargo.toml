@@ -6,11 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-[dev-dependencies]
-tempfile = "3.27.0"
