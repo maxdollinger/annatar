@@ -11,11 +11,19 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 3 — Jira (in progress); Phase 2 and its audit remediation R0–R9 complete |
-| Step | R9 Staged pipeline — **done** (prerequisite for 3.2); 3.1 done with synthetic fixtures (real-token run pending, J3) |
+| Step | R9 Staged pipeline — **done**, review nits addressed (prerequisite for 3.2); 3.1 done with synthetic fixtures (real-token run pending, J3) |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **R9 review nits.** The stage-level abort test is renamed
+  `aborted_build_after_all_stages_keeps_previous_index_and_no_temp_file` (it
+  drives the stages directly, not `build_index`); the `IndexedFile` doc now
+  says files whose fqns were all duplicates are kept with no rows; R9 docs
+  (Done, D-aa, audit plan §9) record that the uncommitted-changes warning
+  now counts only indexed files. No behaviour change; 103 tests pass (2
+  ignored).
 
 - **R9 Staged pipeline.** `build_index` is now the one orchestrator: it owns
   the `IndexBuild` and a single write transaction on it, runs the stages
@@ -27,8 +35,9 @@ the decisions taken, and the tradeoffs behind them.
   (rollback) and the build (temp file deleted), so the previous `index.db` is
   untouched. `IndexedFile`/`IndexedSymbol` carry the row id, `Symbol` and
   content hash from structure to history. The dirty-file check moved into the
-  history stage. Behaviour-preserving: `IndexStats` and the R1 invariant are
-  unchanged, and a live re-run on `argus` reproduced R8 exactly (960 symbols,
+  history stage and now counts only indexed files (a dirty file that fails
+  to parse no longer triggers the warning). Otherwise behaviour-preserving:
+  `IndexStats` and the R1 invariant are unchanged, and a live re-run on `argus` reproduced R8 exactly (960 symbols,
   2920 commits, 1821 tickets; cold 960 misses, warm 960 hits). Open #19
   decided (D-ab): a `--path` run keeps narrowing the whole index, now with one
   warning (prefix, file count, index path), documented in the README and
@@ -566,6 +575,7 @@ the decisions taken, and the tradeoffs behind them.
 | 3.1 Fetch and parse | done | `jira` module: `Ticket`, pure `parse_issue`, async `JiraClient::fetch` (REST v2, `expand=renderedFields`, 30 s timeout), `Auth` (J1), `FetchError` + `status_error`, `html2text`; `jira.epic_link_field` (J9); `reqwest` 0.13 (`json` + `rustls`); **synthetic** fixtures (J3 deviation, open #20); `#[ignore]` `fetches_real_ticket`; decisions D-w–D-z; 93 tests |
 | 3.1 review fixes | done | body read errors → `Transport`; 403 + `X-Authentication-Denied-Reason` → `Unauthorized` (J6); testable `JiraClient::request`; no unicode strikeout, blank-line runs collapsed; `base_url` validated and trimmed; 401 message per auth mode; more parse/HTML tests; D-x/D-z notes; 101 tests |
 | R9 Staged pipeline | done | `build_index` orchestrates `index_structure` → `index_history` on one `&Transaction`, single commit + rename at the end; stage abort keeps the previous index (test); open #19 decided: `--path` narrows by design, one warning + README/help (D-aa, D-ab); `argus` re-run identical to R8; 103 tests |
+| R9 review nits | done | abort test renamed to match what it exercises; `IndexedFile` doc fixed; R9 docs note the dirty-file warning counts only indexed files; no behaviour change; 103 tests |
 
 ## Decisions and tradeoffs
 
@@ -640,7 +650,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-x (3.1, J2) | `reqwest` 0.13 with `default-features = false`, features `json` + `rustls` (0.13 renamed the old `rustls-tls` feature; it uses aws-lc-rs and the platform certificate verifier), and `html2text` (`plain_no_decorate`, no table borders, no link footnotes) for `renderedFields` HTML. PM default, adopted audit recommendation; product owner may override. | `ureq`/blocking; hand-written HTML stripper; ADF parser via REST v3 | Async fits the tokio runtime and 3.2's bounded concurrency; `html2text` keeps lists, tables and code blocks readable. Accepts the TLS compile cost decision 13 avoided for libSQL. A lighter alternative exists: reqwest `rustls-no-provider` plus `rustls` with the `ring` provider avoids the `aws-lc-sys` build; not adopted for now. `default-features = false` also drops reqwest's `system-proxy` (OS proxy settings); `HTTPS_PROXY`/`HTTP_PROXY` from the environment are still honoured. Plain output avoids `**`/URL noise in LLM prompts |
 | D-y (3.1, J9) | `parent_key` = `fields.parent.key`; only when absent, the optional `jira.epic_link_field` custom field (a string key, or an object with `key`). Unset = ignored. PM default, adopted audit recommendation; product owner may override. | Discover the epic-link field via `/rest/api/2/field`; parent only | Cloud covers it via `parent`; Server/DC opts in without code changes |
 | D-z (3.1, J3) | **Deviation:** fixtures under `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape, `jira.example.com`), not real captures; the real-token run is the `#[ignore]` `jira::tests::fetches_real_ticket` (base URL from `ANNATAR_JIRA_URL` or `annatar.toml`, key from `ANNATAR_JIRA_TEST_KEY`; prints only auth mode, key, type, parent and lengths). Also: REST v2 (works on Cloud and Server/DC), `Ticket.key` is the key Jira returns — a moved issue returns its *new* key, so 3.2 must key the cache by the *requested* key (and `fetches_real_ticket` only logs a mismatch), description `None` when null or blank after conversion, keys outside `[A-Za-z0-9_-]` are rejected before any request | Block 3.1 on a token | No token is available to the agent; parsing is pure, so swapping in real captures only changes test data. Tracked as open #20 |
-| D-aa (R9, J4) | One orchestrator (`build_index`) owns the `IndexBuild` and one write transaction; stages are separate functions taking `&libsql::Transaction` (structure → history now, tickets in 3.2, summaries later), and the transaction commit + atomic rename happen once after the last stage. Stages take `&Transaction` rather than `&Connection`: the type says "you are inside the build's transaction" so a stage cannot be called on the committed index or the cache by mistake, while `Transaction: Deref<Target = Connection>` keeps the existing helpers (`write_symbol`, `attach_history`) unchanged. Structure hands history an in-memory `Vec<IndexedFile>` (row id, `Symbol`, content hash) instead of re-reading `symbols`. PM default, adopted audit recommendation; product owner may override. | Later stages write into the committed `index.db` (breaks temp file + atomic rename); an `IndexBuild::transaction()` guard type; stages re-query `symbols` | Keeps the ground rule and D-g's single-transaction batching; one long write transaction on a private temp file blocks nobody. Structure-then-history instead of interleaved per symbol changes only log order, not results (R8 numbers reproduced). Holding the `Symbol`s for the run is a few MB at most |
+| D-aa (R9, J4) | One orchestrator (`build_index`) owns the `IndexBuild` and one write transaction; stages are separate functions taking `&libsql::Transaction` (structure → history now, tickets in 3.2, summaries later), and the transaction commit + atomic rename happen once after the last stage. Stages take `&Transaction` rather than `&Connection`: the type says "you are inside the build's transaction" so a stage cannot be called on the committed index or the cache by mistake, while `Transaction: Deref<Target = Connection>` keeps the existing helpers (`write_symbol`, `attach_history`) unchanged. Structure hands history an in-memory `Vec<IndexedFile>` (row id, `Symbol`, content hash) instead of re-reading `symbols`. PM default, adopted audit recommendation; product owner may override. | Later stages write into the committed `index.db` (breaks temp file + atomic rename); an `IndexBuild::transaction()` guard type; stages re-query `symbols` | Keeps the ground rule and D-g's single-transaction batching; one long write transaction on a private temp file blocks nobody. Structure-then-history instead of interleaved per symbol changes log order, and the uncommitted-changes warning now counts only indexed files (a dirty file that fails to parse no longer triggers it), not results (R8 numbers reproduced). Holding the `Symbol`s for the run is a few MB at most |
 | D-ab (R9, open #19) | A `--path` run keeps replacing the whole `index.db` with an index of only that prefix (empty if it matches nothing). It now logs one warning (prefix, file count, index path), and the README and the `--path` help say so. No merging. PM default, adopted audit recommendation; product owner may override. | Merge the prefix into the existing index; refuse to replace a full index | `--path` exists for fast prompt iteration (plan ground rules); merging needs stable ids/upserts, which is "Incremental indexing" in Later. Making the narrowing explicit removes the surprise at no cost |
 
 ## Open questions
