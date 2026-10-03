@@ -5,6 +5,7 @@ use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
 use annatar::store::{IndexReader, Store};
+use annatar::tickets::TicketFetch;
 use annatar::{indexer, show};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
@@ -36,7 +37,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Rebuild the index from the repository.
-    Index,
+    Index {
+        /// Make no Jira requests, even when Jira is configured; tickets
+        /// already in cache.db are still used.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Print a symbol and its children.
     Show {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
@@ -65,13 +71,15 @@ async fn main() -> Result<()> {
     );
 
     match &cli.command {
-        Command::Index => {
+        Command::Index { offline } => {
+            let jira = TicketFetch::from_config(config.jira.as_ref(), *offline)?;
             let store = Store::open(&config.data_dir).await?;
             let stats = indexer::build_index(
                 &store,
                 &config.repo,
                 cli.path.as_deref(),
                 &config.ticket_regex,
+                jira.as_ref(),
             )
             .await?;
             println!(
@@ -86,6 +94,16 @@ async fn main() -> Result<()> {
                 stats.empty,
                 stats.parse_errors,
                 stats.unreadable
+            );
+            println!(
+                "tickets: {} keys, {} cached, {} fetched, {} unavailable, {} failed, {} not fetched; {} Jira requests",
+                stats.ticket_keys,
+                stats.ticket_hits,
+                stats.tickets_fetched,
+                stats.tickets_unavailable,
+                stats.tickets_failed,
+                stats.tickets_not_fetched,
+                stats.jira_requests
             );
         }
         Command::Show { fqn } => {

@@ -11,7 +11,9 @@ data_dir = ".annatar"
 # Regex used to find Jira ticket keys in commit messages and bodies.
 ticket_regex = '\bGRLD-\d+\b'
 
-# Jira connection. Optional for now; required once Phase 3 wires Jira fetching.
+# Jira connection. Optional: without it (or without ANNATAR_JIRA_TOKEN)
+# `annatar index` warns once and uses only tickets already in cache.db;
+# `annatar index --offline` does the same even when Jira is configured.
 # Secrets come from the environment, never from this file:
 #   ANNATAR_JIRA_TOKEN  API token (Cloud) or personal access token (Server/DC)
 #   ANNATAR_JIRA_EMAIL  Cloud only; when set, requests use basic auth
@@ -21,6 +23,8 @@ ticket_regex = '\bGRLD-\d+\b'
 # Custom field holding the epic link (Server/DC), used when an issue has no
 # parent. Unset = ignored.
 # epic_link_field = "customfield_10100"
+# Maximum Jira requests in flight while fetching tickets (default 4).
+# concurrency = 4
 
 # Ollama connection. Optional for now; required once Phase 4 wires summaries
 # and embeddings.

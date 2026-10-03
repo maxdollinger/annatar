@@ -16,7 +16,7 @@ async fn sample_project_indexes_and_show_lists_children() {
     let store = Store::open(data.path()).await.unwrap();
     let ticket_regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
 
-    let stats = indexer::build_index(&store, &fixture(), None, &ticket_regex)
+    let stats = indexer::build_index(&store, &fixture(), None, &ticket_regex, None)
         .await
         .unwrap();
     assert_eq!(stats.files, 4, "one file per sample type");

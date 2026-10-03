@@ -10,12 +10,52 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 3 — Jira (in progress); Phase 2 and its audit remediation R0–R9 complete |
-| Step | R9 Staged pipeline — **done**, review nits addressed (prerequisite for 3.2); 3.1 done with synthetic fixtures (real-token run pending, J3) |
+| Phase | 3 — Jira **complete** pending the product owner's token checks (3.1 real fixtures + `fetches_real_ticket`, 3.2 real-repo second-run check); Phase 2 and its audit remediation R0–R9 complete |
+| Step | 3.2 Ticket cache — **done** (fake-source tests; no real Jira available to the agent) |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **3.2 Ticket cache.** A third index stage `index_tickets(&Transaction,
+  cache, Option<&TicketFetch>, &mut stats)` runs after history (git work trees
+  only) on the build transaction, before the single commit. It reads the
+  distinct keys from the in-progress `symbol_tickets`, looks each up in the new
+  `cache.db` table `ticket_cache` (keyed by the **requested** key, D-z; content
+  fields incl. description, `unavailable` + HTTP `status`, `fetched_at` UTC),
+  fetches only the missing ones, and copies every cached entry (key,
+  unavailable, issue type, summary, description, parent key) into the new
+  index table `tickets`. Fetching goes through a `jira::TicketSource` trait
+  (boxed `Send` future, object-safe; `JiraClient` implements it), wrapped in
+  `tickets::TicketFetch` (source + policy). Up to `jira.concurrency` (default
+  4) fetches run as tokio tasks; the stage alone writes the results, as they
+  arrive. Error policy (J6, D-ac): 401 / CAPTCHA-403 (`Unauthorized`) fails
+  the run, nothing cached for it; 403/404 cached unavailable, no expiry; 429
+  retried up to 3 times after `Retry-After` (fallback 5 s doubling, each wait
+  capped at 60 s), then skipped like a transport/5xx/parse error: one warning,
+  counted as failed, never cached, retried next run. `index` without
+  `[jira]` or without `ANNATAR_JIRA_TOKEN` warns once and skips fetching; new
+  `annatar index --offline` skips it even when configured (info log). Both
+  still copy already-cached tickets into the index (J5, D-ac). `show` lists
+  each ticket with `[Type] summary` or `(unavailable)` from the index
+  `tickets` table only. `IndexStats` gains `ticket_keys`, `ticket_hits`,
+  `tickets_fetched`, `tickets_unavailable`, `tickets_failed`,
+  `tickets_not_fetched`, `jira_requests` (the five buckets sum to
+  `ticket_keys`), logged and printed by `index`, so "a second run makes no
+  Jira calls" is visible as `0 Jira requests`. 3.1 carry-over: an empty
+  `fields.parent.key` now falls back to the epic-link field. tokio gains the
+  `time` feature. New tests (fake `TicketSource` counting calls, scripted
+  outcomes, end-to-end through `build_index` on scratch git repos): second
+  run makes no Jira calls (+ `show` output, R1 invariant), failed fetches are
+  not cached and retried, bad credentials fail the run and keep the previous
+  index, offline uses the cache, moved issue cached under the requested key,
+  concurrency peaks at the cap; plus cache round-trip, 429 retry cap, backoff,
+  `from_config` skip paths and validation, empty-parent fallback. 115 tests
+  pass (2 ignored). **`argus` without Jira** (release): the skip path warns
+  once; cold 14.83 s / warm 1.85 s, 960 symbols, 2920 commits, 1821 ticket
+  rows, 79 distinct keys (all `not fetched`, 0 Jira requests) — identical to
+  R8. The real-token run (audit §3.1 step 3) is pending with the product
+  owner.
 
 - **R9 review nits.** The stage-level abort test is renamed
   `aborted_build_after_all_stages_keeps_previous_index_and_no_temp_file` (it
@@ -529,15 +569,13 @@ the decisions taken, and the tradeoffs behind them.
   (`cargo test -- --ignored fetches_real_ticket --nocapture`, audit §3.1),
   replace the synthetic fixtures in `tests/fixtures/jira/` with scrubbed real
   captures (open #20), and report the auth mode and parent/epic field shape.
-  Confirm or override the PM defaults for J1, J2, J4, J9 (D-w–D-y, D-aa) and
-  the open #19 decision (D-ab), and answer J5–J8.
-- **Agent:** 3.2 Ticket cache (needs J5–J8). The ticket stage is a third
-  stage `index_tickets(&Transaction, …)` called by `build_index` after
-  `index_history` and before the commit: it reads the distinct keys from
-  `symbol_tickets` on the build transaction (uncommitted rows are visible
-  there), fetches missing ones into `cache.db`, and copies the reader fields
-  into the index `tickets` table (J8). 3.2 must key the cache by the
-  *requested* key, not `Ticket.key` (D-z).
+  Then run `annatar index` twice on the real repo with the token set (audit
+  §3.1 step 3, open #21): the second run's `tickets:` line must read
+  `0 fetched … 0 Jira requests`; report the ticket counts (fetched,
+  unavailable, failed) and any 401/403/429 seen. Confirm or override the PM
+  defaults for J1, J2, J4, J9 (D-w–D-y, D-aa), the open #19 decision (D-ab)
+  and J5–J8 (D-ac, D-ad).
+- **Agent:** 4.1 LLM client.
 
 ## Step log
 
@@ -576,6 +614,7 @@ the decisions taken, and the tradeoffs behind them.
 | 3.1 review fixes | done | body read errors → `Transport`; 403 + `X-Authentication-Denied-Reason` → `Unauthorized` (J6); testable `JiraClient::request`; no unicode strikeout, blank-line runs collapsed; `base_url` validated and trimmed; 401 message per auth mode; more parse/HTML tests; D-x/D-z notes; 101 tests |
 | R9 Staged pipeline | done | `build_index` orchestrates `index_structure` → `index_history` on one `&Transaction`, single commit + rename at the end; stage abort keeps the previous index (test); open #19 decided: `--path` narrows by design, one warning + README/help (D-aa, D-ab); `argus` re-run identical to R8; 103 tests |
 | R9 review nits | done | abort test renamed to match what it exercises; `IndexedFile` doc fixed; R9 docs note the dirty-file warning counts only indexed files; no behaviour change; 103 tests |
+| 3.2 Ticket cache | done | `index_tickets` stage after history; `ticket_cache` (cache.db, requested key, `fetched_at`) + `tickets` (index.db); `TicketSource` trait + `TicketFetch` (concurrency 4, 429 ×3 retries); 401 fails, 403/404 unavailable, others skipped uncached; `--offline`; `show` prints type/summary; empty parent → epic field; fake-source tests prove a second run makes no Jira calls; `argus` offline run = R8 numbers; 115 tests. Real-token run pending (open #21) |
 
 ## Decisions and tradeoffs
 
@@ -648,10 +687,12 @@ the decisions taken, and the tradeoffs behind them.
 | D-v (R6) | `Config.ticket_regex` is a compiled `Regex` (custom `deserialize_with`); `--path` prunes directories off the prefix path inside the walker's `filter_entry` instead of starting the walk at `repo/prefix` | Keep a `String` plus a cached `Option<Regex>`; start `WalkBuilder` at `repo/prefix` | One compile and one error path, reported by the TOML parser with line/column. The default pattern uses `Regex::new(DEFAULT_TICKET_REGEX).expect(..)`: a constant, covered by the config defaults test, unlike the data-dependent `expect` removed from `ticket_span`. Starting the walk at the prefix with `parents(false)` would silently skip the repo-root `.gitignore`; pruning in `filter_entry` keeps the walk equivalent while still never visiting the rest of the repo |
 | D-w (3.1, J1) | Jira auth: `ANNATAR_JIRA_EMAIL` set (non-empty) → basic `email:token` (Cloud API token); otherwise the token is sent as a bearer PAT (Server/DC). A missing or empty `ANNATAR_JIRA_TOKEN` fails `JiraClient::new`. PM default, adopted audit recommendation; product owner may override. | Cloud only; a separate `auth` config key | Both schemes are a few lines and the existing optional `email` already tells them apart; resolves open #1 |
 | D-x (3.1, J2) | `reqwest` 0.13 with `default-features = false`, features `json` + `rustls` (0.13 renamed the old `rustls-tls` feature; it uses aws-lc-rs and the platform certificate verifier), and `html2text` (`plain_no_decorate`, no table borders, no link footnotes) for `renderedFields` HTML. PM default, adopted audit recommendation; product owner may override. | `ureq`/blocking; hand-written HTML stripper; ADF parser via REST v3 | Async fits the tokio runtime and 3.2's bounded concurrency; `html2text` keeps lists, tables and code blocks readable. Accepts the TLS compile cost decision 13 avoided for libSQL. A lighter alternative exists: reqwest `rustls-no-provider` plus `rustls` with the `ring` provider avoids the `aws-lc-sys` build; not adopted for now. `default-features = false` also drops reqwest's `system-proxy` (OS proxy settings); `HTTPS_PROXY`/`HTTP_PROXY` from the environment are still honoured. Plain output avoids `**`/URL noise in LLM prompts |
-| D-y (3.1, J9) | `parent_key` = `fields.parent.key`; only when absent, the optional `jira.epic_link_field` custom field (a string key, or an object with `key`). Unset = ignored. PM default, adopted audit recommendation; product owner may override. | Discover the epic-link field via `/rest/api/2/field`; parent only | Cloud covers it via `parent`; Server/DC opts in without code changes |
+| D-y (3.1, J9) | `parent_key` = `fields.parent.key`; only when absent (or, since 3.2, empty), the optional `jira.epic_link_field` custom field (a string key, or an object with `key`). Unset = ignored. PM default, adopted audit recommendation; product owner may override. | Discover the epic-link field via `/rest/api/2/field`; parent only | Cloud covers it via `parent`; Server/DC opts in without code changes |
 | D-z (3.1, J3) | **Deviation:** fixtures under `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape, `jira.example.com`), not real captures; the real-token run is the `#[ignore]` `jira::tests::fetches_real_ticket` (base URL from `ANNATAR_JIRA_URL` or `annatar.toml`, key from `ANNATAR_JIRA_TEST_KEY`; prints only auth mode, key, type, parent and lengths). Also: REST v2 (works on Cloud and Server/DC), `Ticket.key` is the key Jira returns — a moved issue returns its *new* key, so 3.2 must key the cache by the *requested* key (and `fetches_real_ticket` only logs a mismatch), description `None` when null or blank after conversion, keys outside `[A-Za-z0-9_-]` are rejected before any request | Block 3.1 on a token | No token is available to the agent; parsing is pure, so swapping in real captures only changes test data. Tracked as open #20 |
 | D-aa (R9, J4) | One orchestrator (`build_index`) owns the `IndexBuild` and one write transaction; stages are separate functions taking `&libsql::Transaction` (structure → history now, tickets in 3.2, summaries later), and the transaction commit + atomic rename happen once after the last stage. Stages take `&Transaction` rather than `&Connection`: the type says "you are inside the build's transaction" so a stage cannot be called on the committed index or the cache by mistake, while `Transaction: Deref<Target = Connection>` keeps the existing helpers (`write_symbol`, `attach_history`) unchanged. Structure hands history an in-memory `Vec<IndexedFile>` (row id, `Symbol`, content hash) instead of re-reading `symbols`. PM default, adopted audit recommendation; product owner may override. | Later stages write into the committed `index.db` (breaks temp file + atomic rename); an `IndexBuild::transaction()` guard type; stages re-query `symbols` | Keeps the ground rule and D-g's single-transaction batching; one long write transaction on a private temp file blocks nobody. Structure-then-history instead of interleaved per symbol changes log order, and the uncommitted-changes warning now counts only indexed files (a dirty file that fails to parse no longer triggers it), not results (R8 numbers reproduced). Holding the `Symbol`s for the run is a few MB at most |
 | D-ab (R9, open #19) | A `--path` run keeps replacing the whole `index.db` with an index of only that prefix (empty if it matches nothing). It now logs one warning (prefix, file count, index path), and the README and the `--path` help say so. No merging. PM default, adopted audit recommendation; product owner may override. | Merge the prefix into the existing index; refuse to replace a full index | `--path` exists for fast prompt iteration (plan ground rules); merging needs stable ids/upserts, which is "Incremental indexing" in Later. Making the narrowing explicit removes the surprise at no cost |
+| D-ac (3.2, J5, J6) | `index` without `[jira]` or without `ANNATAR_JIRA_TOKEN` skips fetching with one warning; `--offline` skips it even when configured (info log). The stage still runs offline: cached tickets are copied into the index, uncached keys are counted `tickets_not_fetched`. Errors: `Unauthorized` (401, CAPTCHA 403) fails the run and is never cached; 403/404 cached unavailable with `status` and `fetched_at`, no expiry (drop `ticket_cache` to refresh); 429 honours `Retry-After` (seconds form) with a 5 s doubling fallback, each wait capped at 60 s, at most 3 retries, then the key is **skipped without caching** (counted failed, retried next run); transport, other statuses, invalid keys and parse errors are likewise skipped with a warning and a count, never cached. Concurrency `jira.concurrency` (default 4, 0 rejected) as tokio tasks; the stage is the only writer. Successful fetches are cached as they arrive, so an aborted run keeps them. PM default, adopted audit recommendation; product owner may override. | Fail the run on 429/5xx; no offline flag; skip the whole stage offline | A flaky or rate-limited Jira should degrade the ticket data, not block the index, and nothing transient may poison the cache; bad credentials would otherwise silently leave every ticket missing. The 60 s cap is an addition so an absurd `Retry-After` cannot stall a run. Using the cache offline keeps `--path`/offline loops informative at zero cost |
+| D-ad (3.2, J7, J8) | Test seam `jira::TicketSource` (object-safe: `fetch` returns a boxed `Send` future), implemented by `JiraClient`; tests use a scripted fake that counts calls and records peak concurrency. Cache table `ticket_cache` (cache.db) keyed by the requested key with issue type, summary, description, parent key, `unavailable`, `status`, `fetched_at`; index table `tickets` (key, unavailable, issue type, summary, description, parent key) for every key in `symbol_tickets` the cache knows. `show` reads only index.db. New `tickets` module holds the cache, fetch policy and retry; the stage lives in `indexer`. PM default, adopted audit recommendation; product owner may override. | `async fn` in trait with generics (not object-safe; would make `build_index` generic); a local HTTP mock server; `show` reading `cache.db` | Boxing one future per request is noise next to an HTTP call, and `Arc<dyn TicketSource>` lets fetches run as `'static` tasks. Keeping description in the index too lets Phase 4 build ticket summaries from index.db alone. The Jira-returned key of a moved issue is not stored (logged at debug) |
 
 ## Open questions
 
@@ -677,3 +718,4 @@ the decisions taken, and the tradeoffs behind them.
 | 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | **resolved** (R8) — `argus` indexed end to end: 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (release), 92.5 % ticket coverage. Single-module, so #13 is still untested by a real repo |
 | 19 | A `--path` run rebuilds `index.db` wholesale, so it leaves an index holding only that prefix, and a missing prefix empties it (`show` then fails repo-wide). Should `--path` merge into the existing index, refuse to replace it, or is narrowing intended and merely undocumented? | R8 | **resolved (R9, D-ab)** — narrowing is intended: `--path` is for fast prompt iteration; the run warns once that it replaces `index.db` with a partial index, and README + `--path` help document it. No merging (would need incremental indexing, Later) |
 | 20 | The 3.1 Jira fixtures are synthetic (no token available to the agent). Replace them with scrubbed real `renderedFields` captures (story, bug, sub-task, epic child, empty description) and confirm the auth mode and parent/epic field shape (J3, audit §3.1). | 3.1 | open — **product owner** |
+| 21 | 3.2 is proven only against a fake `TicketSource`; no real Jira was reachable. Run `annatar index` twice on the real repo with a token: does the second run report `0 Jira requests`, and how many keys come back fetched / unavailable / failed (any 401/403/429)? | 3.2 | open — **product owner** (audit §3.1 step 3) |

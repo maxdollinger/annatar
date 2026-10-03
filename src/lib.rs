@@ -8,4 +8,5 @@ pub mod store;
 pub mod symbols;
 #[cfg(test)]
 mod test_support;
+pub mod tickets;
 pub mod walk;

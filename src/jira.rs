@@ -11,15 +11,19 @@
 //!
 //! The parent key comes from `fields.parent.key` (sub-tasks, and epic children
 //! on Cloud). An optional `jira.epic_link_field` names a custom field that
-//! holds the epic key on Server/DC; it is read only when there is no parent.
+//! holds the epic key on Server/DC; it is read only when there is no parent
+//! (or its key is empty).
 //!
 //! [`FetchError`] keeps the HTTP outcomes 3.2 needs apart: bad credentials,
 //! an unavailable issue, rate limiting and everything else. A 403 carrying
 //! `X-Authentication-Denied-Reason` (Server/DC CAPTCHA after failed logins)
-//! counts as bad credentials. Caching, retries and concurrency are not handled
-//! here.
+//! counts as bad credentials. [`TicketSource`] is the seam the ticket stage
+//! fetches through; caching, retries and concurrency live in
+//! [`crate::tickets`] and the index build, not here.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -63,13 +67,15 @@ pub fn parse_issue(json: &Value, epic_link_field: Option<&str>) -> Result<Ticket
         _ => None,
     }
     .filter(|text| !text.is_empty());
-    let parent_key = string_at(json, "/fields/parent/key").or_else(|| {
-        let field = json.get("fields")?.get(epic_link_field?)?;
-        match field {
-            Value::String(key) => Some(key.clone()),
-            other => other.get("key")?.as_str().map(str::to_string),
-        }
-    });
+    let parent_key = string_at(json, "/fields/parent/key")
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            let field = json.get("fields")?.get(epic_link_field?)?;
+            match field {
+                Value::String(key) => Some(key.clone()),
+                other => other.get("key")?.as_str().map(str::to_string),
+            }
+        });
     Ok(Ticket {
         key,
         issue_type,
@@ -292,6 +298,23 @@ impl JiraClient {
     }
 }
 
+/// The future [`TicketSource::fetch`] returns: boxed so the trait stays
+/// object-safe, `Send` so the ticket stage can run fetches as tasks.
+pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<Ticket, FetchError>> + Send + 'a>>;
+
+/// Where the ticket stage gets issues from: [`JiraClient`] in production, a
+/// scripted fake in tests. One call is one Jira request.
+pub trait TicketSource: Send + Sync {
+    /// Fetch and parse the issue `key`.
+    fn fetch<'a>(&'a self, key: &'a str) -> FetchFuture<'a>;
+}
+
+impl TicketSource for JiraClient {
+    fn fetch<'a>(&'a self, key: &'a str) -> FetchFuture<'a> {
+        Box::pin(JiraClient::fetch(self, key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +422,15 @@ mod tests {
         json["fields"]["parent"]["key"] = Value::from("");
 
         assert_eq!(parse_issue(&json, None).unwrap().parent_key, None);
+    }
+
+    #[test]
+    fn empty_parent_key_falls_back_to_the_epic_link_field() {
+        let mut json = fixture("epic_child");
+        json["fields"]["parent"] = serde_json::json!({ "key": "" });
+
+        let ticket = parse_issue(&json, Some("customfield_10100")).unwrap();
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-300"));
     }
 
     #[test]
@@ -635,6 +667,7 @@ mod tests {
             token: std::env::var(ENV_JIRA_TOKEN).ok(),
             email: std::env::var(ENV_JIRA_EMAIL).ok(),
             epic_link_field: file_jira.and_then(|jira| jira.epic_link_field),
+            concurrency: crate::config::DEFAULT_JIRA_CONCURRENCY,
         };
 
         let client = JiraClient::new(&config).unwrap();

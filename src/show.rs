@@ -3,7 +3,8 @@
 //! [`render`] looks a symbol up by its fully qualified name and prints its
 //! stored fields, then every child — nested types and members, recursively —
 //! sorted by source line. This is the read side of the index: `annatar show`
-//! and later the MCP `get_symbol` tool both build on it.
+//! and later the MCP `get_symbol` tool both build on it. Ticket types and
+//! summaries come from the index `tickets` table, never from `cache.db`.
 
 use std::collections::HashMap;
 
@@ -24,6 +25,12 @@ struct StoredTicket {
     ticket_key: String,
     first_date: String,
     last_date: String,
+}
+
+/// One row of the `tickets` table, as read back for display.
+enum TicketInfo {
+    Available { issue_type: String, summary: String },
+    Unavailable,
 }
 
 /// One row of the `symbols` table, as read back for display.
@@ -66,6 +73,7 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
     let symbols = load_all(conn).await?;
     let commits = load_commits(conn).await?;
     let tickets = load_tickets(conn).await?;
+    let info = load_ticket_info(conn).await?;
     let root = symbols
         .iter()
         .find(|symbol| symbol.fqn == fqn)
@@ -82,7 +90,13 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
     }
 
     let mut out = String::new();
-    write_symbol(root, &children, &commits, &tickets, 0, &mut out)?;
+    let rows = Rows {
+        children: &children,
+        commits: &commits,
+        tickets: &tickets,
+        info: &info,
+    };
+    write_symbol(root, &rows, 0, &mut out)?;
     Ok(out)
 }
 
@@ -145,14 +159,42 @@ async fn load_tickets(conn: &Connection) -> Result<HashMap<i64, Vec<StoredTicket
     Ok(tickets)
 }
 
-fn write_symbol(
-    symbol: &StoredSymbol,
-    children: &HashMap<i64, Vec<&StoredSymbol>>,
-    commits: &HashMap<i64, Vec<StoredCommit>>,
-    tickets: &HashMap<i64, Vec<StoredTicket>>,
-    depth: usize,
-    out: &mut String,
-) -> Result<()> {
+async fn load_ticket_info(conn: &Connection) -> Result<HashMap<String, TicketInfo>> {
+    let mut rows = conn
+        .query(
+            "SELECT key, unavailable, issue_type, summary FROM tickets",
+            (),
+        )
+        .await
+        .context("reading tickets")?;
+    let mut info = HashMap::new();
+    while let Some(row) = rows.next().await.context("reading tickets row")? {
+        let key: String = row.get(0).context("reading tickets.key")?;
+        let unavailable: i64 = row.get(1).context("reading tickets.unavailable")?;
+        let issue_type: Option<String> = row.get(2).context("reading tickets.issue_type")?;
+        let summary: Option<String> = row.get(3).context("reading tickets.summary")?;
+        let ticket = match (unavailable, issue_type, summary) {
+            (0, Some(issue_type), Some(summary)) => TicketInfo::Available {
+                issue_type,
+                summary,
+            },
+            (0, _, _) => anyhow::bail!("tickets row for {key} has content missing"),
+            _ => TicketInfo::Unavailable,
+        };
+        info.insert(key, ticket);
+    }
+    Ok(info)
+}
+
+/// Everything loaded for rendering, keyed by symbol id (or ticket key).
+struct Rows<'a> {
+    children: &'a HashMap<i64, Vec<&'a StoredSymbol>>,
+    commits: &'a HashMap<i64, Vec<StoredCommit>>,
+    tickets: &'a HashMap<i64, Vec<StoredTicket>>,
+    info: &'a HashMap<String, TicketInfo>,
+}
+
+fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut String) -> Result<()> {
     let indent = "  ".repeat(depth);
     let mut header = format!("{indent}{} [{}]", symbol.fqn, symbol.kind);
     if let Some(role) = &symbol.role {
@@ -184,7 +226,7 @@ fn write_symbol(
         }
     }
 
-    if let Some(list) = commits.get(&symbol.id) {
+    if let Some(list) = rows.commits.get(&symbol.id) {
         out.push_str(&format!("{field}- commits:\n"));
         for commit in list {
             let short = short_sha(&commit.sha);
@@ -194,19 +236,27 @@ fn write_symbol(
             ));
         }
     }
-    if let Some(list) = tickets.get(&symbol.id) {
+    if let Some(list) = rows.tickets.get(&symbol.id) {
         out.push_str(&format!("{field}- tickets:\n"));
         for ticket in list {
+            let detail = match rows.info.get(&ticket.ticket_key) {
+                Some(TicketInfo::Available {
+                    issue_type,
+                    summary,
+                }) => format!(" [{issue_type}] {summary}"),
+                Some(TicketInfo::Unavailable) => " (unavailable)".to_string(),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "{field}  {} (first: {}, last: {})\n",
+                "{field}  {} (first: {}, last: {}){detail}\n",
                 ticket.ticket_key, ticket.first_date, ticket.last_date
             ));
         }
     }
 
-    if let Some(list) = children.get(&symbol.id) {
+    if let Some(list) = rows.children.get(&symbol.id) {
         for child in list {
-            write_symbol(child, children, commits, tickets, depth + 1, out)?;
+            write_symbol(child, rows, depth + 1, out)?;
         }
     }
     Ok(())
@@ -252,7 +302,7 @@ public class Widget {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
-        build_index(&store, repo.path(), None, &regex)
+        build_index(&store, repo.path(), None, &regex, None)
             .await
             .unwrap();
         (repo, data)
@@ -345,7 +395,7 @@ com.acme.show.Widget [class]
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
-        build_index(&store, repo.path(), None, &regex)
+        build_index(&store, repo.path(), None, &regex, None)
             .await
             .unwrap();
         drop(store);
