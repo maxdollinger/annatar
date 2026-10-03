@@ -31,8 +31,8 @@ the decisions taken, and the tradeoffs behind them.
   fqn map. `Store::open_index` reads the committed index; `show::render` prints a
   symbol and its descendants recursively. `index`/`show` wired in `main`;
   `content_hash` is blake3 of javadoc + source slice; annotations stored as JSON.
-  Manual run on the fixture project: 4 files, 14 symbols, show works. 39 lib + 1
-  integration test, green; clippy clean.
+  Manual run on the fixture project: 4 files, 14 symbols, show works. 40 tests
+  at the time; clippy clean.
 
 - **1.4 Signature, Javadoc, annotations, Spring role.** `Symbol` gained
   `signature` (declaration without body, annotations removed, whitespace
@@ -51,13 +51,13 @@ the decisions taken, and the tradeoffs behind them.
   differ. Nested-type members carry the nested parent fqn; anonymous/local
   classes contribute nothing. 10 symbols tests; 25 total, green; clippy clean.
 
-- **1.2 Parse types.** `symbols::parse_types(path, source)` returns a `TypeDef`
+- **1.2 Parse types.** `symbols::parse_types(path, source)` returned a `TypeDef`
   per class, interface, enum, record and `@interface`, including nested types:
   package, simple name, dotted fqn, kind, 1-based line span, byte span and
-  parent fqn. `tree-sitter` 0.25 + `tree-sitter-java` 0.23; a file that does not
-  parse is logged and skipped (`Ok(empty)`). Recursion is scoped to type
-  containers so method-local and anonymous classes are excluded. 6 tests; 21
-  total, green; clippy clean.
+  parent fqn (both renamed to `parse_file`/`Symbol` in 1.3). `tree-sitter` 0.25
+  + `tree-sitter-java` 0.23; a file that does not parse is logged and skipped
+  (`Ok(empty)`). Recursion is scoped to type containers so method-local and
+  anonymous classes are excluded. 6 tests; 21 total, green; clippy clean.
 
 - **1.1 File walker.** `walk::java_files(repo, path_prefix)` returns the
   production `.java` files under `repo` as repo-relative, sorted paths. Uses
@@ -71,11 +71,17 @@ the decisions taken, and the tradeoffs behind them.
   relative to the config file's directory, `--path` is a `PathBuf`, and the
   `jira`/`ollama` sections are optional. `Store::begin_index` now returns an
   owned `IndexBuild` with `commit()` (dropping it aborts); `Store` no longer
-  tracks the in-progress build. Added `schema` module (empty table lists for
-  now), a committed example `annatar.toml`, and framed `project.md` as the
-  target with `plan.md` as its POC subset. 9 tests, green; `cargo clippy
-  -D warnings` clean.
+  tracks the in-progress build. Added the `schema` module (its table lists are
+  populated from 1.5), a committed example `annatar.toml`, and framed
+  `project.md` as the target with `plan.md` as its POC subset. 9 tests, green;
+  `cargo clippy -D warnings` clean.
 
+- **0.2 Database files.** `store::Store` opens `<data_dir>/cache.db` once and
+  builds `<data_dir>/index.db` in a temporary file (`tempfile`, same
+  directory) that is atomically renamed on `IndexBuild::commit`. An aborted run
+  drops the temp file and leaves the previous index untouched; a new
+  `begin_index` discards an unfinished one. 4 store tests cover replace,
+  abort, cache survival and no-build finish. 9 tests total, green.
 - **0.1 CLI, config, logging.** `annatar` binary with `clap` subcommands
   `index`, `show`, `search`, `serve` (stubs), global `--path`, `-v` and
   `--config`. `annatar.toml` loaded into a typed `Config` (`repo`, `data_dir`,
@@ -85,12 +91,6 @@ the decisions taken, and the tradeoffs behind them.
   Realigned to the refined plan on 2026-10-03: single `database` path became
   `data_dir` (the two-file `index.db` + `cache.db` layout), and `embedding_dim`
   was removed from config (5.1 reads it from the first embedding response).
-- **0.2 Database files.** `store::Store` opens `<data_dir>/cache.db` once and
-  builds `<data_dir>/index.db` in a temporary file (`tempfile`, same
-  directory) that is atomically renamed on `finish_index`. An aborted run
-  drops the temp file and leaves the previous index untouched; a new
-  `begin_index` discards an unfinished one. 4 store tests cover replace,
-  abort, cache survival and no-build finish. 9 tests total, green.
 
 ### Next
 
@@ -105,7 +105,7 @@ the decisions taken, and the tradeoffs behind them.
 | 0.1 CLI, config, logging | done | `--help` works; 5 config tests green; realigned to refined plan (`data_dir`, no `embedding_dim`) |
 | 0.2 Database files | done | two-file `Store`, temp file + atomic rename; 4 tests |
 | 1.1 File walker | done | `walk::java_files`; `ignore` crate; 6 tests (15 total) |
-| 1.2 Parse types | done | `symbols::parse_types`; tree-sitter 0.25 + tree-sitter-java 0.23; 6 tests (21 total) |
+| 1.2 Parse types | done | `symbols::parse_types` (renamed to `parse_file` in 1.3); tree-sitter 0.25 + tree-sitter-java 0.23; 6 tests (21 total) |
 | 1.3 Methods/constructors | done | unified `Symbol`; fqn `Type#name(params)`, ctors `<init>`; 10 symbols tests (25 total) |
 | 1.4 Text + role | done | signature/javadoc/annotations/role; 17 symbols tests (32 total) |
 | 1.5 Write + show | done | `symbols` table, `indexer::build_index`, `Store::open_index`, `show::render`; 40 tests |
@@ -129,14 +129,14 @@ the decisions taken, and the tradeoffs behind them.
 | 12 | `embedding_dim` dropped from config (refined plan) | Keep it and validate | 5.1 takes the dimension from the first embedding response, so config would only be a second source of truth that can disagree |
 | 13 | libSQL via the `libsql` crate with `default-features = false, features = ["core"]` | Default features (remote, replication, sync, tls) | Only local files are needed; avoids tonic/hyper/rustls and keeps compile times down. Vector functions still live in `libsql-sys` |
 | 14 | Index temp file via `tempfile` in `data_dir`, committed with `NamedTempFile::persist` (rename) | Hand-rolled temp name + `fs::rename` | `persist` is atomic on Unix and deletes the temp file on drop, so an aborted run cleans itself up. Same directory guarantees the same filesystem |
-| 15 | Rely on libSQL local leaving a single file (default `journal_mode=delete`) | WAL for the index, checkpoint + sidecar handling | Verified empirically: closed local db leaves only `index.db`. If the index ever moves to WAL, `finish_index` must checkpoint before rename |
-| 16 | `Store` is async; `tokio` is the runtime | Synchronous wrapper | The `libsql` API is async. `open`/`begin_index` are async, `finish_index` is sync (drop + rename). Tests use `#[tokio::test]` |
+| 15 | Rely on libSQL local leaving a single file (default `journal_mode=delete`) | WAL for the index, checkpoint + sidecar handling | Verified empirically: closed local db leaves only `index.db`. If the index ever moves to WAL, `IndexBuild::commit` must checkpoint before rename |
+| 16 | `Store` is async; `tokio` is the runtime | Synchronous wrapper | The `libsql` API is async. `Store::open`/`begin_index`/`open_index` are async, `IndexBuild::commit` is sync (drop + rename). Tests use `#[tokio::test]` |
 | 17 | `Store` owns no schema in 0.2; it exposes `cache()` and the `begin_index()` connection | Bundle table creation into 0.2 | Each phase adds its own tables (plan). Keeps this step to the file lifecycle and lets schema land with the data it stores |
 | 18 | Drop order: connection fields before their `Database`; `_cache_db` field anchors the cache connection | Rely on `Connection` alone | Explicit and safe: the connection is closed before the database handle; the anchor field is underscore-prefixed to stay intentionally unread |
 | 19 | `repo` and `data_dir` resolve relative to the config file's directory, not the cwd (`Config::load`) | Resolve against the cwd | A config file describes its own repo/data layout, so the same file works from any working directory. Absolute paths are returned unchanged |
 | 20 | `--path` is a `PathBuf` | `String` | It is a filesystem path prefix; parse it as one so the walker (1.1) doesn't re-parse or re-validate |
 | 21 | `jira` and `ollama` are `Option<...>` in `Config` | Keep them required | Phases 1–2 (`index`, `show`) don't talk to Jira or Ollama; requiring them taxes the `--path` iteration loop. A command that needs them will require them once wired (3.x/4.x) |
-| 22 | `Store::begin_index` returns an owned `IndexBuild` with `commit()`; `Store` no longer tracks the in-progress build | Return `&Connection` from `&mut Store`, then `finish_index` on `Store` | The borrow blocked holding the connection across an async pipeline while later calling finish, and mixed a sync finish with an async build. An owned guard survives the whole run and aborting is just a drop |
+| 22 | `Store::begin_index` returns an owned `IndexBuild` with `commit()`; `Store` no longer tracks the in-progress build | Return `&Connection` from `&mut Store`, then finish on `Store` | The borrow blocked holding the connection across an async pipeline while later calling finish, and mixed a sync finish with an async build. An owned guard survives the whole run and aborting is just a drop |
 | 23 | All DDL lives in one `schema` module: `INDEX_TABLES` applied by `begin_index`, `CACHE_TABLES` by `open` | Per-phase DDL scattered in each step | `index.db` is disposable, so no migrations or versioning; one file keeps the whole shape reviewable as phases 1–5 add tables |
 | 24 | A working dummy `annatar.toml` is committed (data dir `.annatar`, gitignored) | No config in the repo | The binary's default config now loads out of the box; secrets still come only from the environment, so the file stays committable |
 | 25 | Generated sources detected by directory name (`generated`, `generated-sources`), pruned anywhere | Parse Maven/Gradle build files | Language/build-system agnostic, cheap, and testable; revisit if a repo names its tree differently |
