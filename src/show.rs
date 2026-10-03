@@ -227,8 +227,8 @@ mod tests {
     use crate::config::DEFAULT_TICKET_REGEX;
     use crate::indexer::build_index;
     use crate::store::{IndexReader, Store};
+    use crate::test_support::{commit, init_repo};
     use regex::Regex;
-    use std::process::Command;
 
     const SOURCE: &str = "\
 package com.acme.show;
@@ -329,53 +329,10 @@ com.acme.show.Widget [class]
         );
     }
 
-    fn git(repo: &std::path::Path) -> Command {
-        let mut command = Command::new("git");
-        command
-            .current_dir(repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "Annatar Test")
-            .env("GIT_AUTHOR_EMAIL", "annatar@test.invalid")
-            .env("GIT_COMMITTER_NAME", "Annatar Test")
-            .env("GIT_COMMITTER_EMAIL", "annatar@test.invalid");
-        command
-    }
-
-    fn git_ok(repo: &std::path::Path, args: &[&str]) {
-        let output = git(repo).args(args).output().expect("git should run");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn commit(repo: &std::path::Path, message: &str, date: &str) {
-        git_ok(repo, &["add", "-A"]);
-        let output = git(repo)
-            .args(["commit", "-q", "-m", message])
-            .env("GIT_AUTHOR_DATE", date)
-            .env("GIT_COMMITTER_DATE", date)
-            .output()
-            .expect("git should run");
-        assert!(
-            output.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     #[tokio::test]
     async fn render_lists_commits_and_tickets_for_a_git_backed_symbol() {
         let repo = tempfile::tempdir().unwrap();
-        git_ok(repo.path(), &["init", "-q"]);
-        git_ok(
-            repo.path(),
-            &["config", "user.email", "annatar@test.invalid"],
-        );
-        git_ok(repo.path(), &["config", "user.name", "Annatar Test"]);
-        git_ok(repo.path(), &["config", "commit.gpgsign", "false"]);
+        init_repo(repo.path());
         let file = repo.path().join("src/main/java/com/acme/show/Widget.java");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, SOURCE).unwrap();

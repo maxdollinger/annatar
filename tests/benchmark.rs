@@ -11,15 +11,13 @@
 //! 3. **changed** — about a tenth of the files rewritten in one new commit, so
 //!    only those files' symbols miss.
 //!
-//! No network, no `--release`, and only cheap, non-timing invariants are
-//! asserted. Run it with:
+//! No network and no `--release`: the timings are from a debug build and
+//! overstate release run time. They are printed, never asserted; only the
+//! exact hit/miss counts are. Run it with:
 //!
 //! ```text
 //! cargo test --test benchmark -- --ignored --nocapture
 //! ```
-//!
-//! The scratch-git helpers are a deliberate fourth copy while open question #16
-//! (a shared test-support module) is deferred.
 
 use std::path::Path;
 use std::process::Command;
@@ -30,6 +28,11 @@ use annatar::indexer::{self, IndexStats};
 use annatar::store::Store;
 use regex::Regex;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use test_support::{commit, init_repo};
+
 /// Java classes generated in the scratch repo.
 const FILES: usize = 200;
 /// Methods per class, so each file yields one type plus this many members.
@@ -38,50 +41,6 @@ const METHODS: usize = 4;
 const COMMITS: usize = 20;
 /// Fraction of files rewritten for the third run (10%).
 const CHANGED_DIVISOR: usize = 10;
-
-fn git(repo: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .current_dir(repo)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Annatar Bench")
-        .env("GIT_AUTHOR_EMAIL", "annatar@bench.invalid")
-        .env("GIT_COMMITTER_NAME", "Annatar Bench")
-        .env("GIT_COMMITTER_EMAIL", "annatar@bench.invalid");
-    command
-}
-
-fn git_ok(repo: &Path, args: &[&str]) {
-    let output = git(repo).args(args).output().expect("git should run");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn init_repo(repo: &Path) {
-    git_ok(repo, &["init", "-q"]);
-    git_ok(repo, &["config", "user.email", "annatar@bench.invalid"]);
-    git_ok(repo, &["config", "user.name", "Annatar Bench"]);
-    git_ok(repo, &["config", "commit.gpgsign", "false"]);
-}
-
-fn commit(repo: &Path, message: &str, date: &str) {
-    git_ok(repo, &["add", "-A"]);
-    let output = git(repo)
-        .args(["commit", "-q", "-m", message])
-        .env("GIT_AUTHOR_DATE", date)
-        .env("GIT_COMMITTER_DATE", date)
-        .output()
-        .expect("git should run");
-    assert!(
-        output.status.success(),
-        "git commit failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 /// A deterministic ISO 8601 date, one minute apart per commit.
 fn date(minute: usize) -> String {
@@ -200,19 +159,22 @@ async fn synthetic_index_benchmark() {
         println!("{name} wall time: {time:?}");
     }
 
-    assert!(cold.history_hits == 0, "a cold run cannot hit the cache");
-    assert_eq!(warm.history_misses, 0, "an unchanged tree must fully hit");
-    assert!(warm.history_hits > 0, "the warm run must hit the cache");
-    assert!(
-        changed.history_misses > 0,
-        "the rewritten files must miss the cache"
+    let symbols = FILES * (METHODS + 1);
+    assert_eq!(cold.symbols, symbols, "every generated symbol is indexed");
+    assert_eq!(
+        (cold.history_hits, cold.history_misses),
+        (0, symbols),
+        "a cold run misses every symbol"
     );
-    assert!(
-        changed.history_misses < warm.history_hits,
-        "only the changed files should miss"
+    assert_eq!(
+        (warm.history_hits, warm.history_misses),
+        (symbols, 0),
+        "an unchanged tree hits every symbol"
     );
-    assert!(
-        warm_time < cold_time,
-        "warm {warm_time:?} should beat cold {cold_time:?}"
+    let changed_symbols = changed_files * (METHODS + 1);
+    assert_eq!(
+        (changed.history_hits, changed.history_misses),
+        (symbols - changed_symbols, changed_symbols),
+        "exactly the rewritten files miss"
     );
 }

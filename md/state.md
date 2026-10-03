@@ -11,11 +11,25 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
-| Step | R0 State repair and Phase 2 deviations — **done** |
+| Step | R5 Shared test helpers; exact benchmark assertions — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R5 Shared test helpers; exact benchmark assertions.** The four copies of
+  the scratch-git helpers (`history`, `indexer`, `show`, `tests/benchmark.rs`)
+  are now one file, `src/test_support.rs` (`git`, `git_ok`, `init_repo`,
+  `commit` returning the new sha). The lib uses it as a `#[cfg(test)]` module;
+  the benchmark includes the same file with `#[path]`, because `#[cfg(test)]`
+  lib items are invisible to `tests/` — so there is one source, not two. `show`'s
+  inline `git init`/config block became `init_repo`. The benchmark no longer
+  asserts `warm < cold` (timing) or loose bounds: it asserts the exact counts
+  (cold 0/1000, warm 1000/0, changed 900/100 hits/misses). Its doc now says the
+  timings are from a debug build and overstate release time. Re-run here
+  (linux, debug): cold 3.41 s, warm 0.39 s, changed 0.72 s. Resolves open #16
+  and D-n (finding 24, 25). Decision D-s. 69 lib + 1 integration tests green,
+  benchmark green.
 
 - **R0 State repair and Phase 2 deviations.** Added the Phase 2 audit
   ([`audit_phase_2.md`](./audit_phase_2.md), 37 findings, all verified) and its
@@ -275,9 +289,8 @@ the decisions taken, and the tradeoffs behind them.
 - Phase 2 audit remediation **R1**: extract a `symbol_history` helper in the
   indexer — skip a file with no history once (one warning), degrade cache
   faults to a miss, add `IndexStats.history_skipped` so
-  `hits + misses + skipped == symbols`. Then R2–R7 per
-  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md); Phase 3.1 starts after
-  that (and needs decisions J1, J2, J9).
+  `hits + misses + skipped == symbols`. Then R2, R3, R4, R6, R7 per
+  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
 
 ## Step log
 
@@ -304,6 +317,7 @@ the decisions taken, and the tradeoffs behind them.
 | 2.2 Store history and ticket keys | done | `symbol_commits` + `symbol_tickets`; per-symbol history in the build transaction; pure `history::ticket_keys`; structure-only degradation when `repo` is not a git work tree; `show` lists commits/tickets; `IndexStats.commits/tickets`; 8 new tests; decisions D-l, D-m; 65 tests |
 | 2.3 Measure | done | `history_cache` in `cache.db` keyed by fqn + content hash + file last-commit sha; `HistoryCache`, `file_last_commit`; `IndexStats.history_hits/misses`; synthetic `tests/benchmark.rs` (`#[ignore]`): cold 9.75 s → warm 1.23 s (~8×), 10 %-edit 1.74 s; decisions D-o, D-p; 69 tests |
 | R0 State repair + Phase 2 deviations | done | phase 2 audit + remediation plan added; formatter damage in `state.md` discarded; Phase 2 marked complete with deviations; `plan.md` 2.2/2.3 deviation notes; docs only, 69 tests |
+| R5 Shared test helpers | done | one `src/test_support.rs` shared by lib tests and `tests/benchmark.rs` (`#[path]`); exact hit/miss benchmark assertions, no timing assertion; debug-build note; resolves open #16 / D-n; decision D-s; 69 tests |
 
 ## Decisions and tradeoffs
 
@@ -365,9 +379,10 @@ the decisions taken, and the tradeoffs behind them.
 | D-k (2.1) | `history_for_span` shells out to `git log -L` and parses a control-char-delimited `--format` (`%x1e`…`%x1d`), returning `Commit { sha, date (ISO `%aI`), subject, body }` newest first | A pure-Rust git implementation; `git blame` + `git show`; diff parsing | `-L` already tracks a line range backwards through history (including renames), which is exactly the per-symbol history 2.2 needs. Control chars can't appear in commit text, so diff hunks after the format record are dropped safely. Newest-first preserves git's order so 2.2 can take the last element as "introduced". A non-zero git exit is surfaced as an error rather than an empty history, so a misconfigured repo fails loudly |
 | D-l (2.2) | The indexer degrades to a structure-only index when `repo` is not a git work tree (one warning), and skips a symbol whose history lookup fails (one warning naming the file); `history_for_span` itself still errors | Fail the whole run on a non-git repo or on any single file's history failure; or require git and initialize git in every unit-test fixture | Keeps the 57 existing non-git temp-dir tests meaningful without a test-wide git rewrite, and matches the product: structure is still useful without history. A single untracked file must not sink a whole index. The strict contract stays on the leaf function so a caller that truly needs history still gets an error |
 | D-m (2.2) | Ticket `first_date`/`last_date` are derived from git's newest-first commit order (first sighting = most recent, later sightings move the first date back), never by comparing ISO strings | Parse dates / compare `%aI` strings lexicographically | `%aI` carries a timezone offset, so lexicographic comparison is wrong across offsets (e.g. `+01:00` vs `-05:00`); git's ordering is already correct and needs no date library. `symbol_commits`/`symbol_tickets` are `UNIQUE` per symbol so `INSERT OR IGNORE` is idempotent |
-| D-n (2.2 decision, deferred) | The git test helpers (`git`/`git_ok`/`init_repo`/`commit`) are currently duplicated in `history`, `indexer` and `show` test modules; consolidating into a `#[cfg(test)]` support module is queued, not done here | Extract now | Keeps step 2.2 scoped (AGENTS: one step = one small PR, no unrelated refactors). Recorded as open question #16 so the hygiene pass does not lose it |
+| D-n (2.2 decision, resolved by R5) | The git test helpers (`git`/`git_ok`/`init_repo`/`commit`) are currently duplicated in `history`, `indexer` and `show` test modules; consolidating into a `#[cfg(test)]` support module is queued, not done here | Extract now | Keeps step 2.2 scoped (AGENTS: one step = one small PR, no unrelated refactors). Recorded as open question #16 so the hygiene pass does not lose it |
 | D-o (2.3) | `history_cache` in `cache.db`, keyed by fqn + content hash + the file's last commit sha, storing commits as JSON; one row per fqn (upsert on miss); per-file `git log -1` supplies the sha | Key by fqn + content hash only (zero git on a warm run, but blind to history rewrites); key by fqn + span only; bounded parallelism for the cold run | Follows the plan's stated key. The content hash alone would be faster, but the file's last commit sha is what catches a rewrite/revert that leaves the bytes identical (proved by a test). One `git log -1` (~22 ms on the 98k-commit repo) is ~4× cheaper than `-L` and is paid once per file, not per symbol. Parallelism would help only the one-time cold run and is a larger refactor; deferred (open #17) |
 | D-p (2.3) | The measurement target is a **synthetic benchmark repo** (`tests/benchmark.rs`, `#[ignore]`), not a specific real product repo | Measure against `grld-spring-auth` (single-module) or `grld-core` (multi-module, 98k commits) | Product-owner choice: a controlled repo makes the numbers reproducible and independent of a checkout, and avoids the multi-module test-pruning gap (open #13) confounding the measurement. A real-repo end-to-end validation is deferred to Phase 6 (agent trial) or earlier if wanted. Recon numbers on real repos are recorded in the Done entry as context |
+| D-s (R5) | One scratch-git helper file, `src/test_support.rs`: a `#[cfg(test)]` module for the lib, included by integration tests via `#[path = "../src/test_support.rs"]` | A second copy in `tests/common/mod.rs`; a `test-support` cargo feature exposing the helpers publicly | `#[path]` gives a single source without widening the public API or adding a feature. The constraint is that the file may depend on `std` only (no `crate::` paths), which the helpers already satisfy |
 
 ## Open questions
 
@@ -388,6 +403,6 @@ the decisions taken, and the tradeoffs behind them.
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | partially resolved by 2.1 — renamed files are fine (`git log -L` follows renames by default; verified). Remaining: a **dirty** working tree's stored line numbers come from the working copy, while `-L` resolves the range against committed revisions, so uncommitted edits can mis-attribute. 2.2 runs history before/while writing symbols; decide whether to warn on a dirty tree or accept it for the POC |
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
-| 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | open, defer — queued as a small hygiene step (decision D-n); not mixed into 2.2 to keep the step scoped |
+| 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | resolved by R5 — `src/test_support.rs`, shared with `tests/benchmark.rs` via `#[path]` (decision D-s) |
 | 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end. |
 | 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | open — Phase 2 is marked *complete with deviations* (R0); closed by audit item R8 (real-repo run: symbols, cold/warm time, ticket coverage) before Phase 3.2; may force a decision on #13 |

@@ -267,57 +267,7 @@ fn parse_records(stdout: &str) -> Vec<Commit> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    fn git(repo: &Path) -> Command {
-        let mut command = Command::new("git");
-        command
-            .current_dir(repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "Annatar Test")
-            .env("GIT_AUTHOR_EMAIL", "annatar@test.invalid")
-            .env("GIT_COMMITTER_NAME", "Annatar Test")
-            .env("GIT_COMMITTER_EMAIL", "annatar@test.invalid");
-        command
-    }
-
-    fn git_ok(repo: &Path, args: &[&str]) {
-        let output = git(repo).args(args).output().expect("git should run");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo(repo: &Path) {
-        git_ok(repo, &["init", "-q"]);
-        git_ok(repo, &["config", "user.email", "annatar@test.invalid"]);
-        git_ok(repo, &["config", "user.name", "Annatar Test"]);
-        git_ok(repo, &["config", "commit.gpgsign", "false"]);
-    }
-
-    /// Stage everything and commit, returning the new commit's full sha.
-    fn commit(repo: &Path, message: &str, date: &str) -> String {
-        git_ok(repo, &["add", "-A"]);
-        let output = git(repo)
-            .args(["commit", "-q", "-m", message])
-            .env("GIT_AUTHOR_DATE", date)
-            .env("GIT_COMMITTER_DATE", date)
-            .output()
-            .expect("git should run");
-        assert!(
-            output.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = git(repo)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("git should run");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
+    use crate::test_support::{commit, init_repo};
 
     fn write(repo: &Path, contents: &str) {
         std::fs::write(repo.join("f.txt"), contents).unwrap();
