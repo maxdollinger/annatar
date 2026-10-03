@@ -17,9 +17,13 @@
 //! [`FetchError`] keeps the HTTP outcomes 3.2 needs apart: bad credentials,
 //! an unavailable issue, rate limiting and everything else. A 403 carrying
 //! `X-Authentication-Denied-Reason` (Server/DC CAPTCHA after failed logins)
-//! counts as bad credentials. [`TicketSource`] is the seam the ticket stage
-//! fetches through; caching, retries and concurrency live in
-//! [`crate::tickets`] and the index build, not here.
+//! counts as bad credentials, and so does a 401 or 403 whose body is Jira
+//! Cloud's "Failed to parse Connect Session Auth Token" (Cloud's answer to a
+//! bearer token). [`JiraClient::check_auth`] calls `GET /rest/api/2/myself`
+//! once before the ticket stage fetches, so credentials Jira rejects with a
+//! plain 403 cannot be mistaken for unavailable issues. [`TicketSource`] is
+//! the seam the ticket stage fetches through; caching, retries and
+//! concurrency live in [`crate::tickets`] and the index build, not here.
 
 use std::fmt;
 use std::future::Future;
@@ -144,10 +148,12 @@ impl Auth {
 /// Why fetching an issue failed.
 #[derive(Debug)]
 pub enum FetchError {
-    /// 401, or 403 with `X-Authentication-Denied-Reason`: credentials missing
-    /// or wrong. Must never be cached. `basic` names the auth mode for the
-    /// message.
-    Unauthorized { basic: bool },
+    /// 401, a 403 with `X-Authentication-Denied-Reason` or Cloud's Connect
+    /// token error, or any 401/403 from the auth check: credentials missing,
+    /// wrong or of the wrong kind. Must never be cached. `basic` names the
+    /// auth mode for the message; `cloud` is set when the response showed the
+    /// server is Jira Cloud.
+    Unauthorized { basic: bool, cloud: bool },
     /// 403 or 404: the issue does not exist or is not visible to this account.
     Unavailable { status: u16 },
     /// 429: back off, for `retry_after` when Jira sent a seconds value.
@@ -165,13 +171,23 @@ pub enum FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unauthorized { basic: true } => write!(
+            Self::Unauthorized { basic: true, .. } => write!(
                 f,
                 "Jira rejected the credentials; check {ENV_JIRA_TOKEN} and {ENV_JIRA_EMAIL}"
             ),
-            Self::Unauthorized { basic: false } => {
-                write!(f, "Jira rejected the credentials; check {ENV_JIRA_TOKEN}")
-            }
+            Self::Unauthorized {
+                basic: false,
+                cloud: true,
+            } => write!(
+                f,
+                "Jira rejected the credentials; this is Jira Cloud, which does not accept a \
+                 bearer token: set {ENV_JIRA_EMAIL} to the account email so {ENV_JIRA_TOKEN} \
+                 (an API token) is sent as basic auth"
+            ),
+            Self::Unauthorized {
+                basic: false,
+                cloud: false,
+            } => write!(f, "Jira rejected the credentials; check {ENV_JIRA_TOKEN}"),
             Self::Unavailable { status } => write!(f, "issue unavailable (HTTP {status})"),
             Self::RateLimited {
                 retry_after: Some(wait),
@@ -198,13 +214,26 @@ impl std::error::Error for FetchError {
 /// (e.g. CAPTCHA after repeated failures).
 const AUTH_DENIED_REASON: &str = "x-authentication-denied-reason";
 
-/// Map a non-success status and its headers to a [`FetchError`]; `None` for
-/// 2xx. `basic` is the auth mode, carried into [`FetchError::Unauthorized`].
-fn status_error(status: u16, headers: &HeaderMap, basic: bool) -> Option<FetchError> {
+/// What Jira Cloud answers a request whose bearer token it cannot read.
+const CLOUD_CONNECT_TOKEN_ERROR: &[u8] = b"Connect Session Auth Token";
+
+/// Whether an error body is Jira Cloud's answer to an unreadable bearer token.
+fn is_cloud_token_error(body: &[u8]) -> bool {
+    body.windows(CLOUD_CONNECT_TOKEN_ERROR.len())
+        .any(|window| window == CLOUD_CONNECT_TOKEN_ERROR)
+}
+
+/// Map a non-success status, its headers and its body to a [`FetchError`];
+/// `None` for 2xx. `basic` is the auth mode, carried into
+/// [`FetchError::Unauthorized`].
+fn status_error(status: u16, headers: &HeaderMap, body: &[u8], basic: bool) -> Option<FetchError> {
+    let cloud = is_cloud_token_error(body);
     match status {
         200..=299 => None,
-        401 => Some(FetchError::Unauthorized { basic }),
-        403 if headers.contains_key(AUTH_DENIED_REASON) => Some(FetchError::Unauthorized { basic }),
+        401 => Some(FetchError::Unauthorized { basic, cloud }),
+        403 if cloud || headers.contains_key(AUTH_DENIED_REASON) => {
+            Some(FetchError::Unauthorized { basic, cloud })
+        }
         403 | 404 => Some(FetchError::Unavailable { status }),
         429 => Some(FetchError::RateLimited {
             retry_after: headers
@@ -217,12 +246,35 @@ fn status_error(status: u16, headers: &HeaderMap, basic: bool) -> Option<FetchEr
     }
 }
 
+/// Map the auth check's status to a [`FetchError`]; `None` for 2xx. Unlike
+/// [`status_error`], any 403 is bad credentials: `myself` exists for every
+/// account that may log in.
+fn auth_check_error(
+    status: u16,
+    headers: &HeaderMap,
+    body: &[u8],
+    basic: bool,
+) -> Option<FetchError> {
+    match status {
+        401 | 403 => Some(FetchError::Unauthorized {
+            basic,
+            cloud: is_cloud_token_error(body),
+        }),
+        _ => status_error(status, headers, body, basic),
+    }
+}
+
 /// The issue URL for `key` under `base_url`.
 fn issue_url(base_url: &str, key: &str) -> String {
     format!(
         "{}/rest/api/2/issue/{key}?expand=renderedFields",
         base_url.trim_end_matches('/')
     )
+}
+
+/// The auth check URL under `base_url`.
+fn myself_url(base_url: &str) -> String {
+    format!("{}/rest/api/2/myself", base_url.trim_end_matches('/'))
 }
 
 /// A key is safe to put in the URL path: ASCII letters, digits, `_` and `-`.
@@ -270,20 +322,41 @@ impl JiraClient {
 
     /// Fetch and parse one issue.
     pub async fn fetch(&self, key: &str) -> Result<Ticket, FetchError> {
-        let request = self.request(key)?;
+        let body = self.send(self.request(key)?, status_error).await?;
+        let json: Value =
+            serde_json::from_slice(&body).map_err(|err| FetchError::Parse(anyhow!(err)))?;
+        parse_issue(&json, self.epic_link_field.as_deref()).map_err(FetchError::Parse)
+    }
+
+    /// Check that Jira accepts the credentials: `GET /rest/api/2/myself`.
+    /// 401 and 403 are [`FetchError::Unauthorized`].
+    pub async fn check_auth(&self) -> Result<(), FetchError> {
+        self.send(self.myself_request()?, auth_check_error)
+            .await
+            .map(drop)
+    }
+
+    /// Send `request` and return the body of a 2xx response; other statuses
+    /// go through `map_status`.
+    async fn send(
+        &self,
+        request: reqwest::Request,
+        map_status: fn(u16, &HeaderMap, &[u8], bool) -> Option<FetchError>,
+    ) -> Result<Vec<u8>, FetchError> {
         let response = self
             .http
             .execute(request)
             .await
             .map_err(FetchError::Transport)?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = response.bytes().await;
         let basic = matches!(self.auth, Auth::Basic { .. });
-        if let Some(err) = status_error(response.status().as_u16(), response.headers(), basic) {
+        let error_body = body.as_deref().unwrap_or_default();
+        if let Some(err) = map_status(status, &headers, error_body, basic) {
             return Err(err);
         }
-        let body = response.bytes().await.map_err(FetchError::Transport)?;
-        let json: Value =
-            serde_json::from_slice(&body).map_err(|err| FetchError::Parse(anyhow!(err)))?;
-        parse_issue(&json, self.epic_link_field.as_deref()).map_err(FetchError::Parse)
+        body.map(Vec::from).map_err(FetchError::Transport)
     }
 
     /// The authenticated issue request for `key`, built but not sent.
@@ -291,10 +364,17 @@ impl JiraClient {
         if !is_plain_key(key) {
             return Err(FetchError::InvalidKey(key.to_string()));
         }
-        let request = self
-            .http
-            .get(issue_url(&self.base_url, key))
-            .header(ACCEPT, "application/json");
+        self.get(issue_url(&self.base_url, key))
+    }
+
+    /// The authenticated auth-check request, built but not sent.
+    fn myself_request(&self) -> Result<reqwest::Request, FetchError> {
+        self.get(myself_url(&self.base_url))
+    }
+
+    /// An authenticated JSON `GET` of `url`, built but not sent.
+    fn get(&self, url: String) -> Result<reqwest::Request, FetchError> {
+        let request = self.http.get(url).header(ACCEPT, "application/json");
         let request = match &self.auth {
             Auth::Basic { email, token } => request.basic_auth(email, Some(token)),
             Auth::Bearer { token } => request.bearer_auth(token),
@@ -307,16 +387,26 @@ impl JiraClient {
 /// object-safe, `Send` so the ticket stage can run fetches as tasks.
 pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<Ticket, FetchError>> + Send + 'a>>;
 
+/// The future [`TicketSource::check_auth`] returns.
+pub type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<(), FetchError>> + Send + 'a>>;
+
 /// Where the ticket stage gets issues from: [`JiraClient`] in production, a
 /// scripted fake in tests. One call is one Jira request.
 pub trait TicketSource: Send + Sync {
     /// Fetch and parse the issue `key`.
     fn fetch<'a>(&'a self, key: &'a str) -> FetchFuture<'a>;
+
+    /// Check that the credentials are accepted, before any fetch.
+    fn check_auth(&self) -> CheckFuture<'_>;
 }
 
 impl TicketSource for JiraClient {
     fn fetch<'a>(&'a self, key: &'a str) -> FetchFuture<'a> {
         Box::pin(JiraClient::fetch(self, key))
+    }
+
+    fn check_auth(&self) -> CheckFuture<'_> {
+        Box::pin(JiraClient::check_auth(self))
     }
 }
 
@@ -535,33 +625,37 @@ mod tests {
     #[test]
     fn statuses_map_to_distinct_errors() {
         let none = HeaderMap::new();
-        assert!(status_error(200, &none, false).is_none());
+        assert!(status_error(200, &none, b"", false).is_none());
         assert!(matches!(
-            status_error(401, &none, true),
-            Some(FetchError::Unauthorized { basic: true })
+            status_error(401, &none, b"", true),
+            Some(FetchError::Unauthorized {
+                basic: true,
+                cloud: false
+            })
         ));
         assert!(matches!(
-            status_error(403, &none, false),
+            status_error(403, &none, b"", false),
             Some(FetchError::Unavailable { status: 403 })
         ));
         assert!(matches!(
-            status_error(404, &none, false),
+            status_error(404, &none, b"", false),
             Some(FetchError::Unavailable { status: 404 })
         ));
         assert!(matches!(
-            status_error(429, &headers(&[("retry-after", " 17 ")]), false),
+            status_error(429, &headers(&[("retry-after", " 17 ")]), b"", false),
             Some(FetchError::RateLimited { retry_after: Some(wait) }) if wait == Duration::from_secs(17)
         ));
         assert!(matches!(
             status_error(
                 429,
                 &headers(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]),
+                b"",
                 false
             ),
             Some(FetchError::RateLimited { retry_after: None })
         ));
         assert!(matches!(
-            status_error(500, &none, false),
+            status_error(500, &none, b"", false),
             Some(FetchError::Status { status: 500 })
         ));
     }
@@ -574,20 +668,98 @@ mod tests {
         )]);
 
         assert!(matches!(
-            status_error(403, &denied, false),
-            Some(FetchError::Unauthorized { basic: false })
+            status_error(403, &denied, b"", false),
+            Some(FetchError::Unauthorized {
+                basic: false,
+                cloud: false
+            })
         ));
     }
 
     #[test]
     fn unauthorized_names_the_email_only_in_basic_mode() {
-        let basic = FetchError::Unauthorized { basic: true }.to_string();
+        let basic = FetchError::Unauthorized {
+            basic: true,
+            cloud: false,
+        }
+        .to_string();
         assert!(basic.contains(ENV_JIRA_TOKEN), "{basic}");
         assert!(basic.contains(ENV_JIRA_EMAIL), "{basic}");
 
-        let bearer = FetchError::Unauthorized { basic: false }.to_string();
+        let bearer = FetchError::Unauthorized {
+            basic: false,
+            cloud: false,
+        }
+        .to_string();
         assert!(bearer.contains(ENV_JIRA_TOKEN), "{bearer}");
         assert!(!bearer.contains(ENV_JIRA_EMAIL), "{bearer}");
+    }
+
+    const CLOUD_BEARER_BODY: &[u8] = br#"{"error": "Failed to parse Connect Session Auth Token"}"#;
+
+    #[test]
+    fn cloud_connect_token_error_is_unauthorized_not_unavailable() {
+        let none = HeaderMap::new();
+
+        assert!(matches!(
+            status_error(403, &none, CLOUD_BEARER_BODY, false),
+            Some(FetchError::Unauthorized {
+                basic: false,
+                cloud: true
+            })
+        ));
+        assert!(matches!(
+            status_error(403, &none, br#"{"errorMessages":["no permission"]}"#, false),
+            Some(FetchError::Unavailable { status: 403 })
+        ));
+    }
+
+    #[test]
+    fn auth_check_treats_any_401_or_403_as_unauthorized() {
+        let none = HeaderMap::new();
+
+        assert!(auth_check_error(200, &none, b"{}", false).is_none());
+        for status in [401, 403] {
+            assert!(matches!(
+                auth_check_error(status, &none, b"", true),
+                Some(FetchError::Unauthorized {
+                    basic: true,
+                    cloud: false
+                })
+            ));
+        }
+        assert!(matches!(
+            auth_check_error(403, &none, CLOUD_BEARER_BODY, false),
+            Some(FetchError::Unauthorized {
+                basic: false,
+                cloud: true
+            })
+        ));
+        assert!(matches!(
+            auth_check_error(404, &none, b"", false),
+            Some(FetchError::Unavailable { status: 404 })
+        ));
+        assert!(matches!(
+            auth_check_error(503, &none, b"", false),
+            Some(FetchError::Status { status: 503 })
+        ));
+        assert!(matches!(
+            auth_check_error(429, &none, b"", false),
+            Some(FetchError::RateLimited { .. })
+        ));
+    }
+
+    #[test]
+    fn cloud_bearer_rejection_hints_at_the_email() {
+        let message = FetchError::Unauthorized {
+            basic: false,
+            cloud: true,
+        }
+        .to_string();
+
+        assert!(message.contains("Jira Cloud"), "{message}");
+        assert!(message.contains(ENV_JIRA_EMAIL), "{message}");
+        assert!(message.contains(ENV_JIRA_TOKEN), "{message}");
     }
 
     #[test]
@@ -626,6 +798,37 @@ mod tests {
         assert_eq!(
             request.headers()[reqwest::header::AUTHORIZATION],
             "Bearer t"
+        );
+    }
+
+    #[test]
+    fn auth_check_requests_myself_with_the_auth_header() {
+        let mut config = jira(Some("secret"), None);
+        config.base_url = "https://example.com/jira/".to_string();
+        let request = JiraClient::new(&config).unwrap().myself_request().unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(
+            request.url().as_str(),
+            "https://example.com/jira/rest/api/2/myself"
+        );
+        assert_eq!(request.headers()[ACCEPT], "application/json");
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer secret"
+        );
+
+        let request = JiraClient::new(&jira(Some("t"), Some("a@example.com")))
+            .unwrap()
+            .myself_request()
+            .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://jira.example.com/rest/api/2/myself"
+        );
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Basic YUBleGFtcGxlLmNvbTp0"
         );
     }
 
@@ -680,6 +883,7 @@ mod tests {
             Auth::Basic { .. } => "basic (Cloud)",
             Auth::Bearer { .. } => "bearer (Server/DC)",
         };
+        client.check_auth().await.unwrap();
         let ticket = client.fetch(&key).await.unwrap();
 
         assert!(!ticket.key.is_empty());

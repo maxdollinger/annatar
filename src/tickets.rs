@@ -9,8 +9,9 @@
 //!
 //! [`TicketFetch`] bundles a [`TicketSource`] with the request policy: the
 //! concurrency cap and the 429 back-off. [`fetch_with_retry`] fetches one key
-//! under that policy and counts the requests it sends. Which outcomes are cached, skipped or fatal is decided by
-//! the ticket stage in [`crate::indexer`].
+//! under that policy and counts the requests it sends. Which outcomes are
+//! cached, skipped or fatal, and when the source's auth check runs, is decided
+//! by the ticket stage in [`crate::indexer`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -237,7 +238,7 @@ pub(crate) mod fake {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::jira::FetchFuture;
+    use crate::jira::{CheckFuture, FetchFuture};
 
     /// One scripted answer.
     #[derive(Clone)]
@@ -258,7 +259,10 @@ pub(crate) mod fake {
             match self {
                 Self::Ok(ticket) => Ok(ticket),
                 Self::Unavailable(status) => Err(FetchError::Unavailable { status }),
-                Self::Unauthorized => Err(FetchError::Unauthorized { basic: false }),
+                Self::Unauthorized => Err(FetchError::Unauthorized {
+                    basic: false,
+                    cloud: false,
+                }),
                 Self::RateLimited(retry_after) => Err(FetchError::RateLimited { retry_after }),
                 Self::Status(status) => Err(FetchError::Status { status }),
                 Self::Transport => Err(FetchError::Transport(
@@ -286,10 +290,14 @@ pub(crate) mod fake {
     /// A [`TicketSource`] that answers from a per-key script and counts
     /// calls. Each call takes the next scripted answer; the last one repeats.
     /// An unscripted key is a 404. Every call yields once, so concurrent calls
-    /// really overlap, and the peak number in flight is recorded.
+    /// really overlap, and the peak number in flight is recorded. The auth
+    /// check answers its own scripted answer (`Ok` by default; any
+    /// [`Answer::Ok`] passes) and is counted apart from fetches.
     #[derive(Default)]
     pub struct FakeSource {
         script: Mutex<HashMap<String, VecDeque<Answer>>>,
+        auth: Mutex<Option<Answer>>,
+        auth_checks: AtomicUsize,
         calls: Mutex<Vec<String>>,
         in_flight: AtomicUsize,
         peak: AtomicUsize,
@@ -307,6 +315,15 @@ pub(crate) mod fake {
                 .insert(key.to_string(), answers.iter().cloned().collect());
         }
 
+        pub fn script_auth(&self, answer: Answer) {
+            *self.auth.lock().unwrap() = Some(answer);
+        }
+
+        pub fn auth_checks(&self) -> usize {
+            self.auth_checks.load(Ordering::SeqCst)
+        }
+
+        /// Ticket fetches only; auth checks are counted by [`Self::auth_checks`].
         pub fn calls(&self) -> usize {
             self.calls.lock().unwrap().len()
         }
@@ -347,6 +364,17 @@ pub(crate) mod fake {
                     std::future::pending::<()>().await;
                 }
                 answer.into_result()
+            })
+        }
+
+        fn check_auth(&self) -> CheckFuture<'_> {
+            Box::pin(async move {
+                self.auth_checks.fetch_add(1, Ordering::SeqCst);
+                match self.auth.lock().unwrap().clone() {
+                    None | Some(Answer::Ok(_)) => Ok(()),
+                    Some(Answer::Hang) => unreachable!("the auth check is never scripted to hang"),
+                    Some(answer) => answer.into_result().map(drop),
+                }
             })
         }
     }
