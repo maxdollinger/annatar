@@ -49,8 +49,14 @@ pub struct JiraConfig {
     #[serde(skip)]
     pub token: Option<String>,
     /// Account email, never read from the config file. See [`ENV_JIRA_EMAIL`].
+    /// When set, requests use basic auth (Cloud); otherwise a bearer token
+    /// (Server/DC personal access token).
     #[serde(skip)]
     pub email: Option<String>,
+    /// Custom field holding the epic link (e.g. `customfield_10100` on
+    /// Server/DC), used when an issue has no `parent`. Unset = ignored.
+    #[serde(default)]
+    pub epic_link_field: Option<String>,
 }
 
 impl std::fmt::Debug for JiraConfig {
@@ -59,6 +65,7 @@ impl std::fmt::Debug for JiraConfig {
             .field("base_url", &self.base_url)
             .field("token", &self.token.as_ref().map(|_| "***"))
             .field("email", &self.email)
+            .field("epic_link_field", &self.epic_link_field)
             .finish()
     }
 }
@@ -201,6 +208,26 @@ data_dir = "data"
         assert!(config.jira.is_none(), "jira should default to None");
         assert!(config.ollama.is_none(), "ollama should default to None");
         assert_eq!(config.ticket_regex.as_str(), DEFAULT_TICKET_REGEX);
+    }
+
+    #[test]
+    fn epic_link_field_is_optional() {
+        let config = Config::parse(MINIMAL).expect("config should parse");
+        assert_eq!(config.jira.expect("section present").epic_link_field, None);
+
+        let text = MINIMAL.replace(
+            r#"base_url = "https://example.atlassian.net""#,
+            "base_url = \"https://example.atlassian.net\"\nepic_link_field = \"customfield_10100\"",
+        );
+        let config = Config::parse(&text).expect("config should parse");
+        assert_eq!(
+            config
+                .jira
+                .expect("section present")
+                .epic_link_field
+                .as_deref(),
+            Some("customfield_10100")
+        );
     }
 
     #[test]

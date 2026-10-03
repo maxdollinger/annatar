@@ -1,0 +1,37 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "id": "20214",
+  "self": "https://jira.example.com/rest/api/2/issue/20214",
+  "key": "GRLD-214",
+  "fields": {
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/10004",
+      "id": "10004",
+      "description": "A problem which impairs or prevents the functions of the product.",
+      "iconUrl": "https://jira.example.com/images/icons/issuetypes/bug.svg",
+      "name": "Bug",
+      "subtask": false,
+      "hierarchyLevel": 0
+    },
+    "summary": "Order export fails for orders without a delivery address",
+    "description": "Exporting an order with no delivery address throws an NPE.\n\n{code:java}\njava.lang.NullPointerException: address is null\n    at com.acme.order.OrderExporter.export(OrderExporter.java:42)\n{code}\n\nSee [the export spec|https://wiki.example.com/export].",
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/10002",
+      "name": "Done",
+      "id": "10002",
+      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+    },
+    "customfield_10014": null,
+    "created": "2024-05-10T11:02:13.000+0200",
+    "updated": "2024-05-14T08:21:57.000+0200"
+  },
+  "renderedFields": {
+    "issuetype": null,
+    "summary": null,
+    "description": "<p>Exporting an order with no delivery address throws an NPE.</p>\n\n<div class=\"code panel\" style=\"border-width: 1px;\"><div class=\"codeContent panelContent\">\n<pre class=\"code-java\">java.lang.NullPointerException: address is <span class=\"code-keyword\">null</span>\n    at com.acme.order.OrderExporter.export(OrderExporter.java:42)</pre>\n</div></div>\n\n<p>See <a href=\"https://wiki.example.com/export\" class=\"external-link\" rel=\"nofollow\">the export spec</a>.</p>",
+    "status": null,
+    "customfield_10014": null,
+    "created": "10/May/24 11:02 AM",
+    "updated": "14/May/24 8:21 AM"
+  }
+}
