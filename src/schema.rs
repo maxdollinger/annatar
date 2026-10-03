@@ -15,8 +15,24 @@ use libsql::Connection;
 /// `CREATE TABLE` statements for the disposable `index.db`, in dependency
 /// order.
 pub const INDEX_TABLES: &[&str] = &[
-    // 1.5 `symbols`; 2.2 `symbol_commits` + `symbol_tickets`; 4.3/4.4 add the
-    // what/why columns to `symbols`; 5.1 `symbol_vec` (`F32_BLOB` +
+    // 1.5 `symbols`.
+    "CREATE TABLE symbols (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES symbols(id),
+        kind TEXT NOT NULL,
+        role TEXT,
+        fqn TEXT NOT NULL UNIQUE,
+        file TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        signature TEXT NOT NULL,
+        javadoc TEXT,
+        annotations TEXT NOT NULL DEFAULT '[]',
+        content_hash TEXT NOT NULL
+    )",
+    "CREATE INDEX symbols_parent_id ON symbols(parent_id)",
+    // 2.2 adds `symbol_commits` + `symbol_tickets`; 4.3/4.4 add the what/why
+    // columns to `symbols`; 5.1 adds `symbol_vec` (`F32_BLOB` +
     // `libsql_vector_idx`).
 ];
 

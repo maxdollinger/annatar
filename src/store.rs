@@ -77,6 +77,26 @@ impl Store {
         self.data_dir.join(CACHE_DB)
     }
 
+    /// Open a read-only connection to the committed `index.db`.
+    ///
+    /// This never creates the file or its schema: reading before a run has
+    /// committed an index is an error, pointing the caller at `annatar index`.
+    pub async fn open_index(&self) -> Result<Connection> {
+        let path = self.index_path();
+        if !path.exists() {
+            anyhow::bail!(
+                "index database {} does not exist; run `annatar index` first",
+                path.display()
+            );
+        }
+        let db = Builder::new_local(&path)
+            .build()
+            .await
+            .with_context(|| format!("opening index database {}", path.display()))?;
+        db.connect()
+            .with_context(|| format!("connecting to index database {}", path.display()))
+    }
+
     /// Start a fresh index build in a temporary file. The returned
     /// [`IndexBuild`] is owned by the caller and must be committed to become
     /// the new `index.db`. Later phases create their index tables on the
@@ -206,6 +226,29 @@ mod tests {
             .await
             .is_none(),
             "aborted run should not leak its data into index.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_index_errors_before_the_first_build_and_reads_after_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let err = store
+            .open_index()
+            .await
+            .expect_err("there is no index before the first build");
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "error should say the index is missing, got: {err:#}"
+        );
+
+        write_index(&store, "t", "one").await;
+        let conn = store.open_index().await.unwrap();
+        assert_eq!(
+            first_string(&conn, "SELECT v FROM t").await.as_deref(),
+            Some("one"),
+            "the read connection should see the committed index"
         );
     }
 

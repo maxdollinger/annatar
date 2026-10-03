@@ -4,6 +4,8 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
+use annatar::store::Store;
+use annatar::{indexer, show};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
 #[derive(Debug, Parser)]
@@ -48,7 +50,8 @@ enum Command {
     Serve,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
@@ -61,8 +64,19 @@ fn main() -> Result<()> {
     );
 
     match &cli.command {
-        Command::Index => not_implemented("index"),
-        Command::Show { fqn } => not_implemented(&format!("show {fqn}")),
+        Command::Index => {
+            let store = Store::open(&config.data_dir).await?;
+            let stats = indexer::build_index(&store, &config.repo, cli.path.as_deref()).await?;
+            println!(
+                "indexed {} files, {} symbols, {} skipped",
+                stats.files, stats.symbols, stats.skipped
+            );
+        }
+        Command::Show { fqn } => {
+            let store = Store::open(&config.data_dir).await?;
+            let conn = store.open_index().await?;
+            print!("{}", show::render(&conn, fqn).await?);
+        }
         Command::Search { query } => not_implemented(&format!("search {query}")),
         Command::Serve => not_implemented("serve"),
     }
