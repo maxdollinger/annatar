@@ -88,8 +88,8 @@ impl Config {
         let mut config =
             Self::parse(&text).with_context(|| format!("in config file {}", path.display()))?;
         let base = config_dir(path);
-        config.repo = resolve_path(&base, std::mem::take(&mut config.repo));
-        config.data_dir = resolve_path(&base, std::mem::take(&mut config.data_dir));
+        config.repo = resolve_path(&base, config.repo.clone());
+        config.data_dir = resolve_path(&base, config.data_dir.clone());
         config.apply_env();
         Ok(config)
     }
@@ -162,7 +162,15 @@ embedding_model = "nomic-embed-text"
     fn minimal_without(lines: &[&str]) -> String {
         let mut text = MINIMAL.to_string();
         for line in lines {
+            assert!(
+                text.contains(line),
+                "MINIMAL no longer contains {line:?}; the test would be vacuous"
+            );
             text = text.replace(line, "");
+            assert!(
+                !text.contains(line),
+                "{line:?} is still present after removal; the test would be vacuous"
+            );
         }
         text
     }

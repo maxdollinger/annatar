@@ -10,12 +10,27 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H9 Narrow walker pruning of `build`/`generated` — **done** |
+| Phase | 1 — Symbols (Phase 1 audit remediation complete) |
+| Step | H8 Doc drift, test smells and minor cleanups — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H8 Doc drift, test smells and minor cleanups.** Five hygiene findings closed
+  with no behaviour change. (13) Decision 41's wording now describes what
+  `show::render` actually does — load the whole table, build a child map,
+  recurse with plain function calls — instead of the false "explicit stack"
+  claim; the deep-nesting overflow risk is tracked as a new open question rather
+  than reworking render. (14) `minimal_without` asserts each pattern is present
+  before `str::replace` and absent after, so an edited `MINIMAL` can no longer
+  make a config test pass vacuously. (15) The `store` test helper's insert now
+  binds the value through `params!` (`INSERT INTO {table} VALUES (?1)`), leaving
+  only the table identifier interpolated, as `CREATE TABLE` must be. (16)
+  `relative_path` is now `path.to_string_lossy().replace('\\', "/")` instead of a
+  component loop; the walker/indexer path tests confirm repo-relative,
+  `/`-separated paths still hold. (18) `Config::load` resolves `repo`/`data_dir`
+  from a clone instead of `std::mem::take`. Decision D-i (H8); 52 tests, green.
 
 - **H9 Narrow walker pruning of `build`/`generated`.** `is_skipped_dir` no
   longer prunes a directory named in `SKIP_DIRS` anywhere: it now prunes such a
@@ -192,13 +207,10 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
-  items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1
-  through H7 and H9 are done; next is **H8** (doc drift, test smells and minor
-  cleanups).
-- After the remediation series: 2.1 History for a span:
-  `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
-  `--format` and record delimiter. Note behaviour on renamed files in the PR.
+- Phase 2.1 History for a span: `git log -L <start>,<end>:<file>` via
+  `std::process::Command`, with a custom `--format` and record delimiter. Note
+  behaviour on renamed files in the PR. Phase 1 audit remediation (`H1`–`H9`) is
+  complete; this is now the active queue.
 
 ## Step log
 
@@ -220,6 +232,7 @@ the decisions taken, and the tradeoffs behind them.
 | H6 De-duplicate symbol construction | done | one `build_symbol` factory; annotations walked once (texts + signature + role); dead `record_body`/`program` arms removed; 1 record-body test; decision D-f; 50 tests |
 | H7 Batch symbol writes in a transaction | done | one transaction wraps all symbol writes; committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` (no `IndexBuild::transaction()`); 1 store rollback test; decision D-g; 51 tests |
 | H9 Narrow walker pruning of `build`/`generated` | done | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample out of source root; 1 new walker test; decision D-h, D-j; 52 tests |
+| H8 Doc drift, test smells and minor cleanups | done | decision 41 wording corrected, deep-nesting open question added; `minimal_without` asserts presence/removal; store helper inserts via `params!`; `relative_path` uses `replace('\\', "/")`; `Config::load` clones instead of `mem::take`; decision D-i; 52 tests |
 
 ## Decisions and tradeoffs
 
@@ -265,7 +278,7 @@ the decisions taken, and the tradeoffs behind them.
 | 38 | `symbols` table lives in `INDEX_TABLES` with `fqn UNIQUE`, an in-memory fqn→id map for `parent_id`, and `INSERT OR IGNORE` with first-definition-wins on duplicates | Resolve parents by fqn subquery, or error on duplicates | The parser is pre-order so parents are always written first; a stray duplicate must not orphan the real symbol's children |
 | 39 | `content_hash` = blake3(javadoc + `\n` + source slice); annotations stored as a JSON array string | Hash source only / newline-join annotations | A doc-only edit must invalidate later summaries; JSON survives multi-line annotation text |
 | 40 | `kind`/`role` stored as lower-case strings via `as_str()`, part of the on-disk contract | Store the Rust enum via an integer/serde tag | The index is inspected by SQL and later the MCP tools; readable stable strings are the simplest contract |
-| 41 | `show::render` loads the whole `symbols` table, builds a child map in memory, recurses with an explicit stack | One query per node / recursive CTEs | POC-scale tables make this cheap and it avoids async recursion; revisit when the index grows |
+| 41 | `show::render` loads the whole `symbols` table, builds an in-memory child map, then recurses with plain function calls | One query per node / recursive CTEs | POC-scale tables make this cheap and it avoids async recursion; plain recursion can overflow on pathologically deep nesting, tracked as open question #15 |
 | 42 | `IndexStats.files` counts files that produced a symbol; the disjoint `empty` / `parse_errors` / `unreadable` buckets count the rest | Count every walked file as `files` | `files` + the three failure buckets = walked; a clean symbol-less file (`package-info.java`) is now distinct from a parse failure (D-a) |
 | D-a (H1) | New `JavaParser`/`ParsedFile` API; `IndexStats.skipped` is replaced by `empty`/`parse_errors`/`unreadable`, `files` keeps its meaning | Keep `Ok(vec![])` for both | Distinguishes a broken file from a symbol-less one; resolves open #11; parser reused once per run (one grammar load) |
 | D-j (H1, H9) | Update decision 42 (skip semantics) and decision 25 (walker pruning) | — | Decision 42 changed with H1; decision 25 changed with H9 (D-h) |
@@ -277,6 +290,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-f (H6) | One `build_symbol` factory builds every `Symbol`; a declaration's annotation nodes are walked once and the texts, signature and role all derive from that single list (`signature_of` takes the node list, `role_of` the extracted simple names) | Keep the two field literals and let `annotations_of`/`signature_of`/`role_of` each walk/parse independently | Removes the duplicated 15+ field construction and triple annotation traversal without changing any output; the existing `symbols` tests are the regression net. A record's body is a `class_body` resolved via `child_by_field_name("body")`, so the `record_body` arm and the unreachable `program` arm are dead |
 | D-g (H7) | Wrap the whole build in one transaction (local to `build_index`), committed before the temp file is renamed | Per-file transactions; an `IndexBuild::transaction()` guard | Fewest round trips and the audit's first lever for the 2.3 batched baseline. A local transaction keeps the commit-before-`build.commit()` ordering explicit in one function and leaves `store.rs` production code untouched; a guard type would not really enforce ordering any harder. On error the transaction is dropped (rollback) before the temp file is discarded, so nothing partial is ever renamed over `index.db`. In libsql 0.9.30 `Connection::transaction()` is `async`, so the begin is `.await`ed (the plan text said sync) |
 | D-h (H9) | Prune skip-dirs only outside source roots (no ancestor named `java`) | Prune by name anywhere (current); add `index.skip_dirs` config | Fixes the false negative with a one-function change; a config escape hatch is deferred to avoid cross-module scope creep |
+| D-i (H8) | Correct decision 41's wording and track deep-nesting overflow as an open question | Rewrite `show` to an explicit stack now | Doc/behaviour drift is the actual finding; `show`'s plain recursion is fine at POC scale, and reworking rendering for a pathological input is unwarranted until a real index needs it |
 
 ## Open questions
 
@@ -296,3 +310,4 @@ the decisions taken, and the tradeoffs behind them.
 | 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | open — decide handling (error, warn, or blame working tree) when 2.1 lands |
+| 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
