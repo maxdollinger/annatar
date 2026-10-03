@@ -487,7 +487,7 @@ Status of each item as it lands. One commit per item (Conventional Commits);
 | H3 | done | `087ee6f` | 46 | `PRAGMA foreign_keys = ON` per index connection |
 | H4 | done | — | 48 | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing |
 | H5 | done | — | 49 | `parse_annotations` returns `Result` with the fqn; `text()` warns (kind/span) and returns empty; corrupt-annotations `show` test |
-| H6 | pending | — | — | |
+| H6 | done | — | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
 | H7 | pending | — | — | |
 | H9 | pending | — | — | |
 | H8 | pending | — | — | |
