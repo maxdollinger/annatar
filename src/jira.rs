@@ -7,7 +7,9 @@
 //!
 //! Auth: with an email configured ([`ENV_JIRA_EMAIL`]) requests use basic auth
 //! `email:token` (Cloud API token); without one they send the token as a bearer
-//! personal access token (Server/DC).
+//! personal access token (Server/DC). A classic Cloud API token works against
+//! the site URL; a scoped one only through the Atlassian API gateway
+//! (`https://api.atlassian.com/ex/jira/<cloudId>`) and needs `read:jira-work`.
 //!
 //! The parent key comes from `fields.parent.key` (sub-tasks, and epic children
 //! on Cloud). An optional `jira.epic_link_field` names a custom field that
@@ -19,9 +21,12 @@
 //! `X-Authentication-Denied-Reason` (Server/DC CAPTCHA after failed logins)
 //! counts as bad credentials, and so does a 401 or 403 whose body is Jira
 //! Cloud's "Failed to parse Connect Session Auth Token" (Cloud's answer to a
-//! bearer token). [`JiraClient::check_auth`] calls `GET /rest/api/2/myself`
+//! bearer token). A 401 whose body says `scope does not match` is bad
+//! credentials with `scope` set: a scoped token lacking the scope that request
+//! needs. [`JiraClient::check_auth`] calls `GET /rest/api/2/myself`
 //! once before the ticket stage fetches, so credentials Jira rejects with a
-//! plain 403 cannot be mistaken for unavailable issues. [`TicketSource`] is
+//! plain 403 cannot be mistaken for unavailable issues. Error bodies are read
+//! up to [`MAX_ERROR_BODY`] bytes. [`TicketSource`] is
 //! the seam the ticket stage fetches through; caching, retries and
 //! concurrency live in [`crate::tickets`] and the index build, not here.
 
@@ -42,6 +47,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for establishing the connection, so an unreachable host fails
 /// fast instead of using the whole request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much of a non-success response body is read to classify the error.
+const MAX_ERROR_BODY: usize = 4 * 1024;
 
 /// Wrap width handed to the HTML converter; wide enough that paragraphs stay
 /// on one line.
@@ -152,8 +160,13 @@ pub enum FetchError {
     /// token error, or any 401/403 from the auth check: credentials missing,
     /// wrong or of the wrong kind. Must never be cached. `basic` names the
     /// auth mode for the message; `cloud` is set when the response showed the
-    /// server is Jira Cloud.
-    Unauthorized { basic: bool, cloud: bool },
+    /// server is Jira Cloud; `scope` when a 401 said the token's scopes do not
+    /// match the request (a scoped API token without the scope it needs).
+    Unauthorized {
+        basic: bool,
+        cloud: bool,
+        scope: bool,
+    },
     /// 403 or 404: the issue does not exist or is not visible to this account.
     Unavailable { status: u16 },
     /// 429: back off, for `retry_after` when Jira sent a seconds value.
@@ -171,6 +184,12 @@ pub enum FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Unauthorized { scope: true, .. } => write!(
+                f,
+                "Jira rejected the credentials: the token lacks the scope Jira needs for this \
+                 request; a scoped API token needs read:jira-work (and goes through \
+                 https://api.atlassian.com/ex/jira/<cloudId> as jira.base_url)"
+            ),
             Self::Unauthorized { basic: true, .. } => write!(
                 f,
                 "Jira rejected the credentials; check {ENV_JIRA_TOKEN} and {ENV_JIRA_EMAIL}"
@@ -178,15 +197,19 @@ impl fmt::Display for FetchError {
             Self::Unauthorized {
                 basic: false,
                 cloud: true,
+                ..
             } => write!(
                 f,
                 "Jira rejected the credentials; this is Jira Cloud, which does not accept a \
                  bearer token: set {ENV_JIRA_EMAIL} to the account email so {ENV_JIRA_TOKEN} \
-                 (an API token) is sent as basic auth"
+                 (an API token) is sent as basic auth; a classic API token works with the site \
+                 URL as jira.base_url, a scoped one (scope read:jira-work) only with \
+                 https://api.atlassian.com/ex/jira/<cloudId>"
             ),
             Self::Unauthorized {
                 basic: false,
                 cloud: false,
+                ..
             } => write!(f, "Jira rejected the credentials; check {ENV_JIRA_TOKEN}"),
             Self::Unavailable { status } => write!(f, "issue unavailable (HTTP {status})"),
             Self::RateLimited {
@@ -217,10 +240,22 @@ const AUTH_DENIED_REASON: &str = "x-authentication-denied-reason";
 /// What Jira Cloud answers a request whose bearer token it cannot read.
 const CLOUD_CONNECT_TOKEN_ERROR: &[u8] = b"Connect Session Auth Token";
 
+/// What the Atlassian gateway answers a scoped token that lacks the scope a
+/// request needs.
+const SCOPE_MISMATCH_ERROR: &[u8] = b"scope does not match";
+
+fn contains(body: &[u8], needle: &[u8]) -> bool {
+    body.windows(needle.len()).any(|window| window == needle)
+}
+
 /// Whether an error body is Jira Cloud's answer to an unreadable bearer token.
 fn is_cloud_token_error(body: &[u8]) -> bool {
-    body.windows(CLOUD_CONNECT_TOKEN_ERROR.len())
-        .any(|window| window == CLOUD_CONNECT_TOKEN_ERROR)
+    contains(body, CLOUD_CONNECT_TOKEN_ERROR)
+}
+
+/// Whether a 401 body says the token's scopes do not cover the request.
+fn is_scope_error(body: &[u8]) -> bool {
+    contains(body, SCOPE_MISMATCH_ERROR)
 }
 
 /// Map a non-success status, its headers and its body to a [`FetchError`];
@@ -230,9 +265,17 @@ fn status_error(status: u16, headers: &HeaderMap, body: &[u8], basic: bool) -> O
     let cloud = is_cloud_token_error(body);
     match status {
         200..=299 => None,
-        401 => Some(FetchError::Unauthorized { basic, cloud }),
+        401 => Some(FetchError::Unauthorized {
+            basic,
+            cloud,
+            scope: is_scope_error(body),
+        }),
         403 if cloud || headers.contains_key(AUTH_DENIED_REASON) => {
-            Some(FetchError::Unauthorized { basic, cloud })
+            Some(FetchError::Unauthorized {
+                basic,
+                cloud,
+                scope: false,
+            })
         }
         403 | 404 => Some(FetchError::Unavailable { status }),
         429 => Some(FetchError::RateLimited {
@@ -248,7 +291,11 @@ fn status_error(status: u16, headers: &HeaderMap, body: &[u8], basic: bool) -> O
 
 /// Map the auth check's status to a [`FetchError`]; `None` for 2xx. Unlike
 /// [`status_error`], any 403 is bad credentials: `myself` exists for every
-/// account that may log in.
+/// account that may log in. A 401 with `scope does not match` is
+/// `Unauthorized { scope: true }`, which is inconclusive rather than bad
+/// credentials: `myself` needs `read:jira-user`, which a scoped token that
+/// can read issues (`read:jira-work`) may lack. The ticket stage goes on to
+/// fetch, where a 401 is fatal anyway.
 fn auth_check_error(
     status: u16,
     headers: &HeaderMap,
@@ -259,6 +306,7 @@ fn auth_check_error(
         401 | 403 => Some(FetchError::Unauthorized {
             basic,
             cloud: is_cloud_token_error(body),
+            scope: status == 401 && is_scope_error(body),
         }),
         _ => status_error(status, headers, body, basic),
     }
@@ -329,7 +377,8 @@ impl JiraClient {
     }
 
     /// Check that Jira accepts the credentials: `GET /rest/api/2/myself`.
-    /// 401 and 403 are [`FetchError::Unauthorized`].
+    /// 401 and 403 are [`FetchError::Unauthorized`] (see [`auth_check_error`]
+    /// for the inconclusive scope case).
     pub async fn check_auth(&self) -> Result<(), FetchError> {
         self.send(self.myself_request()?, auth_check_error)
             .await
@@ -337,26 +386,37 @@ impl JiraClient {
     }
 
     /// Send `request` and return the body of a 2xx response; other statuses
-    /// go through `map_status`.
+    /// go through `map_status` with at most [`MAX_ERROR_BODY`] bytes of their
+    /// body (a body that fails to read counts as cut short).
     async fn send(
         &self,
         request: reqwest::Request,
         map_status: fn(u16, &HeaderMap, &[u8], bool) -> Option<FetchError>,
     ) -> Result<Vec<u8>, FetchError> {
-        let response = self
+        let mut response = self
             .http
             .execute(request)
             .await
             .map_err(FetchError::Transport)?;
         let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let body = response.bytes().await;
-        let basic = matches!(self.auth, Auth::Basic { .. });
-        let error_body = body.as_deref().unwrap_or_default();
-        if let Some(err) = map_status(status, &headers, error_body, basic) {
-            return Err(err);
+        if response.status().is_success() {
+            return response
+                .bytes()
+                .await
+                .map(Vec::from)
+                .map_err(FetchError::Transport);
         }
-        body.map(Vec::from).map_err(FetchError::Transport)
+        let headers = response.headers().clone();
+        let mut body = Vec::new();
+        while body.len() < MAX_ERROR_BODY {
+            let Ok(Some(chunk)) = response.chunk().await else {
+                break;
+            };
+            let take = chunk.len().min(MAX_ERROR_BODY - body.len());
+            body.extend_from_slice(&chunk[..take]);
+        }
+        let basic = matches!(self.auth, Auth::Basic { .. });
+        Err(map_status(status, &headers, &body, basic).unwrap_or(FetchError::Status { status }))
     }
 
     /// The authenticated issue request for `key`, built but not sent.
@@ -410,6 +470,10 @@ impl TicketSource for JiraClient {
     }
 }
 
+/// Status, header and body mapping is tested on [`status_error`] and
+/// [`auth_check_error`] directly, and requests are built without sending.
+/// How [`JiraClient::send`] reads a body (2xx in full, error bodies capped at
+/// [`MAX_ERROR_BODY`]) is untested by design: there is no HTTP mock (D-ad).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,7 +694,8 @@ mod tests {
             status_error(401, &none, b"", true),
             Some(FetchError::Unauthorized {
                 basic: true,
-                cloud: false
+                cloud: false,
+                scope: false,
             })
         ));
         assert!(matches!(
@@ -671,7 +736,8 @@ mod tests {
             status_error(403, &denied, b"", false),
             Some(FetchError::Unauthorized {
                 basic: false,
-                cloud: false
+                cloud: false,
+                scope: false,
             })
         ));
     }
@@ -681,6 +747,7 @@ mod tests {
         let basic = FetchError::Unauthorized {
             basic: true,
             cloud: false,
+            scope: false,
         }
         .to_string();
         assert!(basic.contains(ENV_JIRA_TOKEN), "{basic}");
@@ -689,6 +756,7 @@ mod tests {
         let bearer = FetchError::Unauthorized {
             basic: false,
             cloud: false,
+            scope: false,
         }
         .to_string();
         assert!(bearer.contains(ENV_JIRA_TOKEN), "{bearer}");
@@ -705,13 +773,63 @@ mod tests {
             status_error(403, &none, CLOUD_BEARER_BODY, false),
             Some(FetchError::Unauthorized {
                 basic: false,
-                cloud: true
+                cloud: true,
+                scope: false,
             })
         ));
         assert!(matches!(
             status_error(403, &none, br#"{"errorMessages":["no permission"]}"#, false),
             Some(FetchError::Unavailable { status: 403 })
         ));
+        assert!(matches!(
+            status_error(401, &none, CLOUD_BEARER_BODY, false),
+            Some(FetchError::Unauthorized {
+                basic: false,
+                cloud: true,
+                scope: false,
+            })
+        ));
+    }
+
+    const SCOPE_MISMATCH_BODY: &[u8] =
+        br#"{"code":401,"message":"Unauthorized; scope does not match"}"#;
+
+    #[test]
+    fn scope_mismatch_401_sets_scope_on_fetches_and_the_auth_check() {
+        let none = HeaderMap::new();
+
+        for map in [status_error, auth_check_error] {
+            assert!(matches!(
+                map(401, &none, SCOPE_MISMATCH_BODY, true),
+                Some(FetchError::Unauthorized {
+                    basic: true,
+                    cloud: false,
+                    scope: true,
+                })
+            ));
+            assert!(matches!(
+                map(401, &none, br#"{"message":"Unauthorized"}"#, true),
+                Some(FetchError::Unauthorized { scope: false, .. })
+            ));
+        }
+        assert!(matches!(
+            auth_check_error(403, &none, SCOPE_MISMATCH_BODY, true),
+            Some(FetchError::Unauthorized { scope: false, .. })
+        ));
+    }
+
+    #[test]
+    fn scope_mismatch_message_names_the_scope() {
+        for basic in [true, false] {
+            let message = FetchError::Unauthorized {
+                basic,
+                cloud: false,
+                scope: true,
+            }
+            .to_string();
+            assert!(message.contains("lacks the scope"), "{message}");
+            assert!(message.contains("read:jira-work"), "{message}");
+        }
     }
 
     #[test]
@@ -724,7 +842,8 @@ mod tests {
                 auth_check_error(status, &none, b"", true),
                 Some(FetchError::Unauthorized {
                     basic: true,
-                    cloud: false
+                    cloud: false,
+                    scope: false,
                 })
             ));
         }
@@ -732,7 +851,8 @@ mod tests {
             auth_check_error(403, &none, CLOUD_BEARER_BODY, false),
             Some(FetchError::Unauthorized {
                 basic: false,
-                cloud: true
+                cloud: true,
+                scope: false,
             })
         ));
         assert!(matches!(
@@ -754,12 +874,18 @@ mod tests {
         let message = FetchError::Unauthorized {
             basic: false,
             cloud: true,
+            scope: false,
         }
         .to_string();
 
         assert!(message.contains("Jira Cloud"), "{message}");
         assert!(message.contains(ENV_JIRA_EMAIL), "{message}");
         assert!(message.contains(ENV_JIRA_TOKEN), "{message}");
+        assert!(
+            message.contains("https://api.atlassian.com/ex/jira/<cloudId>"),
+            "{message}"
+        );
+        assert!(message.contains("read:jira-work"), "{message}");
     }
 
     #[test]
