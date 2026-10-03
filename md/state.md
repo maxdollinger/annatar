@@ -11,11 +11,19 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols |
-| Step | 1.2 Parse types — **done** |
+| Step | 1.3 Parse methods and constructors — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **1.3 Parse methods and constructors.** `symbols::parse_file` now returns a
+  unified `Vec<Symbol>` (`SymbolKind`: class/interface/enum/record/annotation/
+  method/constructor) in source order, replacing `TypeDef`/`parse_types`.
+  Members get fqn `pkg.Type#name(params)`; constructors use `<init>`; parameter
+  types are rendered as written (whitespace-normalized, no names) so overloads
+  differ. Nested-type members carry the nested parent fqn; anonymous/local
+  classes contribute nothing. 10 symbols tests; 25 total, green; clippy clean.
 
 - **1.2 Parse types.** `symbols::parse_types(path, source)` returns a `TypeDef`
   per class, interface, enum, record and `@interface`, including nested types:
@@ -60,8 +68,9 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- 1.3 Parse methods and constructors: unique fqn `pkg.Type#method(Params)`,
-  spans and parent type; ignore anonymous/local classes.
+- 1.4 Signature, Javadoc, annotations, Spring role: text each symbol carries
+  plus a role for types (controller/service/repository/component/
+  configuration/entity).
 
 ## Step log
 
@@ -71,6 +80,7 @@ the decisions taken, and the tradeoffs behind them.
 | 0.2 Database files | done | two-file `Store`, temp file + atomic rename; 4 tests |
 | 1.1 File walker | done | `walk::java_files`; `ignore` crate; 6 tests (15 total) |
 | 1.2 Parse types | done | `symbols::parse_types`; tree-sitter 0.25 + tree-sitter-java 0.23; 6 tests (21 total) |
+| 1.3 Methods/constructors | done | unified `Symbol`; fqn `Type#name(params)`, ctors `<init>`; 10 symbols tests (25 total) |
 
 ## Decisions and tradeoffs
 
@@ -105,6 +115,10 @@ the decisions taken, and the tradeoffs behind them.
 | 27 | Walker sets `require_git(false)` and `parents(false)` | Require a git repo / honour ancestor ignores | Temp-dir tests need no `git init` and stay deterministic; `parents(false)` also stops a parent `.gitignore` outside the repo from affecting a run |
 | 28 | `tree-sitter` 0.25 + `tree-sitter-java` 0.23 (ABI-matched pair) | Other version pairs | A real parse test proves the pair loads; later bumps must keep the grammar crate compatible |
 | 29 | Type recursion is scoped to type-container nodes (`program`, `*_body`, `enum_body_declarations`), never executable scopes | Filter `class_declaration` by inspecting its `parent.kind()` | `tree-sitter-java` has no `local_class_declaration`; local and anonymous classes are also `class_declaration`, so only descending type containers correctly excludes them |
+| 30 | `TypeDef`/`parse_types` replaced by one unified `Symbol`/`parse_file` in 1.3 | Keep types and members as separate structs | 1.4 adds text to every symbol and 1.5 persists one `symbols` table; one model avoids parallel fields and makes the parent_id join trivial |
+| 31 | Constructor fqn uses `<init>` (name field `<init>` too) | Use the type's simple name | JVM/SCIP/JDT convention; unambiguous and stable, and later SCIP usage mapping matches without translation |
+| 32 | Member fqn parameter types are whitespace-stripped source text, no parameter names (`Map<String,List<X>>`) | Keep original spacing / resolve simple names | Identity only needs distinct overloads; 1.4 stores the full signature separately, so fqn can be compact and deterministic |
+| 33 | Fields, initializer blocks and annotation-type elements are not symbols | Include them | The plan scopes members to methods and constructors; annotations are covered by 1.4's annotation text, not as symbols |
 
 ## Open questions
 
