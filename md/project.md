@@ -2,6 +2,11 @@
 
 Oct 3, 2026 · @Max
 
+> **This is the target.** It describes where Annatar is headed. The
+> proof-of-concept being built now is a subset of it: see [`plan.md`](./plan.md).
+> Everything here that the POC leaves out (SCIP usages, modules, analysis,
+> central build, other languages) is listed under "Later" in the plan.
+
 ## Summary
 
 Annatar is a repository index that records, for every class, method, function and type, what it does, why it exists and where it is used. The "why" comes from the tickets and commits that shaped the code. Engineers, non-technical colleagues and coding agents query it by meaning through an MCP server.

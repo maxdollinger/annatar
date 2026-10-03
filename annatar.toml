@@ -1,0 +1,25 @@
+# Annatar configuration. This is the default file the binary loads; pass
+# `--config <FILE>` to point elsewhere. Relative paths resolve against this
+# file's directory, not the current working directory.
+
+# Repository to index.
+repo = "."
+
+# Directory holding the two libSQL files: index.db and cache.db.
+data_dir = ".annatar"
+
+# Regex used to find Jira ticket keys in commit messages and bodies.
+ticket_regex = '\bGRLD-\d+\b'
+
+# Jira connection. Optional for now; required once Phase 3 wires Jira fetching.
+# Secrets come from the environment (ANNATAR_JIRA_TOKEN, ANNATAR_JIRA_EMAIL),
+# never from this file.
+# [jira]
+# base_url = "https://acme.atlassian.net"
+
+# Ollama connection. Optional for now; required once Phase 4 wires summaries
+# and embeddings.
+# [ollama]
+# url = "http://localhost:11434"
+# chat_model = "qwen2.5-coder"
+# embedding_model = "nomic-embed-text"

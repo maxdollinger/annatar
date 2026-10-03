@@ -25,8 +25,14 @@ pub struct Config {
     /// Regex used to extract ticket keys from history.
     #[serde(default = "default_ticket_regex")]
     pub ticket_regex: String,
-    pub jira: JiraConfig,
-    pub ollama: OllamaConfig,
+    /// Jira connection. Optional for now; a command that talks to Jira will
+    /// require it once Phase 3 lands.
+    #[serde(default)]
+    pub jira: Option<JiraConfig>,
+    /// Ollama connection. Optional for now; a command that calls the LLM will
+    /// require it once Phase 4 lands.
+    #[serde(default)]
+    pub ollama: Option<OllamaConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -73,13 +79,17 @@ impl Config {
         Ok(config)
     }
 
-    /// Read, parse and validate a configuration file, then load secrets
-    /// from the environment.
+    /// Read, parse and validate a configuration file, then resolve relative
+    /// paths against the file's own directory and load secrets from the
+    /// environment.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
         let mut config =
             Self::parse(&text).with_context(|| format!("in config file {}", path.display()))?;
+        let base = config_dir(path);
+        config.repo = resolve_path(&base, std::mem::take(&mut config.repo));
+        config.data_dir = resolve_path(&base, std::mem::take(&mut config.data_dir));
         config.apply_env();
         Ok(config)
     }
@@ -87,11 +97,13 @@ impl Config {
     /// Populate secret fields from environment variables. Missing variables
     /// leave the field empty; a command that needs Jira auth fails later.
     pub fn apply_env(&mut self) {
-        if let Ok(token) = std::env::var(ENV_JIRA_TOKEN) {
-            self.jira.token = Some(token);
-        }
-        if let Ok(email) = std::env::var(ENV_JIRA_EMAIL) {
-            self.jira.email = Some(email);
+        if let Some(jira) = self.jira.as_mut() {
+            if let Ok(token) = std::env::var(ENV_JIRA_TOKEN) {
+                jira.token = Some(token);
+            }
+            if let Ok(email) = std::env::var(ENV_JIRA_EMAIL) {
+                jira.email = Some(email);
+            }
         }
     }
 
@@ -108,6 +120,25 @@ fn default_ticket_regex() -> String {
 
 fn default_ollama_url() -> String {
     DEFAULT_OLLAMA_URL.to_string()
+}
+
+/// The directory a config file lives in, used as the base for relative paths.
+/// A bare filename with no parent resolves to the current directory.
+fn config_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Resolve a possibly-relative config path against the config file's
+/// directory. Absolute paths are returned unchanged.
+fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
+    if path.is_relative() {
+        base.join(path)
+    } else {
+        path
+    }
 }
 
 #[cfg(test)]
@@ -142,7 +173,23 @@ embedding_model = "nomic-embed-text"
         let config = Config::parse(&text).expect("config should parse");
 
         assert_eq!(config.ticket_regex, DEFAULT_TICKET_REGEX);
-        assert_eq!(config.ollama.url, DEFAULT_OLLAMA_URL);
+        assert_eq!(
+            config.ollama.expect("section present").url,
+            DEFAULT_OLLAMA_URL
+        );
+    }
+
+    #[test]
+    fn jira_and_ollama_are_optional() {
+        let text = r#"
+repo = "/tmp/repo"
+data_dir = "data"
+"#;
+        let config = Config::parse(text).expect("config without jira/ollama should parse");
+
+        assert!(config.jira.is_none(), "jira should default to None");
+        assert!(config.ollama.is_none(), "ollama should default to None");
+        assert_eq!(config.ticket_regex, DEFAULT_TICKET_REGEX);
     }
 
     #[test]
@@ -182,13 +229,15 @@ embedding_model = "nomic-embed-text"
     }
 
     #[test]
-    fn load_reads_the_file() {
+    fn load_reads_the_file_and_resolves_relative_paths_against_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("annatar.toml");
         std::fs::write(&path, MINIMAL).unwrap();
 
         let config = Config::load(&path).expect("config should load");
+        // `repo` is absolute and stays as written; `data_dir` is relative and
+        // resolves next to the config file, not the current directory.
         assert_eq!(config.repo, PathBuf::from("/tmp/repo"));
-        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.data_dir, dir.path().join("data"));
     }
 }

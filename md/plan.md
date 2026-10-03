@@ -1,5 +1,9 @@
 # Annatar — POC Plan
 
+> The proof-of-concept is a subset of the target described in
+> [`project.md`](./project.md). Anything there that this plan doesn't cover is
+> in **Later** at the end.
+
 Scope: **Java / Spring** only, **Jira** only (keys like `GRLD-123`), **Ollama** for LLM and embeddings, **libSQL** for storage, written in **Rust**.
 
 ## What the POC has to prove
