@@ -101,6 +101,10 @@ pub struct Symbol {
     pub kind: SymbolKind,
     pub start_line: usize,
     pub end_line: usize,
+    /// The first line of the symbol's history span: its Javadoc's first line
+    /// when it has one, else `start_line`. A commit that only edits the
+    /// Javadoc is part of the symbol's history.
+    pub history_start_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
     pub parent: Option<String>,
@@ -299,6 +303,8 @@ fn build_symbol(
     let start = declaration.start_position();
     let end = declaration.end_position();
     let role = role_of(kind, &annotation_names, declaration, source);
+    let javadoc = javadoc_node(declaration, source);
+    let history_start = javadoc.map_or(start, |comment| comment.start_position());
     Symbol {
         package: package.to_string(),
         name,
@@ -306,11 +312,12 @@ fn build_symbol(
         kind,
         start_line: start.row + 1,
         end_line: end.row + 1,
+        history_start_line: history_start.row + 1,
         start_byte: declaration.start_byte(),
         end_byte: declaration.end_byte(),
         parent,
         signature: signature_of(declaration, source, &annotation_nodes),
-        javadoc: javadoc_of(declaration, source),
+        javadoc: javadoc.map(|comment| clean_javadoc(&text(comment, source))),
         annotations,
         role,
     }
@@ -396,18 +403,14 @@ fn is_annotation_kind(node_kind: &str) -> bool {
     matches!(node_kind, "marker_annotation" | "annotation")
 }
 
-/// The cleaned Javadoc immediately above a declaration, or `None` when the
-/// preceding sibling is not a `/** ... */` block comment.
-fn javadoc_of(declaration: Node<'_>, source: &str) -> Option<String> {
+/// The Javadoc comment node immediately above a declaration, or `None` when
+/// the preceding sibling is not a `/** ... */` block comment.
+fn javadoc_node<'tree>(declaration: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     let previous = declaration.prev_sibling()?;
-    if previous.kind() != "block_comment" {
+    if previous.kind() != "block_comment" || !text(previous, source).starts_with("/**") {
         return None;
     }
-    let raw = text(previous, source);
-    if !raw.starts_with("/**") {
-        return None;
-    }
-    Some(clean_javadoc(&raw))
+    Some(previous)
 }
 
 /// Strip the `/**`, `*/` and per-line `* ` decoration from a Javadoc comment.
@@ -1023,6 +1026,33 @@ class UserService {
             by_fqn(&symbols, "com.acme.doc.UserService#other()").javadoc,
             None
         );
+    }
+
+    #[test]
+    fn history_span_starts_at_the_javadoc_when_there_is_one() {
+        let source = "\
+package com.acme.doc;
+
+/**
+ * Handles users.
+ */
+@Deprecated
+class UserService {
+    /** Finds a user. */
+    User find(Long id) { return null; }
+
+    User other() { return null; }
+}
+";
+        let symbols = parse(source);
+        let lines = |fqn: &str| {
+            let symbol = by_fqn(&symbols, fqn);
+            (symbol.history_start_line, symbol.start_line)
+        };
+
+        assert_eq!(lines("com.acme.doc.UserService"), (3, 6));
+        assert_eq!(lines("com.acme.doc.UserService#find(Long)"), (8, 9));
+        assert_eq!(lines("com.acme.doc.UserService#other()"), (11, 11));
     }
 
     #[test]

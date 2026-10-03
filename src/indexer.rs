@@ -36,7 +36,7 @@ pub struct IndexStats {
     pub commits: usize,
     /// Ticket-key rows written to `symbol_tickets`.
     pub tickets: usize,
-    /// Symbols whose history came from `history_cache` without a git call.
+    /// Symbols whose history came from the history cache without a git call.
     pub history_hits: usize,
     /// Symbols whose history needed a `git log -L` (no usable cache row).
     pub history_misses: usize,
@@ -259,7 +259,7 @@ fn dirty_files(repo: &Path, files: &[PathBuf]) -> HashSet<PathBuf> {
 
 /// Where one symbol's history came from.
 enum HistoryOutcome {
-    /// Reused from `history_cache` without a git call.
+    /// Reused from the history cache without a git call.
     Hit(Vec<Commit>),
     /// Recomputed with `git log -L`: no row, an outdated row or an unreadable one.
     Miss(Vec<Commit>),
@@ -296,18 +296,19 @@ async fn symbol_history(
             }
         }
     }
-    let commits = match history::history_for_span(repo, file, symbol.start_line, symbol.end_line) {
-        Ok(commits) => commits,
-        Err(err) => {
-            tracing::warn!(
-                path = %file.display(),
-                fqn = %symbol.fqn,
-                error = %err,
-                "skipping history for symbol"
-            );
-            return HistoryOutcome::Failed;
-        }
-    };
+    let commits =
+        match history::history_for_span(repo, file, symbol.history_start_line, symbol.end_line) {
+            Ok(commits) => commits,
+            Err(err) => {
+                tracing::warn!(
+                    path = %file.display(),
+                    fqn = %symbol.fqn,
+                    error = %err,
+                    "skipping history for symbol"
+                );
+                return HistoryOutcome::Failed;
+            }
+        };
     if !cacheable {
         return HistoryOutcome::Miss(commits);
     }
@@ -580,6 +581,7 @@ public class UserService {
             kind: crate::symbols::SymbolKind::Class,
             start_line: 1,
             end_line: 1,
+            history_start_line: 1,
             start_byte,
             end_byte,
             parent: None,
@@ -1067,7 +1069,7 @@ public class UserService {
             0
         );
         assert_eq!(
-            cache_count(data.path(), "history_cache").await,
+            cache_count(data.path(), "history_cache_v2").await,
             0,
             "the history cache stays untouched"
         );
@@ -1161,7 +1163,7 @@ public class UserService {
             1
         );
         assert_eq!(
-            cache_count(data.path(), "history_cache").await,
+            cache_count(data.path(), "history_cache_v2").await,
             2,
             "an untracked file is never cached"
         );
@@ -1197,7 +1199,7 @@ public class UserService {
         let dirty = index_git_repo(repo.path(), data.path()).await;
         assert_eq!(dirty.history_misses, 4, "both files still get history");
         assert_eq!(
-            cache_count(data.path(), "history_cache").await,
+            cache_count(data.path(), "history_cache_v2").await,
             2,
             "only the clean file is cached"
         );
@@ -1215,10 +1217,77 @@ public class UserService {
         );
         index_git_repo(repo.path(), data.path()).await;
         assert_eq!(
-            cache_count(data.path(), "history_cache").await,
+            cache_count(data.path(), "history_cache_v2").await,
             4,
             "once committed, the file is cached"
         );
+    }
+
+    #[tokio::test]
+    async fn javadoc_only_commit_is_part_of_the_member_history() {
+        let source = |doc: &str| {
+            format!(
+                "package com.acme;\n\npublic class Service {{\n    /** {doc} */\n    public int value() {{\n        return 1;\n    }}\n}}\n"
+            )
+        };
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &source("Returns one."),
+        );
+        commit(repo.path(), "GRLD-1 add value", "2024-01-01T00:00:00+01:00");
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &source("Returns the constant one."),
+        );
+        commit(
+            repo.path(),
+            "GRLD-9 document value",
+            "2024-01-02T00:00:00+01:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        index_git_repo(repo.path(), data.path()).await;
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        let method = id_of(conn, "com.acme.Service#value()").await;
+        assert_eq!(row_count(conn, "symbol_commits", method).await, 2);
+        assert_eq!(
+            ticket_dates(conn, method, "GRLD-9").await,
+            (
+                "2024-01-02T00:00:00+01:00".to_string(),
+                "2024-01-02T00:00:00+01:00".to_string()
+            ),
+            "the doc-only commit's ticket is attributed to the method"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_history_cache_table_is_dropped() {
+        let data = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(data.path()).await.unwrap();
+            store
+                .cache()
+                .execute("CREATE TABLE history_cache (fqn TEXT PRIMARY KEY)", ())
+                .await
+                .unwrap();
+        }
+        let store = Store::open(data.path()).await.unwrap();
+        let mut rows = store
+            .cache()
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'history_cache'",
+                (),
+            )
+            .await
+            .unwrap();
+        let count = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        assert_eq!(count, 0, "rows computed from the old span are discarded");
     }
 
     #[tokio::test]
@@ -1238,7 +1307,7 @@ public class UserService {
             let store = Store::open(data.path()).await.unwrap();
             store
                 .cache()
-                .execute("UPDATE history_cache SET commits = '{'", ())
+                .execute("UPDATE history_cache_v2 SET commits = '{'", ())
                 .await
                 .unwrap();
         }
@@ -1348,7 +1417,7 @@ public class UserService {
 
         index_git_repo(repo.path(), data.path()).await;
         assert_eq!(
-            cache_count(data.path(), "history_cache").await,
+            cache_count(data.path(), "history_cache_v2").await,
             2,
             "both symbols are cached in cache.db"
         );
@@ -1356,7 +1425,7 @@ public class UserService {
         std::fs::remove_file(data.path().join(crate::store::INDEX_DB)).unwrap();
         index_git_repo(repo.path(), data.path()).await;
         assert_eq!(
-            cache_count(data.path(), "history_cache").await,
+            cache_count(data.path(), "history_cache_v2").await,
             2,
             "the cache is not rebuilt from scratch"
         );

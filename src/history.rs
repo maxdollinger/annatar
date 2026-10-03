@@ -173,7 +173,7 @@ impl<'a> HistoryCache<'a> {
             .conn
             .query(
                 "SELECT content_hash, file_last_commit, commits
-                 FROM history_cache WHERE fqn = ?1",
+                 FROM history_cache_v2 WHERE fqn = ?1",
                 params![fqn],
             )
             .await
@@ -183,16 +183,16 @@ impl<'a> HistoryCache<'a> {
         };
         let stored_hash = row
             .get::<String>(0)
-            .context("reading history_cache.content_hash")?;
+            .context("reading history_cache_v2.content_hash")?;
         let stored_commit = row
             .get::<String>(1)
-            .context("reading history_cache.file_last_commit")?;
+            .context("reading history_cache_v2.file_last_commit")?;
         if stored_hash != content_hash || stored_commit != file_last_commit {
             return Ok(None);
         }
         let stored = row
             .get::<String>(2)
-            .context("reading history_cache.commits")?;
+            .context("reading history_cache_v2.commits")?;
         let commits = serde_json::from_str(&stored).context("decoding cached commits")?;
         Ok(Some(commits))
     }
@@ -208,7 +208,7 @@ impl<'a> HistoryCache<'a> {
         let stored = serde_json::to_string(commits).context("encoding cached commits")?;
         self.conn
             .execute(
-                "INSERT INTO history_cache (fqn, content_hash, file_last_commit, commits)
+                "INSERT INTO history_cache_v2 (fqn, content_hash, file_last_commit, commits)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(fqn) DO UPDATE SET
                      content_hash = excluded.content_hash,
