@@ -202,24 +202,15 @@ fn collect_symbols(
                 Some(parent) => format!("{parent}.{name}"),
                 None => qualify(package, &name),
             };
-            let start = child.start_position();
-            let end = child.end_position();
-            let annotations = annotations_of(child, source);
-            out.push(Symbol {
-                package: package.to_string(),
+            out.push(build_symbol(
+                package,
                 name,
-                fqn: fqn.clone(),
+                fqn.clone(),
                 kind,
-                start_line: start.row + 1,
-                end_line: end.row + 1,
-                start_byte: child.start_byte(),
-                end_byte: child.end_byte(),
-                parent: enclosing.map(str::to_string),
-                signature: signature_of(child, source),
-                javadoc: javadoc_of(child, source),
-                role: role_of(kind, &annotations, child, source),
-                annotations,
-            });
+                enclosing.map(str::to_string),
+                child,
+                source,
+            ));
             if let Some(body) = type_body(child) {
                 collect_symbols(body, source, package, Some(&fqn), out);
             }
@@ -271,29 +262,64 @@ fn member_symbol(
         .child_by_field_name("parameters")
         .map(|parameters| render_params(parameters, source))
         .unwrap_or_default();
-    let start = node.start_position();
-    let end = node.end_position();
-    let annotations = annotations_of(node, source);
-    Some(Symbol {
+    let fqn = format!("{parent}#{name}({params})");
+    Some(build_symbol(
+        package,
+        name,
+        fqn,
+        kind,
+        Some(parent.to_string()),
+        node,
+        source,
+    ))
+}
+
+/// Build a [`Symbol`] from a declaration node, whether a type or a member.
+///
+/// The declaration's annotation nodes are walked once; the annotation texts,
+/// the signature and the role are all derived from that single list.
+fn build_symbol(
+    package: &str,
+    name: String,
+    fqn: String,
+    kind: SymbolKind,
+    parent: Option<String>,
+    declaration: Node<'_>,
+    source: &str,
+) -> Symbol {
+    let annotation_nodes = annotation_nodes(declaration);
+    let annotations: Vec<String> = annotation_nodes
+        .iter()
+        .map(|annotation| text(*annotation, source).trim().to_string())
+        .collect();
+    let annotation_names: Vec<&str> = annotations
+        .iter()
+        .map(|annotation| annotation_simple_name(annotation))
+        .collect();
+    let start = declaration.start_position();
+    let end = declaration.end_position();
+    let role = role_of(kind, &annotation_names, declaration, source);
+    Symbol {
         package: package.to_string(),
-        name: name.clone(),
-        fqn: format!("{parent}#{name}({params})"),
+        name,
+        fqn,
         kind,
         start_line: start.row + 1,
         end_line: end.row + 1,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        parent: Some(parent.to_string()),
-        signature: signature_of(node, source),
-        javadoc: javadoc_of(node, source),
-        role: role_of(kind, &annotations, node, source),
+        start_byte: declaration.start_byte(),
+        end_byte: declaration.end_byte(),
+        parent,
+        signature: signature_of(declaration, source, &annotation_nodes),
+        javadoc: javadoc_of(declaration, source),
         annotations,
-    })
+        role,
+    }
 }
 
 /// The declaration text with the body removed, leading annotations stripped,
-/// whitespace collapsed and a trailing `;` dropped.
-fn signature_of(declaration: Node<'_>, source: &str) -> String {
+/// whitespace collapsed and a trailing `;` dropped. `annotations` is the
+/// declaration's precomputed annotation-node list.
+fn signature_of(declaration: Node<'_>, source: &str, annotations: &[Node<'_>]) -> String {
     let start = declaration.start_byte();
     let end = body_node(declaration)
         .map(|body| body.start_byte())
@@ -301,7 +327,7 @@ fn signature_of(declaration: Node<'_>, source: &str) -> String {
 
     let mut header = String::new();
     let mut cursor = start;
-    for annotation in annotation_nodes(declaration) {
+    for annotation in annotations {
         let annotation_start = annotation.start_byte();
         let annotation_end = annotation.end_byte().min(end);
         if annotation_start < cursor || annotation_start >= end {
@@ -324,8 +350,10 @@ fn signature_of(declaration: Node<'_>, source: &str) -> String {
 }
 
 /// The body block of a declaration: `class_body`/`interface_body`/`enum_body`/
-/// `annotation_type_body`/`record_body` for types, `body`/`constructor_body`
-/// for methods and constructors.
+/// `annotation_type_body` for types (records use `class_body`), and
+/// `body`/`constructor_body` for methods and constructors. A record's body is
+/// resolved by `child_by_field_name("body")`, since its grammar field is a
+/// `class_body`.
 fn body_node(declaration: Node<'_>) -> Option<Node<'_>> {
     if let Some(body) = declaration.child_by_field_name("body") {
         return Some(body);
@@ -338,20 +366,10 @@ fn body_node(declaration: Node<'_>) -> Option<Node<'_>> {
                 | "interface_body"
                 | "enum_body"
                 | "annotation_type_body"
-                | "record_body"
                 | "constructor_body"
                 | "block"
         )
     })
-}
-
-/// Annotation texts on a declaration, as written (arguments keep their original
-/// spacing), in source order.
-fn annotations_of(declaration: Node<'_>, source: &str) -> Vec<String> {
-    annotation_nodes(declaration)
-        .into_iter()
-        .map(|annotation| text(annotation, source).trim().to_string())
-        .collect()
 }
 
 /// The `marker_annotation` and `annotation` nodes on a declaration, whether
@@ -416,18 +434,14 @@ fn clean_javadoc(raw: &str) -> String {
 /// entity.
 fn role_of(
     kind: SymbolKind,
-    annotations: &[String],
+    annotation_names: &[&str],
     declaration: Node<'_>,
     source: &str,
 ) -> Option<Role> {
     if !kind.is_type() {
         return None;
     }
-    let names: Vec<&str> = annotations
-        .iter()
-        .map(|annotation| annotation_simple_name(annotation))
-        .collect();
-    let has = |name: &str| names.contains(&name);
+    let has = |name: &str| annotation_names.contains(&name);
 
     if has("Controller") || has("RestController") {
         Some(Role::Controller)
@@ -610,13 +624,14 @@ fn type_body(declaration: Node<'_>) -> Option<Node<'_>> {
         .find(|child| is_type_container(child.kind()))
 }
 
-/// Node kinds that hold type and member declarations directly: the root, the
-/// bodies of each type kind, and the declarations section of an enum body.
+/// Node kinds that hold type and member declarations directly: the bodies of
+/// each type kind, and the declarations section of an enum body. The root
+/// `program` is passed to `collect_symbols` directly and is never discovered
+/// through this predicate.
 fn is_type_container(node_kind: &str) -> bool {
     matches!(
         node_kind,
-        "program"
-            | "class_body"
+        "class_body"
             | "interface_body"
             | "enum_body"
             | "enum_body_declarations"
@@ -1120,6 +1135,32 @@ enum Color { RED }
         assert_eq!(
             by_fqn(&symbols, "com.acme.sig.Color").signature,
             "enum Color"
+        );
+    }
+
+    #[test]
+    fn record_with_a_body_signature_stops_at_the_header() {
+        let source = "\
+package com.acme.recbody;
+
+record Point(int x, int y) {
+    Point {
+        if (x < 0) { throw new IllegalArgumentException(); }
+    }
+
+    int sum() { return x + y; }
+}
+";
+        let symbols = parse(source);
+
+        assert_eq!(
+            by_fqn(&symbols, "com.acme.recbody.Point").signature,
+            "record Point(int x, int y)",
+            "a record's body is a class_body, resolved by the body field"
+        );
+        assert_eq!(
+            by_fqn(&symbols, "com.acme.recbody.Point#sum()").signature,
+            "int sum()"
         );
     }
 
