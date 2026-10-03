@@ -17,7 +17,9 @@ async fn sample_project_indexes_and_show_lists_children() {
         .await
         .unwrap();
     assert_eq!(stats.files, 4, "one file per sample type");
-    assert_eq!(stats.skipped, 0);
+    assert_eq!(stats.empty, 0);
+    assert_eq!(stats.parse_errors, 0);
+    assert_eq!(stats.unreadable, 0);
     assert_eq!(stats.symbols, 14);
 
     let conn = store.open_index().await.unwrap();

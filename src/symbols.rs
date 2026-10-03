@@ -1,14 +1,16 @@
 //! Java symbols parsed with tree-sitter.
 //!
-//! [`parse_file`] is the entry point: it parses one source file and returns a
-//! record per named type (class, interface, enum, record and `@interface`) plus
-//! every method and constructor, in source order. Each carries the declaration
-//! text the LLM will read — signature (with the body removed), Javadoc and
-//! annotations — and each type carries a Spring [`Role`] derived from those
-//! annotations.
+//! [`JavaParser`] is the reusable entry point: construct it once (grammar
+//! loading is fallible and expensive) and call [`JavaParser::parse`] per file.
+//! It returns a [`ParsedFile`] with a record per named type (class, interface,
+//! enum, record and `@interface`) plus every method and constructor, in source
+//! order. Each carries the declaration text the LLM will read — signature (with
+//! the body removed), Javadoc and annotations — and each type carries a Spring
+//! [`Role`] derived from those annotations.
 //!
-//! Files that do not parse cleanly are logged and skipped: the plan wants a
-//! broken file to drop out of a run, not fail it. Anonymous and method-local
+//! Files that do not parse cleanly are logged and marked `parse_error`, with no
+//! symbols; a clean file with no symbols (`package-info.java`) is not an error.
+//! The plan wants a broken file to drop out of a run, not fail it. Anonymous and method-local
 //! classes are ignored too: recursion only descends into type containers, so
 //! executable scopes (method bodies, field initializers, lambdas) contribute
 //! nothing.
@@ -113,30 +115,64 @@ pub struct Symbol {
     pub role: Option<Role>,
 }
 
-/// Parse every named type and member in `source`.
+/// A reusable tree-sitter Java parser.
 ///
-/// A file that tree-sitter cannot parse without errors is logged with `path`
-/// and yields an empty list; this is a skip, not a failure.
-pub fn parse_file(path: &Path, source: &str) -> Result<Vec<Symbol>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .context("loading the tree-sitter-java grammar")?;
+/// Construct one per run (or per thread) and reuse it across files: loading the
+/// grammar is fallible and expensive, so it happens once in [`JavaParser::new`].
+pub struct JavaParser {
+    parser: Parser,
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        tracing::warn!(path = %path.display(), "tree-sitter produced no tree; skipping file");
-        return Ok(Vec::new());
-    };
-    let root = tree.root_node();
-    if root.has_error() {
-        tracing::warn!(path = %path.display(), "parse errors; skipping file");
-        return Ok(Vec::new());
+impl JavaParser {
+    /// Build a Java parser, loading the tree-sitter-java grammar once.
+    pub fn new() -> Result<Self> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .context("loading the tree-sitter-java grammar")?;
+        Ok(Self { parser })
     }
 
-    let package = package_name(root, source);
-    let mut symbols = Vec::new();
-    collect_symbols(root, source, &package, None, &mut symbols);
-    Ok(symbols)
+    /// Parse every named type and member in `source`.
+    ///
+    /// A file that tree-sitter cannot parse without errors is logged with `path`
+    /// and yields no symbols with `parse_error: true`; this is a skip, not a
+    /// failure. A clean file with no symbols (`package-info.java`) has
+    /// `parse_error: false`.
+    pub fn parse(&mut self, path: &Path, source: &str) -> Result<ParsedFile> {
+        let Some(tree) = self.parser.parse(source, None) else {
+            tracing::warn!(path = %path.display(), "tree-sitter produced no tree; skipping file");
+            return Ok(ParsedFile {
+                symbols: Vec::new(),
+                parse_error: true,
+            });
+        };
+        let root = tree.root_node();
+        if root.has_error() {
+            tracing::warn!(path = %path.display(), "parse errors; skipping file");
+            return Ok(ParsedFile {
+                symbols: Vec::new(),
+                parse_error: true,
+            });
+        }
+
+        let package = package_name(root, source);
+        let mut symbols = Vec::new();
+        collect_symbols(root, source, &package, None, &mut symbols);
+        Ok(ParsedFile {
+            symbols,
+            parse_error: false,
+        })
+    }
+}
+
+/// The result of parsing one source file.
+#[derive(Debug)]
+pub struct ParsedFile {
+    /// The symbols found, in source order. Empty when `parse_error` is `true`.
+    pub symbols: Vec<Symbol>,
+    /// Whether tree-sitter reported errors or produced no tree.
+    pub parse_error: bool,
 }
 
 /// Walk a type container (the root `program` or a type body) and record every
@@ -623,8 +659,15 @@ fn text(node: Node<'_>, source: &str) -> String {
 mod tests {
     use super::*;
 
+    fn parsed(source: &str) -> ParsedFile {
+        JavaParser::new()
+            .unwrap()
+            .parse(Path::new("Fixture.java"), source)
+            .unwrap()
+    }
+
     fn parse(source: &str) -> Vec<Symbol> {
-        parse_file(Path::new("Fixture.java"), source).unwrap()
+        parsed(source).symbols
     }
 
     fn by_name<'a>(symbols: &'a [Symbol], name: &str) -> &'a Symbol {
@@ -784,14 +827,26 @@ class NoPackage {
     }
 
     #[test]
-    fn broken_file_returns_empty_and_does_not_panic() {
+    fn broken_file_reports_a_parse_error_and_does_not_panic() {
         let source = "\
 package com.acme.broken;
 
 class Broken {
     void run() {
 ";
-        assert!(parse(source).is_empty());
+        let result = parsed(source);
+        assert!(
+            result.parse_error,
+            "a missing closing brace is a parse error"
+        );
+        assert!(result.symbols.is_empty());
+    }
+
+    #[test]
+    fn clean_file_without_symbols_is_not_a_parse_error() {
+        let result = parsed("package com.acme;\n");
+        assert!(!result.parse_error, "a valid package declaration parses");
+        assert!(result.symbols.is_empty());
     }
 
     #[test]

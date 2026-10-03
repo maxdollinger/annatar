@@ -11,11 +11,20 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | 1.5 Write symbols and `show` — **done** (Phase 1 complete) |
+| Step | H1 Parse contract + parser reuse — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H1 Parse contract + parser reuse.** `symbols` gains a reusable `JavaParser`
+  (grammar loaded once per run) and `ParsedFile { symbols, parse_error }`;
+  `parse_file` is removed. A broken file is now `parse_error: true` with empty
+  symbols, while a clean symbol-less file (`package-info.java`) is
+  `parse_error: false`. `IndexStats.skipped` is replaced by disjoint `empty` /
+  `parse_errors` / `unreadable` buckets, with `files` still meaning "produced
+  ≥ 1 symbol"; the `index` summary prints them all. Resolves open question #11.
+  43 tests, green.
 
 - **Pre-Phase-2 review.** Verified all five steps on edge-case Java (enums,
   interfaces with default methods, records, annotations, generics, varargs,
@@ -95,8 +104,8 @@ the decisions taken, and the tradeoffs behind them.
 ### Next
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
-  items `H1`–`H9` in order. This is the active queue before Phase 2.1. Start
-  with **H1** (parse contract + parser reuse), which unblocks 2.3.
+  items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1 is
+  done; next is **H2** (bounds-safe `content_hash`).
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -113,6 +122,7 @@ the decisions taken, and the tradeoffs behind them.
 | 1.4 Text + role | done | signature/javadoc/annotations/role; 17 symbols tests (32 total) |
 | 1.5 Write + show | done | `symbols` table, `indexer::build_index`, `Store::open_index`, `show::render`; 40 tests |
 | Pre-Phase-2 review | done | edge-case + CLI verification; missing-repo error; quieter empty-file log; 41 tests |
+| H1 Parse contract + parser reuse | done | `JavaParser`/`ParsedFile`; `IndexStats` buckets `empty`/`parse_errors`/`unreadable`; parser built once per run; resolves open #11; 43 tests |
 
 ## Decisions and tradeoffs
 
@@ -159,7 +169,9 @@ the decisions taken, and the tradeoffs behind them.
 | 39 | `content_hash` = blake3(javadoc + `\n` + source slice); annotations stored as a JSON array string | Hash source only / newline-join annotations | A doc-only edit must invalidate later summaries; JSON survives multi-line annotation text |
 | 40 | `kind`/`role` stored as lower-case strings via `as_str()`, part of the on-disk contract | Store the Rust enum via an integer/serde tag | The index is inspected by SQL and later the MCP tools; readable stable strings are the simplest contract |
 | 41 | `show::render` loads the whole `symbols` table, builds a child map in memory, recurses with an explicit stack | One query per node / recursive CTEs | POC-scale tables make this cheap and it avoids async recursion; revisit when the index grows |
-| 42 | `IndexStats.files` counts files that produced a symbol; a genuinely empty or unparseable file counts as `skipped` | Count every walked file as `files` | Keeps `files + skipped` = walked, and treats "nothing to index" uniformly until the parser can report parse-error vs empty |
+| 42 | `IndexStats.files` counts files that produced a symbol; the disjoint `empty` / `parse_errors` / `unreadable` buckets count the rest | Count every walked file as `files` | `files` + the three failure buckets = walked; a clean symbol-less file (`package-info.java`) is now distinct from a parse failure (D-a) |
+| D-a (H1) | New `JavaParser`/`ParsedFile` API; `IndexStats.skipped` is replaced by `empty`/`parse_errors`/`unreadable`, `files` keeps its meaning | Keep `Ok(vec![])` for both | Distinguishes a broken file from a symbol-less one; resolves open #11; parser reused once per run (one grammar load) |
+| D-j (H1) | Update decision 42 (skip semantics) as above; decision 25 (walker pruning) is unaffected here | — | Decision 25 changes with H9, not H1 |
 | 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
 
 ## Open questions
@@ -176,7 +188,7 @@ the decisions taken, and the tradeoffs behind them.
 | 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | resolved — one `schema` module (decision 23) |
 | 9 | Walker uses `parents(false)`: if `repo` ever points at a subdirectory of a larger checkout, `.ignore`/`.gitignore` above it are not read. Acceptable? | 1.1 | open, defer — fine while `repo` is a repo root |
 | 10 | `--path` is a literal prefix; should it accept globs (e.g. `src/main/java/com/acme/**`)? | 1.1 | open, defer — literal prefix matches the plan wording |
-| 11 | A valid but symbol-less file (e.g. `package-info.java`) is counted `skipped` like a parse error. Distinguish parse-error vs empty? | 1.5 | open — resolve before 2.3 reports run quality; needs `parse_file` to signal a parse failure |
+| 11 | A valid but symbol-less file (e.g. `package-info.java`) is counted `skipped` like a parse error. Distinguish parse-error vs empty? | 1.5 | resolved by H1 — `ParsedFile.parse_error` separates them; `IndexStats` reports `empty` / `parse_errors` / `unreadable` |
 | 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | open — decide handling (error, warn, or blame working tree) when 2.1 lands |
