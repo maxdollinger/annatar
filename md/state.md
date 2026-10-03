@@ -11,11 +11,26 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H7 Batch symbol writes in a transaction — **done** |
+| Step | H9 Narrow walker pruning of `build`/`generated` — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H9 Narrow walker pruning of `build`/`generated`.** `is_skipped_dir` no
+  longer prunes a directory named in `SKIP_DIRS` anywhere: it now prunes such a
+  directory only when it is **not under a source root** (no ancestor component
+  named `java`). So `src/main/java/com/acme/build/Keep.java` is indexed while a
+  module-root `build/`, `target/...`, `generated-sources/...`, and
+  `module/build/Nested/Ignored.java` are still excluded. `java_files`' signature
+  and the rest of the walk are unchanged; the `SKIP_DIRS` doc comment and
+  `is_skipped_dir` gained a doc comment describing the narrowing. No
+  `[index] skip_dirs` config escape hatch (explicitly out of scope). Updated the
+  `returns_exactly_the_expected_production_files` fixture to move the generated
+  sample out of the source root (`generated/Generated.java`) so it still proves
+  generated output is pruned, and added a test that a package named `build`
+  under `src/main/java` survives while root `build/Out.java` is pruned.
+  Decision D-h (H9); decision D-j (H1, H9). 52 tests, green.
 
 - **H7 Batch symbol writes in a transaction.** `build_index` now begins one
   transaction on the build connection after `begin_index` and writes every
@@ -179,8 +194,8 @@ the decisions taken, and the tradeoffs behind them.
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
   items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1
-  through H7 are done; next is **H9** (narrow walker pruning of
-  `build`/`generated`), then H8.
+  through H7 and H9 are done; next is **H8** (doc drift, test smells and minor
+  cleanups).
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -204,6 +219,7 @@ the decisions taken, and the tradeoffs behind them.
 | H5 Surface decode failures | done | corrupt annotations error with the fqn; `text()` warns with kind/span and returns empty; 1 show test; decision D-e; 49 tests |
 | H6 De-duplicate symbol construction | done | one `build_symbol` factory; annotations walked once (texts + signature + role); dead `record_body`/`program` arms removed; 1 record-body test; decision D-f; 50 tests |
 | H7 Batch symbol writes in a transaction | done | one transaction wraps all symbol writes; committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` (no `IndexBuild::transaction()`); 1 store rollback test; decision D-g; 51 tests |
+| H9 Narrow walker pruning of `build`/`generated` | done | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample out of source root; 1 new walker test; decision D-h, D-j; 52 tests |
 
 ## Decisions and tradeoffs
 
@@ -233,7 +249,7 @@ the decisions taken, and the tradeoffs behind them.
 | 22 | `Store::begin_index` returns an owned `IndexBuild` with `commit()`; `Store` no longer tracks the in-progress build | Return `&Connection` from `&mut Store`, then finish on `Store` | The borrow blocked holding the connection across an async pipeline while later calling finish, and mixed a sync finish with an async build. An owned guard survives the whole run and aborting is just a drop |
 | 23 | All DDL lives in one `schema` module: `INDEX_TABLES` applied by `begin_index`, `CACHE_TABLES` by `open` | Per-phase DDL scattered in each step | `index.db` is disposable, so no migrations or versioning; one file keeps the whole shape reviewable as phases 1–5 add tables |
 | 24 | A working dummy `annatar.toml` is committed (data dir `.annatar`, gitignored) | No config in the repo | The binary's default config now loads out of the box; secrets still come only from the environment, so the file stays committable |
-| 25 | Generated sources detected by directory name (`generated`, `generated-sources`), pruned anywhere | Parse Maven/Gradle build files | Language/build-system agnostic, cheap, and testable; revisit if a repo names its tree differently |
+| 25 | Build/generated sources detected by directory name (`build`, `target`, `generated`, `generated-sources`), pruned only when not under a source root (no ancestor named `java`) | Prune the names anywhere; parse Maven/Gradle build files; add an `index.skip_dirs` config | Language/build-system agnostic, cheap, and testable, and now does not drop a legitimate package such as `com.acme.build`; a config escape hatch is deferred (D-h) |
 | 26 | `--path` is a literal path prefix (`Path::starts_with`), not a glob | Glob/pattern matching | The plan calls it a prefix; prefix semantics cover both a directory and a single file with no pattern engine |
 | 27 | Walker sets `require_git(false)` and `parents(false)` | Require a git repo / honour ancestor ignores | Temp-dir tests need no `git init` and stay deterministic; `parents(false)` also stops a parent `.gitignore` outside the repo from affecting a run |
 | 28 | `tree-sitter` 0.25 + `tree-sitter-java` 0.23 (ABI-matched pair) | Other version pairs | A real parse test proves the pair loads; later bumps must keep the grammar crate compatible |
@@ -252,7 +268,7 @@ the decisions taken, and the tradeoffs behind them.
 | 41 | `show::render` loads the whole `symbols` table, builds a child map in memory, recurses with an explicit stack | One query per node / recursive CTEs | POC-scale tables make this cheap and it avoids async recursion; revisit when the index grows |
 | 42 | `IndexStats.files` counts files that produced a symbol; the disjoint `empty` / `parse_errors` / `unreadable` buckets count the rest | Count every walked file as `files` | `files` + the three failure buckets = walked; a clean symbol-less file (`package-info.java`) is now distinct from a parse failure (D-a) |
 | D-a (H1) | New `JavaParser`/`ParsedFile` API; `IndexStats.skipped` is replaced by `empty`/`parse_errors`/`unreadable`, `files` keeps its meaning | Keep `Ok(vec![])` for both | Distinguishes a broken file from a symbol-less one; resolves open #11; parser reused once per run (one grammar load) |
-| D-j (H1) | Update decision 42 (skip semantics) as above; decision 25 (walker pruning) is unaffected here | — | Decision 25 changes with H9, not H1 |
+| D-j (H1, H9) | Update decision 42 (skip semantics) and decision 25 (walker pruning) | — | Decision 42 changed with H1; decision 25 changed with H9 (D-h) |
 | D-b (H2) | An out-of-range symbol span is a hard error carrying the fqn and span; `content_hash` returns `Result` | Clamp the span to the source length and hash the wrong bytes | A span past the end is a parser bug, so the run must fail with context, never panic or hash a truncated slice |
 | D-c (H3) | Enable `PRAGMA foreign_keys = ON` per index connection (build in `begin_index`, read in `open_index`) | Drop the `REFERENCES` clause | Keeps the schema's advertised integrity real; pre-order insert already satisfies it, so enabling is safe. SQLite/libSQL is per-connection and the pragma is a no-op inside a transaction, so it runs right after `connect`. Empirically, `INSERT OR IGNORE` does not suppress an FK violation (it errors), so a linking bug fails loudly |
 | 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
@@ -260,6 +276,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-e (H5) | Corrupt annotation JSON is an error carrying the symbol fqn; `symbols::text` logs `tracing::warn!` (node kind + byte range) and returns empty | Make every text helper fallible | JSON corruption is a real, cheap-to-propagate failure; a UTF-8 failure is impossible for valid tree-sitter spans, so a log is the proportionate signal instead of rippling `Result` through every parser helper |
 | D-f (H6) | One `build_symbol` factory builds every `Symbol`; a declaration's annotation nodes are walked once and the texts, signature and role all derive from that single list (`signature_of` takes the node list, `role_of` the extracted simple names) | Keep the two field literals and let `annotations_of`/`signature_of`/`role_of` each walk/parse independently | Removes the duplicated 15+ field construction and triple annotation traversal without changing any output; the existing `symbols` tests are the regression net. A record's body is a `class_body` resolved via `child_by_field_name("body")`, so the `record_body` arm and the unreachable `program` arm are dead |
 | D-g (H7) | Wrap the whole build in one transaction (local to `build_index`), committed before the temp file is renamed | Per-file transactions; an `IndexBuild::transaction()` guard | Fewest round trips and the audit's first lever for the 2.3 batched baseline. A local transaction keeps the commit-before-`build.commit()` ordering explicit in one function and leaves `store.rs` production code untouched; a guard type would not really enforce ordering any harder. On error the transaction is dropped (rollback) before the temp file is discarded, so nothing partial is ever renamed over `index.db`. In libsql 0.9.30 `Connection::transaction()` is `async`, so the begin is `.await`ed (the plan text said sync) |
+| D-h (H9) | Prune skip-dirs only outside source roots (no ancestor named `java`) | Prune by name anywhere (current); add `index.skip_dirs` config | Fixes the false negative with a one-function change; a config escape hatch is deferred to avoid cross-module scope creep |
 
 ## Open questions
 

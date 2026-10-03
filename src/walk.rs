@@ -10,9 +10,11 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::Result;
 use ignore::{DirEntry, WalkBuilder};
 
-/// Directory names that are pruned wherever they appear in the tree. `build`
-/// and `target` are Maven/Gradle output; `generated` and `generated-sources`
-/// are build-time source trees.
+/// Directory names that are build output or generated source trees: `build`
+/// and `target` are Maven/Gradle output, `generated` and `generated-sources`
+/// are build-time source trees. A directory carrying one of these names is
+/// pruned only outside a source root, so a legitimate package such as
+/// `com.acme.build` under `src/main/java` is still indexed.
 const SKIP_DIRS: &[&str] = &["build", "target", "generated", "generated-sources"];
 
 /// Any file under this repository-relative prefix is test code.
@@ -88,6 +90,11 @@ fn is_test(path: &Path) -> bool {
     path.starts_with(TEST_PREFIX)
 }
 
+/// Whether `entry` is a directory to prune from the walk.
+///
+/// A directory whose name is in [`SKIP_DIRS`] is build output or a generated
+/// source tree and is pruned, unless it sits under a source root (an ancestor
+/// component named `java`), where the same name may be a legitimate package.
 fn is_skipped_dir(repo: &Path, entry: &DirEntry) -> bool {
     if !entry
         .file_type()
@@ -98,10 +105,15 @@ fn is_skipped_dir(repo: &Path, entry: &DirEntry) -> bool {
     let Ok(relative) = entry.path().strip_prefix(repo) else {
         return false;
     };
-    relative.components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
-        SKIP_DIRS.iter().any(|skip| name == *skip)
-    })
+    let mut components = relative.components();
+    let Some(name) = components.next_back() else {
+        return false;
+    };
+    let name = name.as_os_str().to_string_lossy();
+    if !SKIP_DIRS.iter().any(|skip| name == *skip) {
+        return false;
+    }
+    !components.any(|component| component.as_os_str() == "java")
 }
 
 /// Reduce `prefix` to a path relative to `repo`. Absolute prefixes that fall
@@ -156,7 +168,7 @@ mod tests {
             "src/main/java/com/acme/Util.java",
             "src/main/java/com/acme/package-info.txt",
             "src/test/java/com/acme/AppTest.java",
-            "src/main/java/com/acme/generated/Generated.java",
+            "generated/Generated.java",
             "build/Out.java",
             "target/Target.java",
             "generated-sources/Source.java",
@@ -204,6 +216,22 @@ mod tests {
         let files = java_files(root, None).unwrap();
 
         assert_eq!(files, paths(&["src/main/java/com/acme/Real.java"]));
+    }
+
+    #[test]
+    fn keeps_package_dirs_named_build_under_a_source_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/build/Keep.java");
+        write_file(root, "build/Out.java");
+
+        let files = java_files(root, None).unwrap();
+
+        assert_eq!(
+            files,
+            paths(&["src/main/java/com/acme/build/Keep.java"]),
+            "a package named build under a source root is indexed; build output is pruned"
+        );
     }
 
     #[test]

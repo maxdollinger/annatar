@@ -489,7 +489,7 @@ Status of each item as it lands. One commit per item (Conventional Commits);
 | H5 | done | — | 49 | `parse_annotations` returns `Result` with the fqn; `text()` warns (kind/span) and returns empty; corrupt-annotations `show` test |
 | H6 | done | — | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
 | H7 | done | — | 51 | one transaction wraps all symbol writes, committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` |
-| H9 | pending | — | — | |
+| H9 | done | — | 52 | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample under source root → `generated/`; 1 new walker test |
 | H8 | pending | — | — | |
 
 ### Deviations from the plan
