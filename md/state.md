@@ -10,7 +10,7 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
+| Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation R0–R7 complete, R8 pending (product owner) |
 | Step | R7 Doc drift — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
