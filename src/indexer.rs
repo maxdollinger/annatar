@@ -390,6 +390,13 @@ async fn index_history(
 /// other status, unparseable issue, invalid key) → one warning, counted in
 /// `tickets_failed`, not cached, so the next run retries it.
 ///
+/// Before the first fetch (never on a run with nothing to fetch) the source's
+/// auth check runs once and counts as one Jira request: rejected credentials
+/// fail the run before any key is fetched, so a server that answers every
+/// request with a plain 403 (Jira Cloud given a bearer token) cannot get every
+/// key cached as unavailable. Any other check failure skips all fetches like
+/// the circuit breaker: one warning, every missing key `tickets_not_fetched`.
+///
 /// A transport failure or a 429 that outlasts its retries trips a circuit
 /// breaker on the first occurrence: no further fetch starts, in-flight fetches
 /// are aborted, every key left is counted in `tickets_not_fetched` and one
@@ -455,6 +462,25 @@ async fn fetch_tickets(
     known: &mut BTreeMap<String, CachedTicket>,
     stats: &mut IndexStats,
 ) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    stats.jira_requests += 1;
+    match jira.source.check_auth().await {
+        Ok(()) => {}
+        Err(err @ FetchError::Unauthorized { .. }) => {
+            return Err(anyhow::Error::new(err)).context("checking Jira credentials");
+        }
+        Err(err) => {
+            stats.tickets_not_fetched += missing.len();
+            tracing::warn!(
+                error = %err,
+                remaining = missing.len(),
+                "Jira auth check failed; not fetching tickets this run"
+            );
+            return Ok(());
+        }
+    }
     let requests = Arc::new(AtomicUsize::new(0));
     let mut pending = missing.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
@@ -2009,7 +2035,8 @@ public class UserService {
         assert_eq!(cold.tickets_fetched, 1);
         assert_eq!(cold.tickets_unavailable, 2);
         assert_eq!(cold.ticket_hits, 0);
-        assert_eq!(cold.jira_requests, 3);
+        assert_eq!(cold.jira_requests, 1 + 3, "one auth check, three fetches");
+        assert_eq!(source.auth_checks(), 1);
         assert_eq!(source.calls(), 3);
         assert_ticket_buckets(&cold);
         assert_eq!(
@@ -2033,6 +2060,11 @@ public class UserService {
             .await
             .unwrap();
         assert_eq!(source.calls(), 3, "a second run makes no Jira calls");
+        assert_eq!(
+            source.auth_checks(),
+            1,
+            "no auth check when every key is cached"
+        );
         assert_eq!(warm.jira_requests, 0);
         assert_eq!(warm.ticket_hits, 3);
         assert_eq!(warm.tickets_fetched + warm.tickets_unavailable, 0);
@@ -2072,8 +2104,8 @@ public class UserService {
         assert_eq!(first.tickets_fetched, 0);
         assert_eq!(
             first.jira_requests,
-            1 + 1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize,
-            "503 once, 429 plus its retries"
+            1 + 1 + 1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize,
+            "auth check, 503 once, 429 plus its retries"
         );
         assert_ticket_buckets(&first);
         assert_eq!(cache_count(data.path(), "ticket_cache").await, 0);
@@ -2114,6 +2146,58 @@ public class UserService {
             vec!["com.acme.Service", "com.acme.Service#value()"],
             "the previous index is untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_check_fails_the_run_before_any_fetch() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
+        let data = tempfile::tempdir().unwrap();
+        index_with(repo.path(), data.path(), None).await.unwrap();
+        let source = FakeSource::new();
+        source.script_auth(Answer::Unauthorized);
+        source.script("GRLD-1", &[Answer::Unavailable(403)]);
+        source.script("GRLD-2", &[Answer::Unavailable(403)]);
+
+        let err = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 4)),
+        )
+        .await
+        .expect_err("rejected credentials must fail the run");
+
+        assert!(format!("{err:#}").contains("credentials"), "{err:#}");
+        assert_eq!(source.auth_checks(), 1);
+        assert_eq!(source.calls(), 0, "no ticket is fetched");
+        assert!(ticket_cache_keys(data.path()).await.is_empty());
+        assert_eq!(
+            fqns(data.path()).await,
+            vec!["com.acme.Service", "com.acme.Service#value()"],
+            "the previous index is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_auth_check_skips_fetching_without_failing_the_run() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script_auth(Answer::Transport);
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 4)),
+        )
+        .await
+        .expect("an unreachable Jira does not fail the run");
+
+        assert_eq!(stats.tickets_not_fetched, 2);
+        assert_eq!(stats.jira_requests, 1);
+        assert_ticket_buckets(&stats);
+        assert_eq!(source.calls(), 0);
+        assert!(ticket_cache_keys(data.path()).await.is_empty());
     }
 
     #[tokio::test]
@@ -2218,7 +2302,7 @@ public class UserService {
 
         assert_eq!(stats.tickets_failed, 1);
         assert_eq!(stats.tickets_not_fetched, 2);
-        assert_eq!(stats.jira_requests, 1);
+        assert_eq!(stats.jira_requests, 1 + 1);
         assert_ticket_buckets(&stats);
         assert_eq!(source.calls(), 1, "queued keys are never requested");
         assert!(ticket_cache_keys(data.path()).await.is_empty());
@@ -2248,7 +2332,11 @@ public class UserService {
 
         assert_eq!(stats.tickets_failed, 1);
         assert_eq!(stats.tickets_not_fetched, 2);
-        assert_eq!(stats.jira_requests, 2, "the aborted request was sent");
+        assert_eq!(
+            stats.jira_requests,
+            1 + 2,
+            "the auth check, and the aborted request was sent"
+        );
         assert_ticket_buckets(&stats);
         assert_eq!(source.calls_for("GRLD-3"), 0);
         assert!(ticket_cache_keys(data.path()).await.is_empty());
@@ -2274,7 +2362,7 @@ public class UserService {
         assert_eq!(stats.tickets_not_fetched, 1);
         assert_eq!(
             stats.jira_requests,
-            1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize
+            1 + 1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize
         );
         assert_ticket_buckets(&stats);
         assert_eq!(source.calls_for("GRLD-2"), 0);
