@@ -9,17 +9,18 @@
 //!
 //! [`TicketFetch`] bundles a [`TicketSource`] with the request policy: the
 //! concurrency cap and the 429 back-off. [`fetch_with_retry`] fetches one key
-//! under that policy. Which outcomes are cached, skipped or fatal is decided by
+//! under that policy and counts the requests it sends. Which outcomes are cached, skipped or fatal is decided by
 //! the ticket stage in [`crate::indexer`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use libsql::{Connection, Row, params};
 
 use crate::config::{ENV_JIRA_TOKEN, JiraConfig};
-use crate::jira::{FetchError, JiraClient, Ticket, TicketSource};
+use crate::jira::{self, FetchError, JiraClient, Ticket, TicketSource};
 
 /// Retries after a 429 before the key is given up for this run.
 pub const MAX_RATE_LIMIT_RETRIES: u32 = 3;
@@ -127,15 +128,15 @@ fn decode(key: &str, row: &Row) -> Result<CachedTicket> {
 /// A ticket source plus the policy the ticket stage fetches with.
 #[derive(Clone)]
 pub struct TicketFetch {
-    pub source: Arc<dyn TicketSource>,
+    pub(crate) source: Arc<dyn TicketSource>,
     /// Maximum requests in flight; at least 1.
-    pub concurrency: usize,
+    pub(crate) concurrency: usize,
     /// Retries after a 429 before the key is given up for this run.
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// First wait when a 429 has no `Retry-After`; doubled per retry.
-    pub fallback_backoff: Duration,
+    pub(crate) fallback_backoff: Duration,
     /// Cap on any single 429 wait.
-    pub max_backoff: Duration,
+    pub(crate) max_backoff: Duration,
 }
 
 impl TicketFetch {
@@ -186,21 +187,32 @@ impl TicketFetch {
     }
 }
 
-/// The result of fetching one key, with the number of requests it took.
-pub struct Fetched {
-    pub key: String,
-    pub result: Result<Ticket, FetchError>,
-    pub requests: usize,
+/// The result of fetching one key.
+pub(crate) struct Fetched {
+    pub(crate) key: String,
+    pub(crate) result: Result<Ticket, FetchError>,
 }
 
 /// Fetch `key`, retrying a 429 up to `max_retries` times after the wait Jira
 /// asks for (or the doubling fallback), capped at `max_backoff`. Any other
-/// outcome, and the last 429, is returned as is.
-pub async fn fetch_with_retry(fetch: &TicketFetch, key: String) -> Fetched {
-    let mut requests = 0;
+/// outcome, and the last 429, is returned as is. `requests` is incremented as
+/// each request is sent, so a fetch that is aborted midway is still counted;
+/// a key that is not a plain Jira key is answered
+/// [`FetchError::InvalidKey`] without a request.
+pub(crate) async fn fetch_with_retry(
+    fetch: &TicketFetch,
+    key: String,
+    requests: &AtomicUsize,
+) -> Fetched {
+    if !jira::is_plain_key(&key) {
+        return Fetched {
+            result: Err(FetchError::InvalidKey(key.clone())),
+            key,
+        };
+    }
     let mut retry = 0;
     loop {
-        requests += 1;
+        requests.fetch_add(1, Ordering::Relaxed);
         let result = fetch.source.fetch(&key).await;
         match result {
             Err(FetchError::RateLimited { retry_after }) if retry < fetch.max_retries => {
@@ -213,13 +225,7 @@ pub async fn fetch_with_retry(fetch: &TicketFetch, key: String) -> Fetched {
                 tokio::time::sleep(wait).await;
                 retry += 1;
             }
-            result => {
-                return Fetched {
-                    key,
-                    result,
-                    requests,
-                };
-            }
+            result => return Fetched { key, result },
         }
     }
 }
@@ -241,6 +247,10 @@ pub(crate) mod fake {
         Unauthorized,
         RateLimited(Option<Duration>),
         Status(u16),
+        /// A connection failure.
+        Transport,
+        /// Never answers, like a request to a host that hangs.
+        Hang,
     }
 
     impl Answer {
@@ -251,6 +261,13 @@ pub(crate) mod fake {
                 Self::Unauthorized => Err(FetchError::Unauthorized { basic: false }),
                 Self::RateLimited(retry_after) => Err(FetchError::RateLimited { retry_after }),
                 Self::Status(status) => Err(FetchError::Status { status }),
+                Self::Transport => Err(FetchError::Transport(
+                    reqwest::Client::new()
+                        .get("http://")
+                        .build()
+                        .expect_err("a URL without a host does not build"),
+                )),
+                Self::Hang => unreachable!("a hanging answer never resolves"),
             }
         }
     }
@@ -325,7 +342,11 @@ pub(crate) mod fake {
                 self.peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                self.answer(key).into_result()
+                let answer = self.answer(key);
+                if matches!(answer, Answer::Hang) {
+                    std::future::pending::<()>().await;
+                }
+                answer.into_result()
             })
         }
     }
@@ -404,17 +425,39 @@ mod tests {
         source.script("GRLD-2", &[Answer::RateLimited(None)]);
         let fetch = instant(source.clone(), 1);
 
-        let fetched = fetch_with_retry(&fetch, "GRLD-1".to_string()).await;
-        assert_eq!(fetched.requests, 3);
+        let requests = AtomicUsize::new(0);
+        let fetched = fetch_with_retry(&fetch, "GRLD-1".to_string(), &requests).await;
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
         assert!(fetched.result.is_ok());
 
-        let fetched = fetch_with_retry(&fetch, "GRLD-2".to_string()).await;
-        assert_eq!(fetched.requests, 1 + MAX_RATE_LIMIT_RETRIES as usize);
+        let requests = AtomicUsize::new(0);
+        let fetched = fetch_with_retry(&fetch, "GRLD-2".to_string(), &requests).await;
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1 + MAX_RATE_LIMIT_RETRIES as usize
+        );
         assert!(matches!(
             fetched.result,
             Err(FetchError::RateLimited { .. })
         ));
         assert_eq!(source.calls(), 3 + 4);
+    }
+
+    #[tokio::test]
+    async fn invalid_key_is_not_sent_and_not_counted() {
+        let source = FakeSource::new();
+        let requests = AtomicUsize::new(0);
+
+        let fetched = fetch_with_retry(
+            &instant(source.clone(), 1),
+            "GRLD 1/../x".to_string(),
+            &requests,
+        )
+        .await;
+
+        assert!(matches!(fetched.result, Err(FetchError::InvalidKey(_))));
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert_eq!(source.calls(), 0);
     }
 
     #[test]

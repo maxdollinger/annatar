@@ -29,6 +29,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use libsql::{Connection, Transaction, params};
@@ -74,9 +76,11 @@ pub struct IndexStats {
     /// other status, unparseable response); not cached, retried next run.
     pub tickets_failed: usize,
     /// Keys missing from the cache that were not fetched because Jira is not
-    /// configured, has no token, or the run is `--offline`.
+    /// configured, has no token, the run is `--offline`, or the circuit
+    /// breaker stopped fetching after a transport failure or exhausted 429.
     pub tickets_not_fetched: usize,
-    /// Jira requests made, retries included. Zero on a fully cached run.
+    /// Jira requests sent, retries and fetches aborted by the circuit breaker
+    /// included. Zero on a fully cached run.
     pub jira_requests: usize,
     /// Files that parsed cleanly but produced no symbols (`package-info.java`).
     pub empty: usize,
@@ -383,10 +387,18 @@ async fn index_history(
 /// Outcomes per fetched key: content → cached and copied; 403/404 → cached
 /// and copied as unavailable; bad credentials → the run fails and nothing is
 /// cached for that key; anything else (429 after the retries, transport,
-/// other status, unparseable issue) → one warning, counted in
-/// `tickets_failed`, not cached, so the next run retries it. Results are
-/// written by this function alone, as they arrive, so the fetches of an
-/// aborted run are kept in the cache. A cache read fault is a miss and a
+/// other status, unparseable issue, invalid key) → one warning, counted in
+/// `tickets_failed`, not cached, so the next run retries it.
+///
+/// A transport failure or a 429 that outlasts its retries trips a circuit
+/// breaker on the first occurrence: no further fetch starts, in-flight fetches
+/// are aborted, every key left is counted in `tickets_not_fetched` and one
+/// warning says so. Such a failure means Jira is unreachable or throttling the
+/// whole account, so every other key would fail the same way, each costing up
+/// to the request timeout or the full back-off.
+///
+/// Results are written by this function alone, as they arrive, so the fetches
+/// of an aborted run are kept in the cache. A cache read fault is a miss and a
 /// failed cache write only loses the reuse; both warn.
 async fn index_tickets(
     transaction: &Transaction,
@@ -443,24 +455,30 @@ async fn fetch_tickets(
     known: &mut BTreeMap<String, CachedTicket>,
     stats: &mut IndexStats,
 ) -> Result<()> {
+    let requests = Arc::new(AtomicUsize::new(0));
     let mut pending = missing.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
+    let mut tripped = false;
     loop {
-        while tasks.len() < jira.concurrency.max(1)
+        while !tripped
+            && tasks.len() < jira.concurrency
             && let Some(key) = pending.next()
         {
             let jira = jira.clone();
-            tasks.spawn(async move { fetch_with_retry(&jira, key).await });
+            let requests = Arc::clone(&requests);
+            tasks.spawn(async move { fetch_with_retry(&jira, key, &requests).await });
         }
         let Some(joined) = tasks.join_next().await else {
             break;
         };
-        let Fetched {
-            key,
-            result,
-            requests,
-        } = joined.context("ticket fetch task failed")?;
-        stats.jira_requests += requests;
+        let Fetched { key, result } = match joined {
+            Ok(fetched) => fetched,
+            Err(err) if err.is_cancelled() => {
+                stats.tickets_not_fetched += 1;
+                continue;
+            }
+            Err(err) => return Err(err).context("ticket fetch task failed"),
+        };
         let entry = match result {
             Ok(ticket) => {
                 if ticket.key != key {
@@ -491,6 +509,22 @@ async fn fetch_tickets(
             Err(err) => {
                 tracing::warn!(key, error = %err, "could not fetch ticket; skipping it this run");
                 stats.tickets_failed += 1;
+                if !tripped
+                    && matches!(
+                        err,
+                        FetchError::Transport(_) | FetchError::RateLimited { .. }
+                    )
+                {
+                    tripped = true;
+                    tasks.abort_all();
+                    let queued = pending.by_ref().count();
+                    stats.tickets_not_fetched += queued;
+                    tracing::warn!(
+                        key,
+                        remaining = queued + tasks.len(),
+                        "Jira is unreachable or rate limiting; not fetching the remaining tickets this run"
+                    );
+                }
                 continue;
             }
         };
@@ -501,6 +535,7 @@ async fn fetch_tickets(
         }
         known.insert(key, entry);
     }
+    stats.jira_requests += requests.load(Ordering::Relaxed);
     Ok(())
 }
 
@@ -2096,6 +2131,11 @@ public class UserService {
         .unwrap();
         write(repo.path(), "src/main/java/com/acme/Service.java", &java(9));
         commit(repo.path(), "GRLD-2 change", "2024-02-01T00:00:00+00:00");
+        let store = Store::open(data.path()).await.unwrap();
+        TicketCache::new(store.cache())
+            .put_available("GRLD-99", &fake::ticket("GRLD-99"))
+            .await
+            .unwrap();
 
         let offline = index_with(repo.path(), data.path(), None).await.unwrap();
 
@@ -2111,8 +2151,134 @@ public class UserService {
                 0,
                 Some("Summary of GRLD-1".to_string())
             )],
-            "cached tickets reach the index offline; uncached ones have no row"
+            "cached tickets reach the index offline; uncached and unreferenced ones have no row"
         );
+    }
+
+    #[tokio::test]
+    async fn aborted_run_keeps_the_fetches_it_already_cached() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change", "GRLD-3 change"]);
+        let data = tempfile::tempdir().unwrap();
+        index_with(repo.path(), data.path(), None).await.unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+        source.script("GRLD-2", &[Answer::Unauthorized]);
+        source.script("GRLD-3", &[Answer::Ok(fake::ticket("GRLD-3"))]);
+
+        index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 1)),
+        )
+        .await
+        .expect_err("bad credentials must fail the run");
+
+        assert_eq!(ticket_cache_keys(data.path()).await, vec!["GRLD-1"]);
+        assert_eq!(source.calls_for("GRLD-3"), 0);
+        assert!(
+            indexed_tickets(data.path()).await.is_empty(),
+            "the previous index is untouched"
+        );
+        assert_eq!(
+            fqns(data.path()).await,
+            vec!["com.acme.Service", "com.acme.Service#value()"]
+        );
+    }
+
+    async fn ticket_cache_keys(data: &Path) -> Vec<String> {
+        let store = Store::open(data).await.unwrap();
+        let mut rows = store
+            .cache()
+            .query("SELECT key FROM ticket_cache ORDER BY key", ())
+            .await
+            .unwrap();
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            keys.push(row.get::<String>(0).unwrap());
+        }
+        keys
+    }
+
+    #[tokio::test]
+    async fn transport_failure_trips_the_breaker_and_leaves_queued_keys_unfetched() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change", "GRLD-3 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Transport]);
+        source.script("GRLD-2", &[Answer::Ok(fake::ticket("GRLD-2"))]);
+        source.script("GRLD-3", &[Answer::Ok(fake::ticket("GRLD-3"))]);
+
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 1)),
+        )
+        .await
+        .expect("an unreachable Jira does not fail the run");
+
+        assert_eq!(stats.tickets_failed, 1);
+        assert_eq!(stats.tickets_not_fetched, 2);
+        assert_eq!(stats.jira_requests, 1);
+        assert_ticket_buckets(&stats);
+        assert_eq!(source.calls(), 1, "queued keys are never requested");
+        assert!(ticket_cache_keys(data.path()).await.is_empty());
+        assert!(indexed_tickets(data.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn breaker_aborts_in_flight_fetches() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change", "GRLD-3 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Transport]);
+        source.script("GRLD-2", &[Answer::Hang]);
+        source.script("GRLD-3", &[Answer::Ok(fake::ticket("GRLD-3"))]);
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            index_with(
+                repo.path(),
+                data.path(),
+                Some(&fake::instant(source.clone(), 2)),
+            ),
+        )
+        .await
+        .expect("the hanging fetch is aborted, not awaited")
+        .unwrap();
+
+        assert_eq!(stats.tickets_failed, 1);
+        assert_eq!(stats.tickets_not_fetched, 2);
+        assert_eq!(stats.jira_requests, 2, "the aborted request was sent");
+        assert_ticket_buckets(&stats);
+        assert_eq!(source.calls_for("GRLD-3"), 0);
+        assert!(ticket_cache_keys(data.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_rate_limit_trips_the_breaker() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::RateLimited(None)]);
+        source.script("GRLD-2", &[Answer::Ok(fake::ticket("GRLD-2"))]);
+
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.tickets_failed, 1);
+        assert_eq!(stats.tickets_not_fetched, 1);
+        assert_eq!(
+            stats.jira_requests,
+            1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize
+        );
+        assert_ticket_buckets(&stats);
+        assert_eq!(source.calls_for("GRLD-2"), 0);
+        assert!(ticket_cache_keys(data.path()).await.is_empty());
     }
 
     #[tokio::test]
