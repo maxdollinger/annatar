@@ -93,8 +93,11 @@ impl Store {
             .build()
             .await
             .with_context(|| format!("opening index database {}", path.display()))?;
-        db.connect()
-            .with_context(|| format!("connecting to index database {}", path.display()))
+        let conn = db
+            .connect()
+            .with_context(|| format!("connecting to index database {}", path.display()))?;
+        enable_foreign_keys(&conn).await?;
+        Ok(conn)
     }
 
     /// Start a fresh index build in a temporary file. The returned
@@ -113,6 +116,7 @@ impl Store {
             .await
             .context("opening temporary index database")?;
         let conn = db.connect().context("connecting to temporary index")?;
+        enable_foreign_keys(&conn).await?;
         schema::create_index(&conn)
             .await
             .context("creating index schema")?;
@@ -123,6 +127,19 @@ impl Store {
             final_path,
         })
     }
+}
+
+/// Turn on foreign-key enforcement for one connection.
+///
+/// SQLite/libSQL enforce foreign keys per connection, and `PRAGMA foreign_keys`
+/// is a no-op inside a transaction, so this must run immediately after
+/// `connect`, before any write. It does not create or alter any table; the
+/// declared `REFERENCES` clauses are the schema.
+async fn enable_foreign_keys(conn: &Connection) -> Result<()> {
+    conn.execute("PRAGMA foreign_keys = ON", ())
+        .await
+        .context("enabling foreign key enforcement")?;
+    Ok(())
 }
 
 impl IndexBuild {
@@ -179,6 +196,73 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .filter(|name| name.starts_with(".index-"))
             .collect()
+    }
+
+    async fn symbol_count(build: &IndexBuild) -> i64 {
+        let mut rows = build
+            .connection()
+            .query("SELECT COUNT(*) FROM symbols", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_connection_rejects_a_dangling_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+
+        let err = build
+            .connection()
+            .execute(
+                "INSERT OR IGNORE INTO symbols
+                    (parent_id, kind, fqn, file, start_line, end_line, signature, content_hash)
+                 VALUES (999, 'class', 'com.acme.Ghost', 'Ghost.java', 1, 1, 'class Ghost', 'hash')",
+                (),
+            )
+            .await
+            .expect_err("FK enforcement should reject a parent_id that names no row");
+        assert!(
+            format!("{err:#}").contains("FOREIGN KEY"),
+            "error should be an FK violation, got: {err:#}"
+        );
+        assert_eq!(
+            symbol_count(&build).await,
+            0,
+            "a dangling parent must never be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_connection_accepts_a_self_referential_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+
+        build
+            .connection()
+            .execute(
+                "INSERT INTO symbols
+                    (id, parent_id, kind, fqn, file, start_line, end_line, signature, content_hash)
+                 VALUES (1, NULL, 'class', 'com.acme.Parent', 'Parent.java', 1, 1, 'class Parent', 'hash')",
+                (),
+            )
+            .await
+            .expect("a top-level symbol has no parent to reference");
+
+        build
+            .connection()
+            .execute(
+                "INSERT INTO symbols
+                    (id, parent_id, kind, fqn, file, start_line, end_line, signature, content_hash)
+                 VALUES (2, 1, 'method', 'com.acme.Parent#child()', 'Parent.java', 2, 2, 'void child()', 'hash')",
+                (),
+            )
+            .await
+            .expect("a child may reference the parent row already present");
+
+        assert_eq!(symbol_count(&build).await, 2, "both rows should be stored");
     }
 
     #[tokio::test]
