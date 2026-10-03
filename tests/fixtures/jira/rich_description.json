@@ -1,0 +1,69 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_12000.requestTypePractice",
+  "id": "133295",
+  "self": "https://jira.example.com/rest/api/2/issue/133295",
+  "key": "GRLD-72066",
+  "fields": {
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/9",
+      "id": "9",
+      "description": "Eine Verbesserung oder Erweiterung zu einer bestehenden Funktion oder Task.",
+      "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/13450?size=medium",
+      "name": "Verbesserung",
+      "subtask": false,
+      "hierarchyLevel": 0
+    },
+    "summary": "🎄Unit-Test - Privilegien Kollisionen vermeiden",
+    "description": "Um mögliche Kollisionen von Privilegien zu erkennen, welche in unterschiedlichen Java Klassen gepflegt werden, sollte jeder Microservice einen entsprechenden Unit-Test einbauen.\n\nh2. Möglichkeit 1\n\nNutzt die {{grld-starter}} Bibliothek: [https://git.example.com/acme/grld-starter/src/main/|https://git.example.com/acme/grld-starter/src/main/|smart-link] \n\nDer folgende Test ist das Template: [https://git.example.com/acme/grld-starter/src/main/backend/grld-starter-test/src/test/java/com/haufe/grld/starter/codecheck/CodeGuidelinePlausibilityTest.java|https://git.example.com/acme/grld-starter/src/main/backend/grld-starter-test/src/test/java/com/haufe/grld/starter/codecheck/CodeGuidelinePlausibilityTest.java|smart-link] \n\nSo kann damit nach Privilegien-Kollisionen gesucht werden:\n\n{panel:bgColor=#fffae6}\n*Wichtig*: Bitte ergänzt alle Klassen, welche Privilegien für euer Projekt definieren im {{privilegeClasses}} Set.\n{panel}\n\n{noformat}@TagUnitTest\nclass CodeGuidelinePlausibilityTest {\n\n  @BeforeAll\n  public static void init() {\n    [...]\n    // Add all classes which contain your privilege strings to this set, f.e.:\n    // final Set<Class<?>> privilegeClasses = Set.of(Privilege.class);\n    final Set<Class<?>> privilegeClasses = Set.of();\n\n    CodeGuidelinePlausibilityTestDataFactory.setPrivilegeClasses(privilegeClasses);\n  }\n  \n  @ParameterizedTest(name = \"{index} => class''{0}''\")\n  @MethodSource(\"com.haufe.grld.starter.codecheck.CodeGuidelinePlausibilityTestDataFactory#getPrivilegeCollisionArguments\")\n  void noPrivilegeCollisions(final String privilegeClassName, final Map<String, Set<String>> privilegeClassMap) {\n\n    CodeGuidelinePlausibilityTestAssertUtil.assertNoPrivilegeCollisionsExist(privilegeClassName, privilegeClassMap);\n  }\n}{noformat}\n\nh2. Möglichkeit 2\n\nVorlage für den Test: [https://git.example.com/acme/grld-core/src/master/businesslogic/saaseco-ejb/src/test/java/com/haufelexware/saaseco/authentication/privilege/PrivilegeCollisionTest.java|https://git.example.com/acme/grld-core/src/master/businesslogic/saaseco-ejb/src/test/java/com/haufelexware/saaseco/authentication/privilege/PrivilegeCollisionTest.java|smart-link] \n\n{panel:bgColor=#fffae6}\n*Wichtig*: Bitte ergänzt alle Klassen, welche Privilegien für euer Projekt definieren beim Aufruf der Test-Methode.\n{panel}\n\n{code:java}  @Test\n  void checkForPrivilegeCollisions() throws IllegalAccessException {\n    Map<String, Set<String>> privilegeClassMap = new HashMap<>();\n\n    collectStringFieldValues(privilegeClassMap, Privilege.class);\n    collectStringFieldValues(privilegeClassMap, GrldSystems.SystemRoles.Roles.class);\n    // #######\n    // So ergänzt ihr eure Privilegien-Klassen:\n    collectStringFieldValues(privilegeClassMap, CustomPrivileges.class);\n\n    checkForCollisions(privilegeClassMap);\n  }{code}\n\n\n\nh3. Unterliegende Problematik\n\nDie {{@RolesAllowed}}-Annotation an unseren Rest-Endpunkten arbeitet auf Basis von String-Werten. Bspw. {{“MANAGE_ORGANIZATION\"}}. Wir pflegen diese Privilegien normalerweise in eigenen Klassen, häufig ist das die {{Privilege}} Klasse.\n\nAngenommen, wir haben:\n\n* Ein Nutzer-Privileg {{\"MANAGE_ORGANIZATION\"}}, über das ein OrganizationAdmin seine Organisation verwalten kann, bspw. den Firmennamen ändern.\n** Dieses Privileg liegt in der {{Privilege}}-Klasse unter {{Privilege.User.MANAGE_ORGANIZATION}}.\n* Später soll ein Endpunkt geschaffen werden, mit dem ein Lxo Admin eine Organization bei Bedarf anpassen kann. In diesem Kontext macht das Privileg {{“MANAGE_ORGANIZATION\"}} ebenfalls Sinn.\n** Das Admin Privileg wird unter {{Privilege.Admin.MANAGE_ORGANIZATION}} abgelegt.\n* Nun gibt es eine Kollision zwischen den Privilegien. Beide lösen zum String-Wert {{\"MANAGE_ORGANIZATION\"}} auf. Der eigentliche Kontext unterscheidet sich aber. Leider kennt {{@RolesAllowed}} diesen Kontextunterschied nicht, für den Abgleich der Privilegien ist nur der String entscheidend.\n** Da Nutzer und Admin nun das gleiche Privileg haben ist es möglich:\n*** +Für den Nutzer den Admin Endpunkt aufzurufen+ (andere Schutzmaßnahmen erstmal ignoriert)\n*** Für den Admin den Nutzer-Endpunkt aufzurufen",
+    "parent": {
+      "id": "106682",
+      "key": "GRLD-52540",
+      "self": "https://jira.example.com/rest/api/2/issue/106682",
+      "fields": {
+        "summary": "T10 Updates und Maintenance ",
+        "status": {
+          "self": "https://jira.example.com/rest/api/2/status/10312",
+          "name": "Backlog",
+          "id": "10312",
+          "statusCategory": {
+            "id": 2,
+            "key": "new",
+            "name": "Zu erledigen"
+          }
+        },
+        "issuetype": {
+          "self": "https://jira.example.com/rest/api/2/issuetype/5",
+          "id": "5",
+          "description": "Eine Sammlung ähnlicher Bugs, Stories und Tasks.",
+          "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/13447?size=medium",
+          "name": "Epic",
+          "subtask": false,
+          "hierarchyLevel": 1
+        }
+      }
+    },
+    "customfield_10930": "GRLD-52540",
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/6",
+      "name": "Geschlossen",
+      "id": "6",
+      "statusCategory": {
+        "id": 3,
+        "key": "done",
+        "name": "Fertig"
+      }
+    },
+    "created": "2023-09-14T15:40:33.721+0200",
+    "updated": "2024-01-18T13:01:39.643+0100"
+  },
+  "renderedFields": {
+    "issuetype": null,
+    "summary": null,
+    "description": "<p>Um mögliche Kollisionen von Privilegien zu erkennen, welche in unterschiedlichen Java Klassen gepflegt werden, sollte jeder Microservice einen entsprechenden Unit-Test einbauen.</p>\n\n<h2><a name=\"M%C3%B6glichkeit1\"></a>Möglichkeit 1</h2>\n\n<p>Nutzt die <tt>grld-starter</tt> Bibliothek: <a href=\"https://git.example.com/acme/grld-starter/src/main/\" title=\"smart-link\" class=\"external-link\" rel=\"nofollow noreferrer\">https://git.example.com/acme/grld-starter/src/main/</a> </p>\n\n<p>Der folgende Test ist das Template: <a href=\"https://git.example.com/acme/grld-starter/src/main/backend/grld-starter-test/src/test/java/com/haufe/grld/starter/codecheck/CodeGuidelinePlausibilityTest.java\" title=\"smart-link\" class=\"external-link\" rel=\"nofollow noreferrer\">https://git.example.com/acme/grld-starter/src/main/backend/grld-starter-test/src/test/java/com/haufe/grld/starter/codecheck/CodeGuidelinePlausibilityTest.java</a> </p>\n\n<p>So kann damit nach Privilegien-Kollisionen gesucht werden:</p>\n\n<div class=\"panel\" style=\"background-color: #fffae6;border-width: 1px;\"><div class=\"panelContent\" style=\"background-color: #fffae6;\">\n<p><b>Wichtig</b>: Bitte ergänzt alle Klassen, welche Privilegien für euer Projekt definieren im <tt>privilegeClasses</tt> Set.</p>\n</div></div>\n\n<div class=\"preformatted panel\" style=\"border-width: 1px;\"><div class=\"preformattedContent panelContent\">\n<pre>@TagUnitTest\nclass CodeGuidelinePlausibilityTest {\n\n  @BeforeAll\n  public static void init() {\n    [...]\n    // Add all classes which contain your privilege strings to this set, f.e.:\n    // final Set&lt;Class&lt;?&gt;&gt; privilegeClasses = Set.of(Privilege.class);\n    final Set&lt;Class&lt;?&gt;&gt; privilegeClasses = Set.of();\n\n    CodeGuidelinePlausibilityTestDataFactory.setPrivilegeClasses(privilegeClasses);\n  }\n  \n  @ParameterizedTest(name = \"{index} =&gt; class''{0}''\")\n  @MethodSource(\"com.haufe.grld.starter.codecheck.CodeGuidelinePlausibilityTestDataFactory#getPrivilegeCollisionArguments\")\n  void noPrivilegeCollisions(final String privilegeClassName, final Map&lt;String, Set&lt;String&gt;&gt; privilegeClassMap) {\n\n    CodeGuidelinePlausibilityTestAssertUtil.assertNoPrivilegeCollisionsExist(privilegeClassName, privilegeClassMap);\n  }\n}</pre>\n</div></div>\n\n<h2><a name=\"M%C3%B6glichkeit2\"></a>Möglichkeit 2</h2>\n\n<p>Vorlage für den Test: <a href=\"https://git.example.com/acme/grld-core/src/master/businesslogic/saaseco-ejb/src/test/java/com/haufelexware/saaseco/authentication/privilege/PrivilegeCollisionTest.java\" title=\"smart-link\" class=\"external-link\" rel=\"nofollow noreferrer\">https://git.example.com/acme/grld-core/src/master/businesslogic/saaseco-ejb/src/test/java/com/haufelexware/saaseco/authentication/privilege/PrivilegeCollisionTest.java</a> </p>\n\n<div class=\"panel\" style=\"background-color: #fffae6;border-width: 1px;\"><div class=\"panelContent\" style=\"background-color: #fffae6;\">\n<p><b>Wichtig</b>: Bitte ergänzt alle Klassen, welche Privilegien für euer Projekt definieren beim Aufruf der Test-Methode.</p>\n</div></div>\n\n<div class=\"code panel\" style=\"border-width: 1px;\"><div class=\"codeContent panelContent\">\n<pre class=\"code-java\">  @Test\n  void checkForPrivilegeCollisions() <span class=\"code-keyword\">throws</span> IllegalAccessException {\n    Map&lt;<span class=\"code-object\">String</span>, Set&lt;<span class=\"code-object\">String</span>&gt;&gt; privilegeClassMap = <span class=\"code-keyword\">new</span> HashMap&lt;&gt;();\n\n    collectStringFieldValues(privilegeClassMap, Privilege.class);\n    collectStringFieldValues(privilegeClassMap, GrldSystems.SystemRoles.Roles.class);\n    <span class=\"code-comment\">// #######\n</span>    <span class=\"code-comment\">// So ergänzt ihr eure Privilegien-Klassen:\n</span>    collectStringFieldValues(privilegeClassMap, CustomPrivileges.class);\n\n    checkForCollisions(privilegeClassMap);\n  }</pre>\n</div></div>\n\n\n\n<h3><a name=\"UnterliegendeProblematik\"></a>Unterliegende Problematik</h3>\n\n<p>Die <tt>@RolesAllowed</tt>-Annotation an unseren Rest-Endpunkten arbeitet auf Basis von String-Werten. Bspw. <tt>“MANAGE_ORGANIZATION\"</tt>. Wir pflegen diese Privilegien normalerweise in eigenen Klassen, häufig ist das die <tt>Privilege</tt> Klasse.</p>\n\n<p>Angenommen, wir haben:</p>\n\n<ul>\n\t<li>Ein Nutzer-Privileg <tt>\"MANAGE_ORGANIZATION\"</tt>, über das ein OrganizationAdmin seine Organisation verwalten kann, bspw. den Firmennamen ändern.\n\t<ul>\n\t\t<li>Dieses Privileg liegt in der <tt>Privilege</tt>-Klasse unter <tt>Privilege.User.MANAGE_ORGANIZATION</tt>.</li>\n\t</ul>\n\t</li>\n\t<li>Später soll ein Endpunkt geschaffen werden, mit dem ein Lxo Admin eine Organization bei Bedarf anpassen kann. In diesem Kontext macht das Privileg <tt>“MANAGE_ORGANIZATION\"</tt> ebenfalls Sinn.\n\t<ul>\n\t\t<li>Das Admin Privileg wird unter <tt>Privilege.Admin.MANAGE_ORGANIZATION</tt> abgelegt.</li>\n\t</ul>\n\t</li>\n\t<li>Nun gibt es eine Kollision zwischen den Privilegien. Beide lösen zum String-Wert <tt>\"MANAGE_ORGANIZATION\"</tt> auf. Der eigentliche Kontext unterscheidet sich aber. Leider kennt <tt>@RolesAllowed</tt> diesen Kontextunterschied nicht, für den Abgleich der Privilegien ist nur der String entscheidend.\n\t<ul>\n\t\t<li>Da Nutzer und Admin nun das gleiche Privileg haben ist es möglich:\n\t\t<ul>\n\t\t\t<li><ins>Für den Nutzer den Admin Endpunkt aufzurufen</ins> (andere Schutzmaßnahmen erstmal ignoriert)</li>\n\t\t\t<li>Für den Admin den Nutzer-Endpunkt aufzurufen</li>\n\t\t</ul>\n\t\t</li>\n\t</ul>\n\t</li>\n</ul>\n",
+    "parent": null,
+    "customfield_10930": null,
+    "status": null,
+    "created": "14/Sep/23 3:40 PM",
+    "updated": "18/Jan/24 1:01 PM"
+  }
+}

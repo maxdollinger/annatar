@@ -1,41 +1,69 @@
 {
-  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
-  "id": "20101",
-  "self": "https://jira.example.com/rest/api/2/issue/20101",
-  "key": "GRLD-101",
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_12000.requestTypePractice",
+  "id": "67945",
+  "self": "https://jira.example.com/rest/api/2/issue/67945",
+  "key": "GRLD-24229",
   "fields": {
     "issuetype": {
-      "self": "https://jira.example.com/rest/api/2/issuetype/10001",
-      "id": "10001",
-      "description": "A user-facing feature.",
-      "iconUrl": "https://jira.example.com/images/icons/issuetypes/story.svg",
+      "self": "https://jira.example.com/rest/api/2/issuetype/6",
+      "id": "6",
+      "description": "Eine Funktionalität oder Funktion, ausgedrückt als Benutzerziel.",
+      "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/16500?size=medium",
       "name": "Story",
       "subtask": false,
       "hierarchyLevel": 0
     },
-    "summary": "Users can reset their password by email",
-    "description": "As a user I want to reset my password so that I can log in again.\n\n*Acceptance criteria*\n* A reset link is sent to the registered address\n* The link expires after 30 minutes\n\n||Field||Rule||\n|token|single use|",
-    "status": {
-      "self": "https://jira.example.com/rest/api/2/status/10002",
-      "name": "Done",
-      "id": "10002",
-      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+    "summary": "SMS Versand (Dev & Color) ",
+    "description": "Out of scope:\r\n- keine Validierung\r\n- keine Historie",
+    "parent": {
+      "id": "67524",
+      "key": "GRLD-23870",
+      "self": "https://jira.example.com/rest/api/2/issue/67524",
+      "fields": {
+        "summary": "2 Faktor Auth",
+        "status": {
+          "self": "https://jira.example.com/rest/api/2/status/10312",
+          "name": "Backlog",
+          "id": "10312",
+          "statusCategory": {
+            "id": 2,
+            "key": "new",
+            "name": "Zu erledigen"
+          }
+        },
+        "issuetype": {
+          "self": "https://jira.example.com/rest/api/2/issuetype/5",
+          "id": "5",
+          "description": "Eine Sammlung ähnlicher Bugs, Stories und Tasks.",
+          "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/13447?size=medium",
+          "name": "Epic",
+          "subtask": false,
+          "hierarchyLevel": 1
+        }
+      }
     },
-    "priority": { "self": "https://jira.example.com/rest/api/2/priority/3", "name": "Medium", "id": "3" },
-    "labels": ["auth"],
-    "customfield_10014": null,
-    "created": "2024-03-04T09:12:45.000+0100",
-    "updated": "2024-04-02T16:40:03.000+0200"
+    "customfield_10930": "GRLD-23870",
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/6",
+      "name": "Geschlossen",
+      "id": "6",
+      "statusCategory": {
+        "id": 3,
+        "key": "done",
+        "name": "Fertig"
+      }
+    },
+    "created": "2018-06-25T11:39:02.607+0200",
+    "updated": "2018-08-15T12:44:31.542+0200"
   },
   "renderedFields": {
     "issuetype": null,
     "summary": null,
-    "description": "<p>As a user I want to reset my password so that I can log in again.</p>\n\n<p><b>Acceptance criteria</b></p>\n<ul>\n\t<li>A reset link is sent to the registered address</li>\n\t<li>The link expires after 30 minutes</li>\n</ul>\n\n<div class='table-wrap'>\n<table class='confluenceTable'><tbody>\n<tr>\n<th class='confluenceTh'>Field</th>\n<th class='confluenceTh'>Rule</th>\n</tr>\n<tr>\n<td class='confluenceTd'>token</td>\n<td class='confluenceTd'>single use</td>\n</tr>\n</tbody></table>\n</div>\n",
+    "description": "<p>Out of scope:</p>\n<ul class=\"alternate\" type=\"square\">\n\t<li>keine Validierung</li>\n\t<li>keine Historie</li>\n</ul>\n",
+    "parent": null,
+    "customfield_10930": null,
     "status": null,
-    "priority": null,
-    "labels": null,
-    "customfield_10014": null,
-    "created": "04/Mar/24 9:12 AM",
-    "updated": "02/Apr/24 4:40 PM"
+    "created": "25/Jun/18 11:39 AM",
+    "updated": "15/Aug/18 12:44 PM"
   }
 }

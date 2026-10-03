@@ -1,60 +1,67 @@
 {
-  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
-  "id": "20102",
-  "self": "https://jira.example.com/rest/api/2/issue/20102",
-  "key": "GRLD-102",
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_12000.requestTypePractice",
+  "id": "10129",
+  "self": "https://jira.example.com/rest/api/2/issue/10129",
+  "key": "GRLD-100",
   "fields": {
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/7",
+      "id": "7",
+      "description": "Ein kleine, bestimmte Aufgabe.",
+      "iconUrl": "https://jira.example.com/images/icons/issuetypes/task_agile.png",
+      "name": "Task",
+      "subtask": true,
+      "hierarchyLevel": -1
+    },
+    "summary": "Implementierung + Klärung offener Fragen",
+    "description": null,
     "parent": {
-      "id": "20101",
-      "key": "GRLD-101",
-      "self": "https://jira.example.com/rest/api/2/issue/20101",
+      "id": "10113",
+      "key": "GRLD-84",
+      "self": "https://jira.example.com/rest/api/2/issue/10113",
       "fields": {
-        "summary": "Users can reset their password by email",
+        "summary": "Rechnung anlegen: statische Attribute (mock)",
         "status": {
-          "self": "https://jira.example.com/rest/api/2/status/10002",
-          "name": "Done",
-          "id": "10002",
-          "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+          "self": "https://jira.example.com/rest/api/2/status/6",
+          "name": "Geschlossen",
+          "id": "6",
+          "statusCategory": {
+            "id": 3,
+            "key": "done",
+            "name": "Fertig"
+          }
         },
-        "priority": { "self": "https://jira.example.com/rest/api/2/priority/3", "name": "Medium", "id": "3" },
         "issuetype": {
-          "self": "https://jira.example.com/rest/api/2/issuetype/10001",
-          "id": "10001",
+          "self": "https://jira.example.com/rest/api/2/issuetype/6",
+          "id": "6",
+          "description": "Eine Funktionalität oder Funktion, ausgedrückt als Benutzerziel.",
+          "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/16500?size=medium",
           "name": "Story",
           "subtask": false,
           "hierarchyLevel": 0
         }
       }
     },
-    "issuetype": {
-      "self": "https://jira.example.com/rest/api/2/issuetype/10003",
-      "id": "10003",
-      "description": "A small piece of work that's part of a larger task.",
-      "iconUrl": "https://jira.example.com/images/icons/issuetypes/subtask.svg",
-      "name": "Sub-task",
-      "subtask": true,
-      "hierarchyLevel": -1
-    },
-    "summary": "Add expiry timestamp to password reset tokens",
-    "description": "Store {{expires_at}} next to the token and reject expired tokens.",
     "status": {
-      "self": "https://jira.example.com/rest/api/2/status/10002",
-      "name": "Done",
-      "id": "10002",
-      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+      "self": "https://jira.example.com/rest/api/2/status/6",
+      "name": "Geschlossen",
+      "id": "6",
+      "statusCategory": {
+        "id": 3,
+        "key": "done",
+        "name": "Fertig"
+      }
     },
-    "customfield_10014": null,
-    "created": "2024-03-05T10:00:00.000+0100",
-    "updated": "2024-03-12T15:30:00.000+0100"
+    "created": "2011-03-18T16:36:41.560+0100",
+    "updated": "2013-06-04T15:17:46.285+0200"
   },
   "renderedFields": {
-    "parent": null,
     "issuetype": null,
     "summary": null,
-    "description": "<p>Store <tt>expires_at</tt> next to the token and reject expired tokens.</p>",
+    "description": "",
+    "parent": null,
     "status": null,
-    "customfield_10014": null,
-    "created": "05/Mar/24 10:00 AM",
-    "updated": "12/Mar/24 3:30 PM"
+    "created": "18/Mär/11 4:36 PM",
+    "updated": "04/Jun/13 3:17 PM"
   }
 }

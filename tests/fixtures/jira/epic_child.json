@@ -1,38 +1,69 @@
 {
-  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
-  "id": "20305",
-  "self": "https://jira.example.com/rest/api/2/issue/20305",
-  "key": "GRLD-305",
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_12000.requestTypePractice",
+  "id": "64277",
+  "self": "https://jira.example.com/rest/api/2/issue/64277",
+  "key": "GRLD-21115",
   "fields": {
     "issuetype": {
-      "self": "https://jira.example.com/rest/api/2/issuetype/10001",
-      "id": "10001",
-      "description": "A user-facing feature.",
-      "iconUrl": "https://jira.example.com/images/icons/issuetypes/story.svg",
-      "name": "Story",
-      "subtask": false
+      "self": "https://jira.example.com/rest/api/2/issuetype/9",
+      "id": "9",
+      "description": "Eine Verbesserung oder Erweiterung zu einer bestehenden Funktion oder Task.",
+      "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/13450?size=medium",
+      "name": "Verbesserung",
+      "subtask": false,
+      "hierarchyLevel": 0
     },
-    "summary": "Show invoice PDF download in the customer portal",
-    "description": "Customers can download each invoice as a PDF from the portal.",
+    "summary": "Neues Projekt \"Argus\" anlegen - CachingService zukft. AutorisierungsService ",
+    "description": "Projekt soll in Dev-Umgebung lauffähig sein",
+    "parent": {
+      "id": "64014",
+      "key": "GRLD-20898",
+      "self": "https://jira.example.com/rest/api/2/issue/64014",
+      "fields": {
+        "summary": "JWT-Caching",
+        "status": {
+          "self": "https://jira.example.com/rest/api/2/status/10312",
+          "name": "Backlog",
+          "id": "10312",
+          "statusCategory": {
+            "id": 2,
+            "key": "new",
+            "name": "Zu erledigen"
+          }
+        },
+        "issuetype": {
+          "self": "https://jira.example.com/rest/api/2/issuetype/5",
+          "id": "5",
+          "description": "Eine Sammlung ähnlicher Bugs, Stories und Tasks.",
+          "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/13447?size=medium",
+          "name": "Epic",
+          "subtask": false,
+          "hierarchyLevel": 1
+        }
+      }
+    },
+    "customfield_10930": "GRLD-20898",
     "status": {
-      "self": "https://jira.example.com/rest/api/2/status/10002",
-      "name": "Done",
-      "id": "10002",
-      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+      "self": "https://jira.example.com/rest/api/2/status/6",
+      "name": "Geschlossen",
+      "id": "6",
+      "statusCategory": {
+        "id": 3,
+        "key": "done",
+        "name": "Fertig"
+      }
     },
-    "customfield_10100": "GRLD-300",
-    "customfield_10101": "Sprint 12",
-    "created": "2024-06-01T08:45:00.000+0200",
-    "updated": "2024-06-20T17:05:00.000+0200"
+    "created": "2017-12-06T10:05:27.058+0100",
+    "updated": "2018-04-11T13:14:29.774+0200"
   },
   "renderedFields": {
     "issuetype": null,
     "summary": null,
-    "description": "<p>Customers can download each invoice as a PDF from the portal.</p>",
+    "description": "<p>Projekt soll in Dev-Umgebung lauffähig sein</p>",
+    "parent": null,
+    "customfield_10930": null,
     "status": null,
-    "customfield_10100": null,
-    "customfield_10101": null,
-    "created": "01/Jun/24 8:45 AM",
-    "updated": "20/Jun/24 5:05 PM"
+    "created": "06/Dez/17 10:05 AM",
+    "updated": "11/Apr/18 1:14 PM"
   }
 }

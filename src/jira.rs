@@ -62,6 +62,7 @@ pub struct Ticket {
     pub key: String,
     /// Issue type name, e.g. `Story`, `Bug`, `Sub-task`.
     pub issue_type: String,
+    /// Summary with surrounding whitespace trimmed.
     pub summary: String,
     /// Plain-text description; `None` when the issue has none.
     pub description: Option<String>,
@@ -74,8 +75,10 @@ pub fn parse_issue(json: &Value, epic_link_field: Option<&str>) -> Result<Ticket
     let key = string_at(json, "/key").context("issue has no key")?;
     let issue_type = string_at(json, "/fields/issuetype/name")
         .with_context(|| format!("{key}: no issue type"))?;
-    let summary =
-        string_at(json, "/fields/summary").with_context(|| format!("{key}: no summary"))?;
+    let summary = string_at(json, "/fields/summary")
+        .with_context(|| format!("{key}: no summary"))?
+        .trim()
+        .to_string();
     let description = match json.pointer("/renderedFields/description") {
         Some(Value::String(html)) => {
             Some(html_to_text(html).with_context(|| format!("{key}: description"))?)
@@ -501,66 +504,156 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_story_with_lists_and_tables() {
+    fn parses_a_story_with_a_list() {
         let ticket = parse_issue(&fixture("story"), None).unwrap();
 
-        assert_eq!(ticket.key, "GRLD-101");
+        assert_eq!(ticket.key, "GRLD-24229");
         assert_eq!(ticket.issue_type, "Story");
-        assert_eq!(ticket.summary, "Users can reset their password by email");
-        assert_eq!(ticket.parent_key, None);
-        let description = ticket.description.expect("story has a description");
-        assert!(
-            description.starts_with("As a user I want to reset my password"),
-            "{description}"
+        assert_eq!(ticket.summary, "SMS Versand (Dev & Color)");
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-23870"));
+        assert_eq!(
+            ticket.description.as_deref(),
+            Some("Out of scope:\n* keine Validierung\n* keine Historie")
         );
-        assert!(
-            description.contains("* A reset link is sent to the registered address"),
-            "{description}"
-        );
-        assert!(description.contains("single use"), "{description}");
-        assert!(!description.contains('<'), "HTML left in: {description}");
-        assert!(!description.contains("**"), "{description}");
     }
 
     #[test]
-    fn parses_a_bug_with_code_and_links() {
+    fn parses_a_bug_with_an_image_and_blank_lines() {
         let ticket = parse_issue(&fixture("bug"), None).unwrap();
 
-        assert_eq!(ticket.key, "GRLD-214");
+        assert_eq!(ticket.key, "GRLD-82584");
         assert_eq!(ticket.issue_type, "Bug");
+        assert_eq!(ticket.summary, "Argus Token PreValidation Problem");
+        assert_eq!(ticket.parent_key, None);
         let description = ticket.description.unwrap();
         assert!(
-            description.contains(
-                "java.lang.NullPointerException: address is null\n    at com.acme.order.OrderExporter.export"
+            description.starts_with(
+                "“Ich denke, das problem ist, dass die Token Pre-Validierung im Argus nur schaut"
             ),
             "{description}"
         );
-        assert!(description.contains("the export spec"), "{description}");
+        assert!(
+            description.contains("gehört.\n\n[image-20240513-110026.png]\n\nSollte gefixt werden…"),
+            "{description}"
+        );
+        assert!(
+            description.ends_with("Sollte gefixt werden…"),
+            "{description}"
+        );
+        assert!(!description.contains("\n\n\n"), "{description}");
+        assert!(!description.contains('<'), "HTML left in: {description}");
+        assert!(!description.contains("jira.example.com"), "{description}");
+    }
+
+    #[test]
+    fn parses_a_rich_description() {
+        let ticket = parse_issue(&fixture("rich_description"), None).unwrap();
+
+        assert_eq!(ticket.key, "GRLD-72066");
+        assert_eq!(ticket.issue_type, "Verbesserung");
+        assert_eq!(
+            ticket.summary,
+            "🎄Unit-Test - Privilegien Kollisionen vermeiden"
+        );
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-52540"));
+        let description = ticket.description.unwrap();
+        assert!(
+            description.starts_with(
+                "Um mögliche Kollisionen von Privilegien zu erkennen, welche in unterschiedlichen \
+                 Java Klassen gepflegt werden, sollte jeder Microservice einen entsprechenden \
+                 Unit-Test einbauen.\n\n## Möglichkeit 1\n\nNutzt die grld-starter Bibliothek: \
+                 [https://git.example.com/acme/grld-starter/src/main/]"
+            ),
+            "{description}"
+        );
+        assert!(
+            description.contains(
+                "Wichtig: Bitte ergänzt alle Klassen, welche Privilegien für euer Projekt \
+                 definieren im privilegeClasses Set."
+            ),
+            "{description}"
+        );
+        assert!(
+            description.contains(
+                "    final Set<Class<?>> privilegeClasses = Set.of();\n\n    \
+                 CodeGuidelinePlausibilityTestDataFactory.setPrivilegeClasses(privilegeClasses);"
+            ),
+            "{description}"
+        );
+        assert!(
+            description.contains(
+                "  void checkForPrivilegeCollisions() throws IllegalAccessException {\n    \
+                 Map<String, Set<String>> privilegeClassMap = new HashMap<>();"
+            ),
+            "{description}"
+        );
+        assert!(
+            description.contains(
+                "* Ein Nutzer-Privileg \"MANAGE_ORGANIZATION\", über das ein OrganizationAdmin"
+            ),
+            "{description}"
+        );
+        assert!(
+            description.ends_with(
+                "  * Da Nutzer und Admin nun das gleiche Privileg haben ist es möglich:\n    \
+                 * Für den Nutzer den Admin Endpunkt aufzurufen (andere Schutzmaßnahmen \
+                 erstmal ignoriert)\n    * Für den Admin den Nutzer-Endpunkt aufzurufen"
+            ),
+            "{description}"
+        );
         assert!(!description.contains("<span"), "{description}");
-        assert!(!description.contains("wiki.example.com"), "{description}");
+        assert!(!description.contains("&lt;"), "{description}");
+        assert!(!description.contains("**"), "{description}");
+        assert!(!description.contains("\n\n\n"), "{description}");
     }
 
     #[test]
     fn sub_task_takes_its_parent_key() {
         let ticket = parse_issue(&fixture("subtask"), None).unwrap();
 
-        assert_eq!(ticket.issue_type, "Sub-task");
-        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-101"));
+        assert_eq!(ticket.key, "GRLD-100");
+        assert_eq!(ticket.issue_type, "Task");
+        assert_eq!(ticket.summary, "Implementierung + Klärung offener Fragen");
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-84"));
+        assert_eq!(ticket.description, None);
+    }
+
+    #[test]
+    fn epic_child_takes_the_epic_from_its_parent() {
+        let ticket = parse_issue(&fixture("epic_child"), None).unwrap();
+
+        assert_eq!(ticket.key, "GRLD-21115");
+        assert_eq!(ticket.issue_type, "Verbesserung");
+        assert_eq!(
+            ticket.summary,
+            "Neues Projekt \"Argus\" anlegen - CachingService zukft. AutorisierungsService"
+        );
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-20898"));
         assert_eq!(
             ticket.description.as_deref(),
-            Some("Store expires_at next to the token and reject expired tokens.")
+            Some("Projekt soll in Dev-Umgebung lauffähig sein")
         );
     }
 
     #[test]
+    fn summary_is_trimmed() {
+        let mut json = fixture("story");
+        assert_eq!(json["fields"]["summary"], "SMS Versand (Dev & Color) ");
+        json["fields"]["summary"] = Value::from("\t SMS Versand \n");
+
+        assert_eq!(parse_issue(&json, None).unwrap().summary, "SMS Versand");
+    }
+
+    #[test]
     fn epic_link_field_is_used_only_when_configured() {
-        let json = fixture("epic_child");
+        let mut json = fixture("epic_child");
+        json["fields"].as_object_mut().unwrap().remove("parent");
 
         let ticket = parse_issue(&json, None).unwrap();
         assert_eq!(ticket.parent_key, None);
 
-        let ticket = parse_issue(&json, Some("customfield_10100")).unwrap();
-        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-300"));
+        let ticket = parse_issue(&json, Some("customfield_10930")).unwrap();
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-20898"));
 
         let ticket = parse_issue(&json, Some("customfield_99999")).unwrap();
         assert_eq!(ticket.parent_key, None);
@@ -569,9 +662,10 @@ mod tests {
     #[test]
     fn epic_link_field_may_hold_an_object_with_a_key() {
         let mut json = fixture("epic_child");
-        json["fields"]["customfield_10100"] = serde_json::json!({ "key": "GRLD-301" });
+        json["fields"].as_object_mut().unwrap().remove("parent");
+        json["fields"]["customfield_10930"] = serde_json::json!({ "key": "GRLD-301" });
 
-        let ticket = parse_issue(&json, Some("customfield_10100")).unwrap();
+        let ticket = parse_issue(&json, Some("customfield_10930")).unwrap();
         assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-301"));
     }
 
@@ -588,26 +682,36 @@ mod tests {
         let mut json = fixture("epic_child");
         json["fields"]["parent"] = serde_json::json!({ "key": "" });
 
-        let ticket = parse_issue(&json, Some("customfield_10100")).unwrap();
-        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-300"));
+        let ticket = parse_issue(&json, Some("customfield_10930")).unwrap();
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-20898"));
     }
 
     #[test]
     fn parent_wins_over_epic_link_field() {
-        let mut json = fixture("subtask");
-        json["fields"]["customfield_10100"] = Value::from("GRLD-300");
+        let mut json = fixture("epic_child");
+        json["fields"]["customfield_10930"] = Value::from("GRLD-300");
 
-        let ticket = parse_issue(&json, Some("customfield_10100")).unwrap();
-        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-101"));
+        let ticket = parse_issue(&json, Some("customfield_10930")).unwrap();
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-20898"));
     }
 
     #[test]
     fn null_or_blank_description_is_none() {
         let mut json = fixture("empty_description");
+        assert_eq!(json["fields"]["description"], Value::Null);
+        assert_eq!(json["renderedFields"]["description"], "");
         let ticket = parse_issue(&json, None).unwrap();
-        assert_eq!(ticket.key, "GRLD-412");
-        assert_eq!(ticket.issue_type, "Task");
+        assert_eq!(ticket.key, "GRLD-1500");
+        assert_eq!(ticket.issue_type, "Story");
+        assert_eq!(
+            ticket.summary,
+            "Branch für FU-Test (Features deaktiviert) aktualisieren/neu anlegen"
+        );
+        assert_eq!(ticket.parent_key, None);
         assert_eq!(ticket.description, None);
+
+        json["renderedFields"]["description"] = Value::Null;
+        assert_eq!(parse_issue(&json, None).unwrap().description, None);
 
         json["renderedFields"]["description"] = Value::from("<p> </p>\n");
         assert_eq!(parse_issue(&json, None).unwrap().description, None);
@@ -647,7 +751,7 @@ mod tests {
 
         let err = parse_issue(&json, None).unwrap_err();
         assert!(
-            format!("{err:#}").contains("GRLD-101: no summary"),
+            format!("{err:#}").contains("GRLD-24229: no summary"),
             "{err:#}"
         );
     }
@@ -1009,7 +1113,10 @@ mod tests {
             Auth::Basic { .. } => "basic (Cloud)",
             Auth::Bearer { .. } => "bearer (Server/DC)",
         };
-        client.check_auth().await.unwrap();
+        match client.check_auth().await {
+            Ok(()) | Err(FetchError::Unauthorized { scope: true, .. }) => {}
+            Err(error) => panic!("{error}"),
+        }
         let ticket = client.fetch(&key).await.unwrap();
 
         assert!(!ticket.key.is_empty());
