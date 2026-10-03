@@ -11,11 +11,19 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H1 Parse contract + parser reuse — **done** |
+| Step | H2 Bounds-safe `content_hash` — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H2 Bounds-safe `content_hash`.** `content_hash` now uses
+  `as_bytes().get(start..end)` and returns `anyhow::Result<String>`; an
+  out-of-range span is a hard error naming the symbol fqn and the span, not a
+  panic or a silent clamp. `write_symbol` `?`s the hash with
+  `hashing symbol <fqn>` context, so a parser bug fails the run. Added a unit
+  test that a span past the end of the source errors and names the fqn/span;
+  existing content-hash test stays green. Decision D-b (H2).
 
 - **H1 Parse contract + parser reuse.** `symbols` gains a reusable `JavaParser`
   (grammar loaded once per run) and `ParsedFile { symbols, parse_error }`;
@@ -104,8 +112,8 @@ the decisions taken, and the tradeoffs behind them.
 ### Next
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
-  items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1 is
-  done; next is **H2** (bounds-safe `content_hash`).
+  items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1 and
+  H2 are done; next is **H3** (make the declared foreign key real).
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -123,6 +131,7 @@ the decisions taken, and the tradeoffs behind them.
 | 1.5 Write + show | done | `symbols` table, `indexer::build_index`, `Store::open_index`, `show::render`; 40 tests |
 | Pre-Phase-2 review | done | edge-case + CLI verification; missing-repo error; quieter empty-file log; 41 tests |
 | H1 Parse contract + parser reuse | done | `JavaParser`/`ParsedFile`; `IndexStats` buckets `empty`/`parse_errors`/`unreadable`; parser built once per run; resolves open #11; 43 tests |
+| H2 Bounds-safe `content_hash` | done | `.get(start..end)` + `Result`; out-of-range span errors with fqn/span context; unit test; decision D-b |
 
 ## Decisions and tradeoffs
 
@@ -172,6 +181,7 @@ the decisions taken, and the tradeoffs behind them.
 | 42 | `IndexStats.files` counts files that produced a symbol; the disjoint `empty` / `parse_errors` / `unreadable` buckets count the rest | Count every walked file as `files` | `files` + the three failure buckets = walked; a clean symbol-less file (`package-info.java`) is now distinct from a parse failure (D-a) |
 | D-a (H1) | New `JavaParser`/`ParsedFile` API; `IndexStats.skipped` is replaced by `empty`/`parse_errors`/`unreadable`, `files` keeps its meaning | Keep `Ok(vec![])` for both | Distinguishes a broken file from a symbol-less one; resolves open #11; parser reused once per run (one grammar load) |
 | D-j (H1) | Update decision 42 (skip semantics) as above; decision 25 (walker pruning) is unaffected here | — | Decision 25 changes with H9, not H1 |
+| D-b (H2) | An out-of-range symbol span is a hard error carrying the fqn and span; `content_hash` returns `Result` | Clamp the span to the source length and hash the wrong bytes | A span past the end is a parser bug, so the run must fail with context, never panic or hash a truncated slice |
 | 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
 
 ## Open questions
