@@ -1,0 +1,276 @@
+//! The production Java files to index.
+//!
+//! A single pure function, [`java_files`], walks a repository with the
+//! [`ignore`] crate so `.gitignore` and the other standard filters apply, then
+//! drops test code and build/generated trees. Results are paths relative to
+//! the repository root, sorted so later steps and tests are stable.
+
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::Result;
+use ignore::{DirEntry, WalkBuilder};
+
+/// Directory names that are pruned wherever they appear in the tree. `build`
+/// and `target` are Maven/Gradle output; `generated` and `generated-sources`
+/// are build-time source trees.
+const SKIP_DIRS: &[&str] = &["build", "target", "generated", "generated-sources"];
+
+/// Any file under this repository-relative prefix is test code.
+const TEST_PREFIX: &str = "src/test";
+
+/// Every production `.java` file under `repo`, as paths relative to `repo`,
+/// sorted lexicographically.
+///
+/// `.gitignore` is honoured (the `ignore` crate's standard filters), and the
+/// [`SKIP_DIRS`] and `src/test` trees are excluded. `path_prefix`, when given,
+/// limits the result to files under that prefix; it may be relative to `repo`
+/// or an absolute path inside it. A prefix outside the repository, or one that
+/// matches nothing, yields an empty list rather than an error.
+pub fn java_files(repo: &Path, path_prefix: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let prefix = match path_prefix {
+        Some(prefix) => match relative_prefix(repo, prefix) {
+            Some(prefix) => Some(prefix),
+            None => return Ok(Vec::new()),
+        },
+        None => None,
+    };
+
+    let root = repo.to_path_buf();
+    let mut walker = WalkBuilder::new(repo);
+    walker
+        .standard_filters(true)
+        .parents(false)
+        .require_git(false)
+        .filter_entry(move |entry| !is_skipped_dir(&root, entry));
+
+    let mut files = Vec::new();
+    for result in walker.build() {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!("skipping unreadable entry: {err}");
+                continue;
+            }
+        };
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(repo) else {
+            continue;
+        };
+        if !is_java(relative) {
+            continue;
+        }
+        if is_test(relative) {
+            tracing::debug!(path = %relative.display(), "skipping test file");
+            continue;
+        }
+        if let Some(prefix) = &prefix
+            && !relative.starts_with(prefix)
+        {
+            continue;
+        }
+        files.push(relative.to_path_buf());
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_java(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "java")
+}
+
+fn is_test(path: &Path) -> bool {
+    path.starts_with(TEST_PREFIX)
+}
+
+fn is_skipped_dir(repo: &Path, entry: &DirEntry) -> bool {
+    if !entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+    {
+        return false;
+    }
+    let Ok(relative) = entry.path().strip_prefix(repo) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        SKIP_DIRS.iter().any(|skip| name == *skip)
+    })
+}
+
+/// Reduce `prefix` to a path relative to `repo`. Absolute prefixes that fall
+/// outside `repo` return `None`; a relative prefix is normalised by dropping
+/// leading `./` components.
+fn relative_prefix(repo: &Path, prefix: &Path) -> Option<PathBuf> {
+    if prefix.is_absolute() {
+        if let Ok(relative) = prefix.strip_prefix(repo) {
+            return Some(relative.to_path_buf());
+        }
+        if repo.is_relative()
+            && let Ok(cwd) = std::env::current_dir()
+            && let Ok(relative) = prefix.strip_prefix(cwd.join(repo))
+        {
+            return Some(relative.to_path_buf());
+        }
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in prefix.components() {
+        if let Component::CurDir = component {
+            continue;
+        }
+        normalized.push(component.as_os_str());
+    }
+    Some(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(repo: &Path, relative: &str) {
+        let path = repo.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "class Placeholder {}\n").unwrap();
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn returns_exactly_the_expected_production_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for file in [
+            "src/main/java/com/acme/App.java",
+            "src/main/java/com/acme/Util.java",
+            "src/main/java/com/acme/package-info.txt",
+            "src/test/java/com/acme/AppTest.java",
+            "src/main/java/com/acme/generated/Generated.java",
+            "build/Out.java",
+            "target/Target.java",
+            "generated-sources/Source.java",
+            "vendor/Vendor.java",
+        ] {
+            write_file(root, file);
+        }
+        std::fs::write(root.join(".gitignore"), "vendor/\n").unwrap();
+
+        let files = java_files(root, None).unwrap();
+
+        assert_eq!(
+            files,
+            paths(&[
+                "src/main/java/com/acme/App.java",
+                "src/main/java/com/acme/Util.java",
+            ]),
+            "walker should return only the two production files"
+        );
+    }
+
+    #[test]
+    fn gitignore_excludes_ignored_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/Keep.java");
+        write_file(root, "src/main/java/com/acme/Drop.java");
+        std::fs::write(root.join(".gitignore"), "Drop.java\n").unwrap();
+
+        let files = java_files(root, None).unwrap();
+
+        assert_eq!(files, paths(&["src/main/java/com/acme/Keep.java"]));
+    }
+
+    #[test]
+    fn skips_build_output_and_generated_trees() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/Real.java");
+        for skip in SKIP_DIRS {
+            write_file(root, &format!("{skip}/Ignored.java"));
+            write_file(root, &format!("module/{skip}/Nested/Ignored.java"));
+        }
+
+        let files = java_files(root, None).unwrap();
+
+        assert_eq!(files, paths(&["src/main/java/com/acme/Real.java"]));
+    }
+
+    #[test]
+    fn skips_src_test_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/App.java");
+        write_file(root, "src/test/java/com/acme/AppTest.java");
+        write_file(root, "src/test/kotlin/com/acme/AppSpec.java");
+        write_file(root, "src/testng/com/acme/NotTest.java");
+
+        let files = java_files(root, None).unwrap();
+
+        assert_eq!(
+            files,
+            paths(&[
+                "src/main/java/com/acme/App.java",
+                "src/testng/com/acme/NotTest.java",
+            ]),
+            "only the src/test prefix is test code"
+        );
+    }
+
+    #[test]
+    fn path_prefix_limits_results_and_accepts_absolute_prefixes() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/App.java");
+        write_file(root, "src/main/java/com/acme/other/Other.java");
+
+        let relative =
+            java_files(root, Some(Path::new("src/main/java/com/acme/App.java"))).unwrap();
+        assert_eq!(relative, paths(&["src/main/java/com/acme/App.java"]));
+
+        let absolute = java_files(root, Some(&root.join("src/main/java/com/acme/other"))).unwrap();
+        assert_eq!(
+            absolute,
+            paths(&["src/main/java/com/acme/other/Other.java"])
+        );
+
+        let dot = java_files(root, Some(Path::new("./src/main/java/com/acme"))).unwrap();
+        assert_eq!(
+            dot,
+            paths(&[
+                "src/main/java/com/acme/App.java",
+                "src/main/java/com/acme/other/Other.java",
+            ])
+        );
+    }
+
+    #[test]
+    fn path_prefix_outside_repo_or_matching_nothing_is_empty() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/App.java");
+
+        assert!(
+            java_files(root, Some(Path::new("/does/not/exist")))
+                .unwrap()
+                .is_empty(),
+            "an absolute prefix outside the repo should be empty"
+        );
+        assert!(
+            java_files(root, Some(Path::new("src/main/java/com/missing")))
+                .unwrap()
+                .is_empty(),
+            "a prefix matching nothing should be empty"
+        );
+    }
+}
