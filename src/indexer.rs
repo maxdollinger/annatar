@@ -1,8 +1,8 @@
 //! Build `index.db` from a repository's Java sources.
 //!
-//! [`build_index`] walks the production files, parses each one with
-//! [`crate::symbols::parse_file`] and writes every symbol to the `symbols`
-//! table of a fresh index build. The whole run happens on
+//! [`build_index`] walks the production files, parses each one with a single
+//! reusable [`crate::symbols::JavaParser`] and writes every symbol to the
+//! `symbols` table of a fresh index build. The whole run happens on
 //! [`crate::store::IndexBuild`]'s temporary file and only becomes `index.db`
 //! when it commits; an error drops the build and leaves the previous index
 //! untouched.
@@ -11,7 +11,7 @@
 //! across runs. The parser returns symbols in pre-order, so a symbol is always
 //! written before its members and nested types; an in-memory map from fqn to row
 //! id supplies each child's `parent_id`. A file that cannot be read or parsed is
-//! logged and counted as skipped, never fatal.
+//! counted in its own bucket, never fatal.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use libsql::{Connection, params};
 
 use crate::store::Store;
-use crate::symbols::{self, Symbol};
+use crate::symbols::{JavaParser, Symbol};
 use crate::walk;
 
 /// A summary of one index run.
@@ -30,8 +30,12 @@ pub struct IndexStats {
     pub files: usize,
     /// Symbol rows written to `symbols`.
     pub symbols: usize,
-    /// Files dropped because they were unreadable or produced no symbols.
-    pub skipped: usize,
+    /// Files that parsed cleanly but produced no symbols (`package-info.java`).
+    pub empty: usize,
+    /// Files tree-sitter could not parse, or for which it produced no tree.
+    pub parse_errors: usize,
+    /// Files whose contents could not be read.
+    pub unreadable: usize,
 }
 
 /// Index every production Java file under `repo` into a fresh `index.db`.
@@ -52,8 +56,11 @@ pub async fn build_index(
     let mut stats = IndexStats {
         files: 0,
         symbols: 0,
-        skipped: 0,
+        empty: 0,
+        parse_errors: 0,
+        unreadable: 0,
     };
+    let mut parser = JavaParser::new()?;
     let mut ids: HashMap<String, i64> = HashMap::new();
 
     for relative in &files {
@@ -61,21 +68,26 @@ pub async fn build_index(
             Ok(source) => source,
             Err(err) => {
                 tracing::warn!(path = %relative.display(), error = %err, "skipping unreadable file");
-                stats.skipped += 1;
+                stats.unreadable += 1;
                 continue;
             }
         };
-        let symbols = symbols::parse_file(relative, &source)?;
-        if symbols.is_empty() {
-            // A parse error was already logged by `parse_file`; this also
-            // covers valid files with no symbols (`package-info.java`), so it
-            // stays at debug to keep a normal run quiet.
+        let parsed = parser.parse(relative, &source)?;
+        if parsed.parse_error {
+            // The parser already logged the path; the file drops out of the
+            // run, and the bucket keeps it distinct from a clean empty file.
+            stats.parse_errors += 1;
+            continue;
+        }
+        if parsed.symbols.is_empty() {
+            // A valid file with no symbols (`package-info.java`) is normal, so
+            // this stays at debug to keep a clean run quiet.
             tracing::debug!(path = %relative.display(), "no symbols parsed; skipping file");
-            stats.skipped += 1;
+            stats.empty += 1;
             continue;
         }
         stats.files += 1;
-        for symbol in &symbols {
+        for symbol in &parsed.symbols {
             if write_symbol(build.connection(), relative, &source, symbol, &mut ids).await? {
                 stats.symbols += 1;
             }
@@ -86,7 +98,9 @@ pub async fn build_index(
     tracing::info!(
         files = stats.files,
         symbols = stats.symbols,
-        skipped = stats.skipped,
+        empty = stats.empty,
+        parse_errors = stats.parse_errors,
+        unreadable = stats.unreadable,
         "indexed repository"
     );
     Ok(stats)
@@ -257,7 +271,9 @@ public class UserService {
 
         let (store, stats) = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(stats.files, 1);
-        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.empty, 0);
+        assert_eq!(stats.parse_errors, 0);
+        assert_eq!(stats.unreadable, 0);
         assert_eq!(stats.symbols, 5, "class, two methods, nested type, ping");
 
         let conn = store.open_index().await.unwrap();
@@ -378,7 +394,9 @@ public class UserService {
             IndexStats {
                 files: 0,
                 symbols: 0,
-                skipped: 0,
+                empty: 0,
+                parse_errors: 0,
+                unreadable: 0,
             }
         );
 
@@ -418,7 +436,43 @@ public class UserService {
 
         let (store, stats) = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(stats.files, 1);
-        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.parse_errors, 1);
+        assert_eq!(stats.empty, 0);
+        assert_eq!(stats.unreadable, 0);
+        assert_eq!(stats.symbols, 1);
+
+        let conn = store.open_index().await.unwrap();
+        assert_eq!(count(&conn).await, 1);
+    }
+
+    #[tokio::test]
+    async fn good_empty_and_broken_files_land_in_distinct_buckets() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Good.java",
+            "package com.acme;\nclass Good {}\n",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/package-info.java",
+            "package com.acme;\n",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Broken.java",
+            "package com.acme;\nclass Broken {\n",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let (store, stats) = build(repo.path(), data.path()).await.unwrap();
+        assert_eq!(stats.files, 1, "only Good.java produced a symbol");
+        assert_eq!(
+            stats.empty, 1,
+            "package-info.java parsed cleanly, no symbols"
+        );
+        assert_eq!(stats.parse_errors, 1, "Broken.java did not parse");
+        assert_eq!(stats.unreadable, 0);
         assert_eq!(stats.symbols, 1);
 
         let conn = store.open_index().await.unwrap();

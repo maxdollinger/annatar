@@ -68,8 +68,8 @@ async fn main() -> Result<()> {
             let store = Store::open(&config.data_dir).await?;
             let stats = indexer::build_index(&store, &config.repo, cli.path.as_deref()).await?;
             println!(
-                "indexed {} files, {} symbols, {} skipped",
-                stats.files, stats.symbols, stats.skipped
+                "indexed {} files, {} symbols, {} empty, {} parse errors, {} unreadable",
+                stats.files, stats.symbols, stats.empty, stats.parse_errors, stats.unreadable
             );
         }
         Command::Show { fqn } => {
