@@ -11,11 +11,20 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols |
-| Step | 1.3 Parse methods and constructors — **done** |
+| Step | 1.4 Signature, Javadoc, annotations, Spring role — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **1.4 Signature, Javadoc, annotations, Spring role.** `Symbol` gained
+  `signature` (declaration without body, annotations removed, whitespace
+  collapsed), `javadoc: Option<String>` (cleaned `/** ... */` directly above the
+  declaration), `annotations: Vec<String>` (as written) and `role: Option<Role>`
+  for types. `Role`: controller/service/repository/component/configuration/
+  entity, derived from annotations; Spring Data interfaces are repository via
+  `extends` names. Precedence controller > service > repository > configuration
+  > component > entity. 7 tests; 32 total, green; clippy clean.
 
 - **1.3 Parse methods and constructors.** `symbols::parse_file` now returns a
   unified `Vec<Symbol>` (`SymbolKind`: class/interface/enum/record/annotation/
@@ -68,9 +77,9 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- 1.4 Signature, Javadoc, annotations, Spring role: text each symbol carries
-  plus a role for types (controller/service/repository/component/
-  configuration/entity).
+- 1.5 Write symbols and `show`: `symbols` table in `index.db`, content hash,
+  and `annatar show <fqn>` printing a symbol and its children. Needs a read
+  connection to the committed index (open question 6).
 
 ## Step log
 
@@ -81,6 +90,7 @@ the decisions taken, and the tradeoffs behind them.
 | 1.1 File walker | done | `walk::java_files`; `ignore` crate; 6 tests (15 total) |
 | 1.2 Parse types | done | `symbols::parse_types`; tree-sitter 0.25 + tree-sitter-java 0.23; 6 tests (21 total) |
 | 1.3 Methods/constructors | done | unified `Symbol`; fqn `Type#name(params)`, ctors `<init>`; 10 symbols tests (25 total) |
+| 1.4 Text + role | done | signature/javadoc/annotations/role; 17 symbols tests (32 total) |
 
 ## Decisions and tradeoffs
 
@@ -119,6 +129,10 @@ the decisions taken, and the tradeoffs behind them.
 | 31 | Constructor fqn uses `<init>` (name field `<init>` too) | Use the type's simple name | JVM/SCIP/JDT convention; unambiguous and stable, and later SCIP usage mapping matches without translation |
 | 32 | Member fqn parameter types are whitespace-stripped source text, no parameter names (`Map<String,List<X>>`) | Keep original spacing / resolve simple names | Identity only needs distinct overloads; 1.4 stores the full signature separately, so fqn can be compact and deterministic |
 | 33 | Fields, initializer blocks and annotation-type elements are not symbols | Include them | The plan scopes members to methods and constructors; annotations are covered by 1.4's annotation text, not as symbols |
+| 34 | `signature` drops declaration-level annotations and collapses whitespace; parameter annotations stay in it | Keep annotations in the signature / preserve source formatting | Annotations have their own field; a one-line signature is what the 4.3 prompt wants. Parameter annotations are part of the method's shape |
+| 35 | Javadoc is cleaned (delimiters and leading `*` stripped) and only the immediately preceding `block_comment` counts | Store raw comment / search further back | Clean text goes straight into the LLM prompt; a comment separated by code is not a doc comment for the declaration |
+| 36 | Role precedence puts `Configuration` above `Component` (plan lists component first) | Follow the plan's list order verbatim | `@Configuration` is a specialization of `@Component`, so it is the more specific role; classes carrying both are configurations |
+| 37 | Spring Data repository = known base-interface list or a superinterface simple name ending in `Repository`; the type's own name does not matter | Match the type's own name too / use imports for exactness | The `extends` chain is what makes it a Spring Data repo; own-name matching would tag unrelated interfaces. Import resolution is deferred |
 
 ## Open questions
 
