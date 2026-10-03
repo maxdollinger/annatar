@@ -14,19 +14,22 @@
 //! holds the epic key on Server/DC; it is read only when there is no parent.
 //!
 //! [`FetchError`] keeps the HTTP outcomes 3.2 needs apart: bad credentials,
-//! an unavailable issue, rate limiting and everything else. Caching, retries
-//! and concurrency are not handled here.
+//! an unavailable issue, rate limiting and everything else. A 403 carrying
+//! `X-Authentication-Denied-Reason` (Server/DC CAPTCHA after failed logins)
+//! counts as bad credentials. Caching, retries and concurrency are not handled
+//! here.
 
 use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use reqwest::header::{ACCEPT, HeaderMap, RETRY_AFTER};
 use serde_json::Value;
 
 use crate::config::{ENV_JIRA_EMAIL, ENV_JIRA_TOKEN, JiraConfig};
 
 /// Per-request timeout.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wrap width handed to the HTML converter; wide enough that paragraphs stay
 /// on one line.
@@ -80,21 +83,29 @@ fn string_at(json: &Value, pointer: &str) -> Option<String> {
     json.pointer(pointer)?.as_str().map(str::to_string)
 }
 
-/// Convert Jira's rendered HTML to plain text: no emphasis markers, table
-/// borders or link URLs (link text stays); list items and code blocks keep
-/// their lines; surrounding blank lines and trailing spaces are dropped.
-pub fn html_to_text(html: &str) -> Result<String> {
+/// Convert Jira's rendered HTML to plain text: no emphasis or strikeout
+/// markers, table borders or link URLs (links keep their text in `[text]`
+/// brackets); list items and code blocks keep their lines; runs of blank lines
+/// collapse to one, and surrounding blank lines and trailing spaces are
+/// dropped.
+fn html_to_text(html: &str) -> Result<String> {
     let text = html2text::config::plain_no_decorate()
         .no_table_borders()
         .link_footnotes(false)
+        .unicode_strikeout(false)
         .string_from_read(html.as_bytes(), TEXT_WIDTH)
         .map_err(|err| anyhow!("converting HTML to text: {err}"))?;
-    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim_end) {
+        if !(line.is_empty() && lines.last().is_some_and(|last| last.is_empty())) {
+            lines.push(line);
+        }
+    }
     Ok(lines.join("\n").trim().to_string())
 }
 
 /// How requests authenticate.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum Auth {
     /// Cloud: account email plus API token.
     Basic { email: String, token: String },
@@ -123,8 +134,10 @@ impl Auth {
 /// Why fetching an issue failed.
 #[derive(Debug)]
 pub enum FetchError {
-    /// 401: credentials missing or wrong. Must never be cached.
-    Unauthorized,
+    /// 401, or 403 with `X-Authentication-Denied-Reason`: credentials missing
+    /// or wrong. Must never be cached. `basic` names the auth mode for the
+    /// message.
+    Unauthorized { basic: bool },
     /// 403 or 404: the issue does not exist or is not visible to this account.
     Unavailable { status: u16 },
     /// 429: back off, for `retry_after` when Jira sent a seconds value.
@@ -142,10 +155,13 @@ pub enum FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unauthorized => write!(
+            Self::Unauthorized { basic: true } => write!(
                 f,
-                "Jira rejected the credentials (401); check {ENV_JIRA_TOKEN} and {ENV_JIRA_EMAIL}"
+                "Jira rejected the credentials; check {ENV_JIRA_TOKEN} and {ENV_JIRA_EMAIL}"
             ),
+            Self::Unauthorized { basic: false } => {
+                write!(f, "Jira rejected the credentials; check {ENV_JIRA_TOKEN}")
+            }
             Self::Unavailable { status } => write!(f, "issue unavailable (HTTP {status})"),
             Self::RateLimited {
                 retry_after: Some(wait),
@@ -168,14 +184,22 @@ impl std::error::Error for FetchError {
     }
 }
 
-/// Map a non-success status to its [`FetchError`]; `None` for 2xx.
-pub fn status_error(status: u16, retry_after: Option<&str>) -> Option<FetchError> {
+/// Header Jira Server/DC adds to a 403 when it refuses the login itself
+/// (e.g. CAPTCHA after repeated failures).
+const AUTH_DENIED_REASON: &str = "x-authentication-denied-reason";
+
+/// Map a non-success status and its headers to a [`FetchError`]; `None` for
+/// 2xx. `basic` is the auth mode, carried into [`FetchError::Unauthorized`].
+fn status_error(status: u16, headers: &HeaderMap, basic: bool) -> Option<FetchError> {
     match status {
         200..=299 => None,
-        401 => Some(FetchError::Unauthorized),
+        401 => Some(FetchError::Unauthorized { basic }),
+        403 if headers.contains_key(AUTH_DENIED_REASON) => Some(FetchError::Unauthorized { basic }),
         403 | 404 => Some(FetchError::Unavailable { status }),
         429 => Some(FetchError::RateLimited {
-            retry_after: retry_after
+            retry_after: headers
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse().ok())
                 .map(Duration::from_secs),
         }),
@@ -184,7 +208,7 @@ pub fn status_error(status: u16, retry_after: Option<&str>) -> Option<FetchError
 }
 
 /// The issue URL for `key` under `base_url`.
-pub fn issue_url(base_url: &str, key: &str) -> String {
+fn issue_url(base_url: &str, key: &str) -> String {
     format!(
         "{}/rest/api/2/issue/{key}?expand=renderedFields",
         base_url.trim_end_matches('/')
@@ -208,10 +232,17 @@ pub struct JiraClient {
 }
 
 impl JiraClient {
-    /// Build a client from the Jira config. Fails when no token is set.
+    /// Build a client from the Jira config. Fails when no token is set or
+    /// `base_url` is not an absolute http(s) URL.
     pub fn new(config: &JiraConfig) -> Result<Self> {
-        if config.base_url.trim().is_empty() {
+        let base_url = config.base_url.trim();
+        if base_url.is_empty() {
             bail!("jira.base_url is empty");
+        }
+        let url = reqwest::Url::parse(base_url)
+            .with_context(|| format!("jira.base_url {base_url:?} is not a URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("jira.base_url {base_url:?} must start with http:// or https://");
         }
         let auth = Auth::from_config(config)?;
         let http = reqwest::Client::builder()
@@ -220,7 +251,7 @@ impl JiraClient {
             .context("building the HTTP client")?;
         Ok(Self {
             http,
-            base_url: config.base_url.clone(),
+            base_url: base_url.to_string(),
             auth,
             epic_link_field: config.epic_link_field.clone(),
         })
@@ -228,30 +259,36 @@ impl JiraClient {
 
     /// Fetch and parse one issue.
     pub async fn fetch(&self, key: &str) -> Result<Ticket, FetchError> {
+        let request = self.request(key)?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(FetchError::Transport)?;
+        let basic = matches!(self.auth, Auth::Basic { .. });
+        if let Some(err) = status_error(response.status().as_u16(), response.headers(), basic) {
+            return Err(err);
+        }
+        let body = response.bytes().await.map_err(FetchError::Transport)?;
+        let json: Value =
+            serde_json::from_slice(&body).map_err(|err| FetchError::Parse(anyhow!(err)))?;
+        parse_issue(&json, self.epic_link_field.as_deref()).map_err(FetchError::Parse)
+    }
+
+    /// The authenticated issue request for `key`, built but not sent.
+    fn request(&self, key: &str) -> Result<reqwest::Request, FetchError> {
         if !is_plain_key(key) {
             return Err(FetchError::InvalidKey(key.to_string()));
         }
         let request = self
             .http
             .get(issue_url(&self.base_url, key))
-            .header(reqwest::header::ACCEPT, "application/json");
+            .header(ACCEPT, "application/json");
         let request = match &self.auth {
             Auth::Basic { email, token } => request.basic_auth(email, Some(token)),
             Auth::Bearer { token } => request.bearer_auth(token),
         };
-        let response = request.send().await.map_err(FetchError::Transport)?;
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok());
-        if let Some(err) = status_error(response.status().as_u16(), retry_after) {
-            return Err(err);
-        }
-        let json: Value = response
-            .json()
-            .await
-            .map_err(|err| FetchError::Parse(anyhow!(err)))?;
-        parse_issue(&json, self.epic_link_field.as_deref()).map_err(FetchError::Parse)
+        request.build().map_err(FetchError::Transport)
     }
 }
 
@@ -348,6 +385,23 @@ mod tests {
     }
 
     #[test]
+    fn epic_link_field_may_hold_an_object_with_a_key() {
+        let mut json = fixture("epic_child");
+        json["fields"]["customfield_10100"] = serde_json::json!({ "key": "GRLD-301" });
+
+        let ticket = parse_issue(&json, Some("customfield_10100")).unwrap();
+        assert_eq!(ticket.parent_key.as_deref(), Some("GRLD-301"));
+    }
+
+    #[test]
+    fn empty_parent_key_is_none() {
+        let mut json = fixture("subtask");
+        json["fields"]["parent"]["key"] = Value::from("");
+
+        assert_eq!(parse_issue(&json, None).unwrap().parent_key, None);
+    }
+
+    #[test]
     fn parent_wins_over_epic_link_field() {
         let mut json = fixture("subtask");
         json["fields"]["customfield_10100"] = Value::from("GRLD-300");
@@ -369,6 +423,30 @@ mod tests {
 
         json.as_object_mut().unwrap().remove("renderedFields");
         assert_eq!(parse_issue(&json, None).unwrap().description, None);
+    }
+
+    #[test]
+    fn html_drops_strikeout_and_collapses_blank_lines() {
+        assert_eq!(
+            html_to_text("<p>was <del>struck</del> out</p>").unwrap(),
+            "was struck out"
+        );
+        assert_eq!(
+            html_to_text("<p>one</p><br/><br/><br/><p>two</p><p></p><p></p><p>three</p>").unwrap(),
+            "one\n\ntwo\n\nthree"
+        );
+        assert_eq!(
+            html_to_text("<p>see <a href=\"https://wiki.example.com/x\">the spec</a></p>").unwrap(),
+            "see [the spec]"
+        );
+    }
+
+    #[test]
+    fn long_paragraph_stays_on_one_line() {
+        let paragraph = "word ".repeat(400);
+        let text = html_to_text(&format!("<p>{paragraph}</p>")).unwrap();
+
+        assert_eq!(text, paragraph.trim_end());
     }
 
     #[test]
@@ -405,33 +483,74 @@ mod tests {
         }
     }
 
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    reqwest::header::HeaderName::from_static(name),
+                    value.parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn statuses_map_to_distinct_errors() {
-        assert!(status_error(200, None).is_none());
+        let none = HeaderMap::new();
+        assert!(status_error(200, &none, false).is_none());
         assert!(matches!(
-            status_error(401, None),
-            Some(FetchError::Unauthorized)
+            status_error(401, &none, true),
+            Some(FetchError::Unauthorized { basic: true })
         ));
         assert!(matches!(
-            status_error(403, None),
+            status_error(403, &none, false),
             Some(FetchError::Unavailable { status: 403 })
         ));
         assert!(matches!(
-            status_error(404, None),
+            status_error(404, &none, false),
             Some(FetchError::Unavailable { status: 404 })
         ));
         assert!(matches!(
-            status_error(429, Some(" 17 ")),
+            status_error(429, &headers(&[("retry-after", " 17 ")]), false),
             Some(FetchError::RateLimited { retry_after: Some(wait) }) if wait == Duration::from_secs(17)
         ));
         assert!(matches!(
-            status_error(429, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            status_error(
+                429,
+                &headers(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]),
+                false
+            ),
             Some(FetchError::RateLimited { retry_after: None })
         ));
         assert!(matches!(
-            status_error(500, None),
+            status_error(500, &none, false),
             Some(FetchError::Status { status: 500 })
         ));
+    }
+
+    #[test]
+    fn forbidden_with_auth_denied_reason_is_unauthorized() {
+        let denied = headers(&[(
+            "x-authentication-denied-reason",
+            "CAPTCHA_CHALLENGE; login-url=https://jira.example.com/login.jsp",
+        )]);
+
+        assert!(matches!(
+            status_error(403, &denied, false),
+            Some(FetchError::Unauthorized { basic: false })
+        ));
+    }
+
+    #[test]
+    fn unauthorized_names_the_email_only_in_basic_mode() {
+        let basic = FetchError::Unauthorized { basic: true }.to_string();
+        assert!(basic.contains(ENV_JIRA_TOKEN), "{basic}");
+        assert!(basic.contains(ENV_JIRA_EMAIL), "{basic}");
+
+        let bearer = FetchError::Unauthorized { basic: false }.to_string();
+        assert!(bearer.contains(ENV_JIRA_TOKEN), "{bearer}");
+        assert!(!bearer.contains(ENV_JIRA_EMAIL), "{bearer}");
     }
 
     #[test]
@@ -447,15 +566,52 @@ mod tests {
     }
 
     #[test]
-    fn client_requires_a_token_and_rejects_odd_keys() {
+    fn request_carries_url_accept_and_auth() {
+        let mut config = jira(Some("t"), Some("a@example.com"));
+        config.base_url = " https://jira.example.com/ ".to_string();
+        let request = JiraClient::new(&config).unwrap().request("GRLD-1").unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(
+            request.url().as_str(),
+            "https://jira.example.com/rest/api/2/issue/GRLD-1?expand=renderedFields"
+        );
+        assert_eq!(request.headers()[ACCEPT], "application/json");
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Basic YUBleGFtcGxlLmNvbTp0"
+        );
+
+        let request = JiraClient::new(&jira(Some("t"), None))
+            .unwrap()
+            .request("GRLD-1")
+            .unwrap();
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer t"
+        );
+    }
+
+    #[test]
+    fn client_validates_base_url() {
+        let mut config = jira(Some("t"), None);
+        for base_url in ["", "  ", "jira.example.com", "ftp://jira.example.com"] {
+            config.base_url = base_url.to_string();
+            assert!(JiraClient::new(&config).is_err(), "{base_url:?}");
+        }
+
+        config.base_url = "  https://jira.example.com/jira  ".to_string();
+        let client = JiraClient::new(&config).unwrap();
+        assert_eq!(client.base_url, "https://jira.example.com/jira");
+    }
+
+    #[tokio::test]
+    async fn client_requires_a_token_and_rejects_odd_keys() {
         assert!(JiraClient::new(&jira(None, None)).is_err());
 
         let client = JiraClient::new(&jira(Some("t"), None)).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
         for key in ["", "GRLD-1/../2", "GRLD-1?x=1"] {
-            let err = runtime.block_on(client.fetch(key)).unwrap_err();
+            let err = client.fetch(key).await.unwrap_err();
             assert!(matches!(err, FetchError::InvalidKey(_)), "{key}: {err}");
         }
     }
@@ -488,7 +644,13 @@ mod tests {
         };
         let ticket = client.fetch(&key).await.unwrap();
 
-        assert_eq!(ticket.key, key);
+        assert!(!ticket.key.is_empty());
+        if ticket.key != key {
+            println!(
+                "requested {key}, Jira returned {} (moved issue?)",
+                ticket.key
+            );
+        }
         assert!(!ticket.issue_type.is_empty());
         assert!(!ticket.summary.trim().is_empty());
         if let Some(description) = &ticket.description {

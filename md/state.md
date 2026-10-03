@@ -17,6 +17,25 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Done
 
+- **3.1 review fixes.** Body read errors are `FetchError::Transport`
+  (`bytes()` then `serde_json::from_slice` → `Parse`). A 403 with
+  `X-Authentication-Denied-Reason` (Server/DC CAPTCHA after failed logins) is
+  `Unauthorized`, so bad credentials never look like an unavailable issue
+  (J6); `status_error` now takes the headers and the auth mode, and the
+  `Unauthorized { basic }` message names `ANNATAR_JIRA_EMAIL` only in basic
+  mode. Request construction is a separate `JiraClient::request` (built, not
+  sent) with a test for URL, `Accept` and `Authorization` (basic vs bearer).
+  `html_to_text` turns off unicode strikeout, collapses runs of blank lines,
+  and its doc says links keep their `[text]` brackets. `JiraClient::new`
+  rejects a `base_url` that is not an absolute http(s) URL and stores it
+  trimmed. New tests: epic-link object with `key`, empty parent key, long
+  paragraph stays on one line (guards `TEXT_WIDTH`). `fetches_real_ticket`
+  no longer requires the returned key to equal the requested one (it logs the
+  difference). Nits: `#[tokio::test]`, `Auth` no longer derives
+  `PartialEq, Eq`, `status_error`/`issue_url`/`html_to_text`/`REQUEST_TIMEOUT`
+  private. D-x and D-z extended. 20 jira tests + 1 config test (1 ignored);
+  101 tests total.
+
 - **3.1 Fetch and parse.** New `jira` module: `Ticket { key, issue_type,
   summary, description: Option<String>, parent_key }`, a pure
   `parse_issue(&Value, epic_link_field)`, and an async `JiraClient::fetch`
@@ -485,7 +504,8 @@ the decisions taken, and the tradeoffs behind them.
   Confirm or override the PM defaults for J1, J2, J9 (D-w–D-y), answer J4–J8,
   and decide open #19 (`--path` narrows the whole index).
 - **Agent:** R9 staged pipeline (needs J4; natural home for open #19), then
-  3.2 Ticket cache.
+  3.2 Ticket cache. 3.2 must key the cache by the *requested* key, not
+  `Ticket.key` (D-z).
 
 ## Step log
 
@@ -521,6 +541,7 @@ the decisions taken, and the tradeoffs behind them.
 | R7 Doc drift | done | `project.md` storage/fqn/MCP signatures/broken export fixed; `AGENTS.md` clippy `--all-targets`; README usage + git requirement; findings 8/10/16 recorded as notes; docs only; 80 tests |
 | R8 Real-repo run | done | `argus` (release, rustc 1.99.0): 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (~7.8×), 15.6 ms/symbol, **92.5 % ticket coverage**, 0 degraded; cold run is git-bound (44 % CPU), release ≈ debug; R2/R3 verified live, history spot-checked against git; closes open #18; finding 5 measured (4 % merge-only keys → no action), finding 8 withdrawn; new open #19 (`--path` narrows the index). Toolchain installed: fmt/clippy/`cargo test` (80+1) green for the first time |
 | 3.1 Fetch and parse | done | `jira` module: `Ticket`, pure `parse_issue`, async `JiraClient::fetch` (REST v2, `expand=renderedFields`, 30 s timeout), `Auth` (J1), `FetchError` + `status_error`, `html2text`; `jira.epic_link_field` (J9); `reqwest` 0.13 (`json` + `rustls`); **synthetic** fixtures (J3 deviation, open #20); `#[ignore]` `fetches_real_ticket`; decisions D-w–D-z; 93 tests |
+| 3.1 review fixes | done | body read errors → `Transport`; 403 + `X-Authentication-Denied-Reason` → `Unauthorized` (J6); testable `JiraClient::request`; no unicode strikeout, blank-line runs collapsed; `base_url` validated and trimmed; 401 message per auth mode; more parse/HTML tests; D-x/D-z notes; 101 tests |
 
 ## Decisions and tradeoffs
 
@@ -592,9 +613,9 @@ the decisions taken, and the tradeoffs behind them.
 | D-u (R4) | `git log` runs with `--no-color --no-ext-diff --no-show-signature`, `-L` with `-s`; history-cache writes are batched in one cache-connection transaction per file | Enforce a minimum git version for `-s` with `-L`; one cache transaction per run | The flags make output independent of the developer's git config and stop git from producing hunks nobody reads; keeping the hunk-tolerant parser avoids a version check. Per file (not per run) bounds what a crash loses to one file's results while still removing the per-symbol fsync |
 | D-v (R6) | `Config.ticket_regex` is a compiled `Regex` (custom `deserialize_with`); `--path` prunes directories off the prefix path inside the walker's `filter_entry` instead of starting the walk at `repo/prefix` | Keep a `String` plus a cached `Option<Regex>`; start `WalkBuilder` at `repo/prefix` | One compile and one error path, reported by the TOML parser with line/column. The default pattern uses `Regex::new(DEFAULT_TICKET_REGEX).expect(..)`: a constant, covered by the config defaults test, unlike the data-dependent `expect` removed from `ticket_span`. Starting the walk at the prefix with `parents(false)` would silently skip the repo-root `.gitignore`; pruning in `filter_entry` keeps the walk equivalent while still never visiting the rest of the repo |
 | D-w (3.1, J1) | Jira auth: `ANNATAR_JIRA_EMAIL` set (non-empty) → basic `email:token` (Cloud API token); otherwise the token is sent as a bearer PAT (Server/DC). A missing or empty `ANNATAR_JIRA_TOKEN` fails `JiraClient::new`. PM default, adopted audit recommendation; product owner may override. | Cloud only; a separate `auth` config key | Both schemes are a few lines and the existing optional `email` already tells them apart; resolves open #1 |
-| D-x (3.1, J2) | `reqwest` 0.13 with `default-features = false`, features `json` + `rustls` (0.13 renamed the old `rustls-tls` feature; it uses aws-lc-rs and the platform certificate verifier), and `html2text` (`plain_no_decorate`, no table borders, no link footnotes) for `renderedFields` HTML. PM default, adopted audit recommendation; product owner may override. | `ureq`/blocking; hand-written HTML stripper; ADF parser via REST v3 | Async fits the tokio runtime and 3.2's bounded concurrency; `html2text` keeps lists, tables and code blocks readable. Accepts the TLS compile cost decision 13 avoided for libSQL. Plain output avoids `**`/URL noise in LLM prompts |
+| D-x (3.1, J2) | `reqwest` 0.13 with `default-features = false`, features `json` + `rustls` (0.13 renamed the old `rustls-tls` feature; it uses aws-lc-rs and the platform certificate verifier), and `html2text` (`plain_no_decorate`, no table borders, no link footnotes) for `renderedFields` HTML. PM default, adopted audit recommendation; product owner may override. | `ureq`/blocking; hand-written HTML stripper; ADF parser via REST v3 | Async fits the tokio runtime and 3.2's bounded concurrency; `html2text` keeps lists, tables and code blocks readable. Accepts the TLS compile cost decision 13 avoided for libSQL. A lighter alternative exists: reqwest `rustls-no-provider` plus `rustls` with the `ring` provider avoids the `aws-lc-sys` build; not adopted for now. `default-features = false` also drops reqwest's `system-proxy` (OS proxy settings); `HTTPS_PROXY`/`HTTP_PROXY` from the environment are still honoured. Plain output avoids `**`/URL noise in LLM prompts |
 | D-y (3.1, J9) | `parent_key` = `fields.parent.key`; only when absent, the optional `jira.epic_link_field` custom field (a string key, or an object with `key`). Unset = ignored. PM default, adopted audit recommendation; product owner may override. | Discover the epic-link field via `/rest/api/2/field`; parent only | Cloud covers it via `parent`; Server/DC opts in without code changes |
-| D-z (3.1, J3) | **Deviation:** fixtures under `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape, `jira.example.com`), not real captures; the real-token run is the `#[ignore]` `jira::tests::fetches_real_ticket` (base URL from `ANNATAR_JIRA_URL` or `annatar.toml`, key from `ANNATAR_JIRA_TEST_KEY`; prints only auth mode, key, type, parent and lengths). Also: REST v2 (works on Cloud and Server/DC), `Ticket.key` is the key Jira returns, description `None` when null or blank after conversion, keys outside `[A-Za-z0-9_-]` are rejected before any request | Block 3.1 on a token | No token is available to the agent; parsing is pure, so swapping in real captures only changes test data. Tracked as open #20 |
+| D-z (3.1, J3) | **Deviation:** fixtures under `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape, `jira.example.com`), not real captures; the real-token run is the `#[ignore]` `jira::tests::fetches_real_ticket` (base URL from `ANNATAR_JIRA_URL` or `annatar.toml`, key from `ANNATAR_JIRA_TEST_KEY`; prints only auth mode, key, type, parent and lengths). Also: REST v2 (works on Cloud and Server/DC), `Ticket.key` is the key Jira returns — a moved issue returns its *new* key, so 3.2 must key the cache by the *requested* key (and `fetches_real_ticket` only logs a mismatch), description `None` when null or blank after conversion, keys outside `[A-Za-z0-9_-]` are rejected before any request | Block 3.1 on a token | No token is available to the agent; parsing is pure, so swapping in real captures only changes test data. Tracked as open #20 |
 
 ## Open questions
 
