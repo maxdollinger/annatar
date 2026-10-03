@@ -90,14 +90,14 @@ If it isn't, add bounded parallelism (results written by one writer) or a histor
 *Goal:* for any ticket key, a `Ticket` with key, issue type, summary, plain-text description and parent/epic key.
 Use `reqwest` with the target's auth. Request `expand=renderedFields` and strip the HTML to text, which avoids writing an Atlassian Document Format parser.
 *Done when:* parsing is tested against saved JSON fixtures; an `#[ignore]` test fetches a real ticket.
-*Deviation:* no real Jira token was available, so the fixtures in `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape). The product owner replaces them with scrubbed real captures and runs `jira::tests::fetches_real_ticket` (audit J3, `state.md` D-z, open #20).
+*Deviation:* the fixtures in `tests/fixtures/jira/` started synthetic (no token); **closed** — they are now scrubbed real captures from the target Cloud Jira and `jira::tests::fetches_real_ticket` passes against it (audit J3, `state.md` D-z, open #20).
 
 **3.2 Ticket cache**
 *Goal:* every distinct key in `symbol_tickets` is in `cache.db`, either with content or marked unavailable.
 Fetch only missing keys. Record 403/404 as unavailable; back off on 429.
 Runs as a stage of the index build (after history, on the build's transaction, before the single commit; audit R9), so it reads the keys from the in-progress `symbol_tickets`.
 *Done when:* a second run makes no Jira calls.
-*Deviation:* proven against a fake `TicketSource` end to end through `build_index` (no real Jira available to the agent); the real-repo second run with a token is the product owner's check (audit §3.1 step 3, `state.md` open #21). Without Jira (or with `--offline`) the stage makes no requests but still copies already-cached tickets into the index `tickets` table, which `show` reads (D-ac, D-ad).
+*Deviation:* proven against a fake `TicketSource` end to end through `build_index` (no real Jira available to the agent); the real-repo second run with a token was the product owner's check (audit §3.1 step 3, `state.md` open #21) — **closed**: on `argus` the first run fetched all 79 keys, the second made 0 Jira requests. Without Jira (or with `--offline`) the stage makes no requests but still copies already-cached tickets into the index `tickets` table, which `show` reads (D-ac, D-ad).
 
 ## Phase 4 — LLM summaries
 

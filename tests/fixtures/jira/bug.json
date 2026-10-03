@@ -1,37 +1,39 @@
 {
-  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
-  "id": "20214",
-  "self": "https://jira.example.com/rest/api/2/issue/20214",
-  "key": "GRLD-214",
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_12000.requestTypePractice",
+  "id": "146857",
+  "self": "https://jira.example.com/rest/api/2/issue/146857",
+  "key": "GRLD-82584",
   "fields": {
     "issuetype": {
-      "self": "https://jira.example.com/rest/api/2/issuetype/10004",
-      "id": "10004",
-      "description": "A problem which impairs or prevents the functions of the product.",
-      "iconUrl": "https://jira.example.com/images/icons/issuetypes/bug.svg",
+      "self": "https://jira.example.com/rest/api/2/issuetype/1",
+      "id": "1",
+      "description": "Ein Problem oder Fehler.",
+      "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/13443?size=medium",
       "name": "Bug",
       "subtask": false,
       "hierarchyLevel": 0
     },
-    "summary": "Order export fails for orders without a delivery address",
-    "description": "Exporting an order with no delivery address throws an NPE.\n\n{code:java}\njava.lang.NullPointerException: address is null\n    at com.acme.order.OrderExporter.export(OrderExporter.java:42)\n{code}\n\nSee [the export spec|https://wiki.example.com/export].",
+    "summary": "Argus Token PreValidation Problem",
+    "description": "“Ich denke, das problem ist, dass die Token Pre-Validierung im Argus nur schaut, ob das jwt an sich gültig ist (signatur und expiration date), aber nicht, ob das token auch noch zu den aktuell gültigen tokens in der DB passt...”\n\n\n\nProblem war, dass ganze Log einträge generiert worden sind durch die PreAuthentication. Wie Oben beschrieben, prüft nur auf gültigkeit des JWTs, jedoch nicht ob das Token zu den aktuell tokens gehört.\n\n\n\n!image-20240513-110026.png|width=1536,height=640,alt=\"image-20240513-110026.png\"!\n\n\n\nSollte gefixt werden…",
     "status": {
-      "self": "https://jira.example.com/rest/api/2/status/10002",
-      "name": "Done",
-      "id": "10002",
-      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+      "self": "https://jira.example.com/rest/api/2/status/6",
+      "name": "Geschlossen",
+      "id": "6",
+      "statusCategory": {
+        "id": 3,
+        "key": "done",
+        "name": "Fertig"
+      }
     },
-    "customfield_10014": null,
-    "created": "2024-05-10T11:02:13.000+0200",
-    "updated": "2024-05-14T08:21:57.000+0200"
+    "created": "2024-05-13T12:57:23.061+0200",
+    "updated": "2024-07-16T07:29:03.389+0200"
   },
   "renderedFields": {
     "issuetype": null,
     "summary": null,
-    "description": "<p>Exporting an order with no delivery address throws an NPE.</p>\n\n<div class=\"code panel\" style=\"border-width: 1px;\"><div class=\"codeContent panelContent\">\n<pre class=\"code-java\">java.lang.NullPointerException: address is <span class=\"code-keyword\">null</span>\n    at com.acme.order.OrderExporter.export(OrderExporter.java:42)</pre>\n</div></div>\n\n<p>See <a href=\"https://wiki.example.com/export\" class=\"external-link\" rel=\"nofollow\">the export spec</a>.</p>",
+    "description": "<p>“Ich denke, das problem ist, dass die Token Pre-Validierung im Argus nur schaut, ob das jwt an sich gültig ist (signatur und expiration date), aber nicht, ob das token auch noch zu den aktuell gültigen tokens in der DB passt...”</p>\n\n\n\n<p>Problem war, dass ganze Log einträge generiert worden sind durch die PreAuthentication. Wie Oben beschrieben, prüft nur auf gültigkeit des JWTs, jedoch nicht ob das Token zu den aktuell tokens gehört.</p>\n\n\n\n<p><span class=\"image-wrap\" style=\"\"><img src=\"https://jira.example.com/rest/api/3/attachment/content/68533\" alt=\"image-20240513-110026.png\" height=\"640\" width=\"1536\" style=\"border: 0px solid black\" /></span></p>\n\n\n\n<p>Sollte gefixt werden…</p>",
     "status": null,
-    "customfield_10014": null,
-    "created": "10/May/24 11:02 AM",
-    "updated": "14/May/24 8:21 AM"
+    "created": "13/Mai/24 12:57 PM",
+    "updated": "16/Jul/24 7:29 AM"
   }
 }

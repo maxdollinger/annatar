@@ -1,37 +1,39 @@
 {
-  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
-  "id": "20412",
-  "self": "https://jira.example.com/rest/api/2/issue/20412",
-  "key": "GRLD-412",
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_12000.requestTypePractice",
+  "id": "13839",
+  "self": "https://jira.example.com/rest/api/2/issue/13839",
+  "key": "GRLD-1500",
   "fields": {
     "issuetype": {
-      "self": "https://jira.example.com/rest/api/2/issuetype/10002",
-      "id": "10002",
-      "description": "A task that needs to be done.",
-      "iconUrl": "https://jira.example.com/images/icons/issuetypes/task.svg",
-      "name": "Task",
+      "self": "https://jira.example.com/rest/api/2/issuetype/6",
+      "id": "6",
+      "description": "Eine Funktionalität oder Funktion, ausgedrückt als Benutzerziel.",
+      "iconUrl": "https://jira.example.com/rest/api/2/universal_avatar/view/type/issuetype/avatar/16500?size=medium",
+      "name": "Story",
       "subtask": false,
       "hierarchyLevel": 0
     },
-    "summary": "Bump Spring Boot to 3.2.5",
+    "summary": "Branch für FU-Test (Features deaktiviert) aktualisieren/neu anlegen",
     "description": null,
     "status": {
-      "self": "https://jira.example.com/rest/api/2/status/10002",
-      "name": "Done",
-      "id": "10002",
-      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+      "self": "https://jira.example.com/rest/api/2/status/6",
+      "name": "Geschlossen",
+      "id": "6",
+      "statusCategory": {
+        "id": 3,
+        "key": "done",
+        "name": "Fertig"
+      }
     },
-    "customfield_10014": null,
-    "created": "2024-07-08T13:20:00.000+0200",
-    "updated": "2024-07-08T14:02:00.000+0200"
+    "created": "2012-02-02T13:03:26.301+0100",
+    "updated": "2012-06-20T15:38:50.506+0200"
   },
   "renderedFields": {
     "issuetype": null,
     "summary": null,
-    "description": null,
+    "description": "",
     "status": null,
-    "customfield_10014": null,
-    "created": "08/Jul/24 1:20 PM",
-    "updated": "08/Jul/24 2:02 PM"
+    "created": "02/Feb/12 1:03 PM",
+    "updated": "20/Jun/12 3:38 PM"
   }
 }
