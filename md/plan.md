@@ -22,7 +22,7 @@ Everything that doesn't help answer these three questions is in **Later**, at th
   - `index.db` is rebuilt from scratch on every run. It's written to a temporary file and atomically renamed into place, so a running MCP server never sees a half-built index.
   - `cache.db` persists and holds only expensive results, keyed by content: tickets by ticket key (fetched once, never refreshed, since done tickets don't change), LLM outputs by a hash of model + prompt text + input, and embeddings by a hash of model + text. A changed prompt, model or input simply misses the cache, so no versioning or invalidation logic is needed. If a cache table's schema changes, drop that table.
 - **Symbols are identified by fully qualified name (fqn)** everywhere outside a single run: in caches, the golden set and the MCP tools. Row IDs change on every rebuild.
-- `--path <prefix>` limits a run to part of the repo, for fast iteration on prompts.
+- `--path <prefix>` limits a run to part of the repo, for fast iteration on prompts. The run still replaces the whole `index.db`, which then holds only that prefix (one warning says so; `state.md` D-ab).
 
 ---
 
@@ -95,6 +95,7 @@ Use `reqwest` with the target's auth. Request `expand=renderedFields` and strip 
 **3.2 Ticket cache**
 *Goal:* every distinct key in `symbol_tickets` is in `cache.db`, either with content or marked unavailable.
 Fetch only missing keys. Record 403/404 as unavailable; back off on 429.
+Runs as a stage of the index build (after history, on the build's transaction, before the single commit; audit R9), so it reads the keys from the in-progress `symbol_tickets`.
 *Done when:* a second run makes no Jira calls.
 
 ## Phase 4 — LLM summaries
