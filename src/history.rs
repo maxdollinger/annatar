@@ -1,8 +1,9 @@
 //! Commits that touched a line range.
 //!
-//! [`history_for_span`] shells out to `git log -L <start>,<end>:<file>` and
-//! parses only the format records, ignoring the diff hunks git prints after
-//! each commit. The format separates fields with `%x1f`, records with `%x1e`,
+//! [`history_for_span`] shells out to `git log -s -L <start>,<end>:<file>` and
+//! parses only the format records. `-s` suppresses the diff hunks; a git that
+//! ignores it with `-L` still prints them after each record, and the parser
+//! drops them. The format separates fields with `%x1f`, records with `%x1e`,
 //! and terminates each record with `%x1d`; those control characters do not
 //! occur in ordinary commit text, so a subject or body can never split a
 //! record.
@@ -41,6 +42,10 @@ const RECORD_END: char = '\u{1d}';
 /// Git format: record start, sha, author date, subject, body, record end.
 /// The trailing `%x1d` lets the parser drop the diff hunk that follows.
 const GIT_FORMAT: &str = "%x1e%H%x1f%aI%x1f%s%x1f%b%x1d";
+
+/// `git log` flags that make its output independent of the user's config:
+/// no colour codes, no external diff driver, no signature verification text.
+const LOG_FLAGS: [&str; 3] = ["--no-color", "--no-ext-diff", "--no-show-signature"];
 
 /// One commit that changed a line span.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +90,7 @@ pub fn file_last_commit(repo: &Path, file: &Path) -> Result<Option<String>> {
         .arg("-C")
         .arg(repo)
         .arg("log")
+        .args(LOG_FLAGS)
         .arg("-1")
         .arg("--format=%H")
         .arg("--")
@@ -129,6 +135,8 @@ pub fn dirty_files(repo: &Path) -> Result<HashSet<PathBuf>> {
             "-z",
             "--relative",
             "--no-renames",
+            "--no-color",
+            "--no-ext-diff",
         ])
         .output()
         .with_context(|| format!("running git diff HEAD in {}", repo.display()))?;
@@ -259,6 +267,8 @@ pub fn history_for_span(
         .arg("-C")
         .arg(repo)
         .arg("log")
+        .args(LOG_FLAGS)
+        .arg("-s")
         .arg("-L")
         .arg(&range)
         .arg(format!("--format={GIT_FORMAT}"))
@@ -338,6 +348,32 @@ mod tests {
         write(repo.path(), "1\n");
         commit(repo.path(), "initial", "2024-01-01T00:00:00+00:00");
 
+        assert!(dirty_files(repo.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_does_not_depend_on_the_users_git_config() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "a\nb\n");
+        commit(repo.path(), "add", "2024-01-01T00:00:00+00:00");
+        write(repo.path(), "a\nB\n");
+        let head = commit(repo.path(), "change", "2024-01-02T00:00:00+00:00");
+        for (key, value) in [
+            ("color.ui", "always"),
+            ("log.showSignature", "true"),
+            ("diff.external", "false"),
+        ] {
+            git_ok(repo.path(), &["config", key, value]);
+        }
+
+        let commits = history_for_span(repo.path(), Path::new("f.txt"), 1, 2).unwrap();
+
+        assert_eq!(subjects(&commits), ["change", "add"]);
+        assert_eq!(
+            file_last_commit(repo.path(), Path::new("f.txt")).unwrap(),
+            Some(head)
+        );
         assert!(dirty_files(repo.path()).unwrap().is_empty());
     }
 
