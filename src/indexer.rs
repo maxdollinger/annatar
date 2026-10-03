@@ -26,7 +26,7 @@ use crate::symbols::{JavaParser, Symbol};
 use crate::walk;
 
 /// A summary of one index run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexStats {
     /// Files that produced at least one symbol.
     pub files: usize,
@@ -38,8 +38,12 @@ pub struct IndexStats {
     pub tickets: usize,
     /// Symbols whose history came from `history_cache` without a git call.
     pub history_hits: usize,
-    /// Symbols whose history needed a `git log -L` (cache miss or no cache).
+    /// Symbols whose history needed a `git log -L` (no usable cache row).
     pub history_misses: usize,
+    /// Symbols in a git repository indexed without history: their file has no
+    /// commit (untracked) or its lookup failed. On a git repository,
+    /// `history_hits + history_misses + history_skipped == symbols`.
+    pub history_skipped: usize,
     /// Files that parsed cleanly but produced no symbols (`package-info.java`).
     pub empty: usize,
     /// Files tree-sitter could not parse, or for which it produced no tree.
@@ -62,9 +66,10 @@ pub struct IndexStats {
 /// the symbol rows.
 ///
 /// When `repo` is not a git work tree the run degrades to a structure-only
-/// index: one warning, no history tables, no error. When it is a repo, a
-/// per-symbol history lookup that fails (an untracked file, say) warns with the
-/// file and is skipped, so one bad file cannot abort the whole index.
+/// index: one warning, no history tables, no error. When it is a repo, a file
+/// with no commit (untracked) or whose last-commit lookup fails gets one
+/// warning naming it and is indexed without history; a cache fault is treated
+/// as a miss. Neither can abort the whole index.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
@@ -86,17 +91,7 @@ pub async fn build_index(
     let files = walk::java_files(repo, path_prefix)?;
     let build = store.begin_index().await?;
     let cache = HistoryCache::new(store.cache());
-    let mut stats = IndexStats {
-        files: 0,
-        symbols: 0,
-        commits: 0,
-        tickets: 0,
-        history_hits: 0,
-        history_misses: 0,
-        empty: 0,
-        parse_errors: 0,
-        unreadable: 0,
-    };
+    let mut stats = IndexStats::default();
     let mut parser = JavaParser::new()?;
     let mut ids: HashMap<String, i64> = HashMap::new();
 
@@ -131,12 +126,19 @@ pub async fn build_index(
         }
         stats.files += 1;
 
-        // One `git log -1` per file keys the whole file's cache entries. An
-        // untracked file yields `None`, so its symbols keep the old
-        // warn-and-continue path and are never cached.
+        // One `git log -1` per file keys the whole file's cache entries. A file
+        // no commit touches has no history to look up, so it is skipped once
+        // here rather than failing one `git log -L` per symbol.
         let file_last_commit = if is_repo {
             match history::file_last_commit(repo, relative) {
-                Ok(sha) => sha,
+                Ok(Some(sha)) => Some(sha),
+                Ok(None) => {
+                    tracing::warn!(
+                        path = %relative.display(),
+                        "no commit touches this file; indexing it without history"
+                    );
+                    None
+                }
                 Err(err) => {
                     tracing::warn!(
                         path = %relative.display(),
@@ -163,59 +165,27 @@ pub async fn build_index(
                 continue;
             }
             let Some(last_commit) = file_last_commit.as_deref() else {
-                match history::history_for_span(repo, relative, symbol.start_line, symbol.end_line)
-                {
-                    Ok(commits) => {
-                        attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats)
-                            .await?;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %relative.display(),
-                            error = %err,
-                            "skipping history for symbol"
-                        );
-                    }
-                }
+                stats.history_skipped += 1;
                 continue;
             };
-            match cache.get(&symbol.fqn, &content_hash, last_commit).await? {
-                Some(commits) => {
-                    stats.history_hits += 1;
-                    attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats)
-                        .await?;
-                }
-                None => {
-                    stats.history_misses += 1;
-                    match history::history_for_span(
-                        repo,
-                        relative,
-                        symbol.start_line,
-                        symbol.end_line,
-                    ) {
-                        Ok(commits) => {
-                            cache
-                                .put(&symbol.fqn, &content_hash, last_commit, &commits)
-                                .await?;
-                            attach_history(
-                                &transaction,
-                                symbol_id,
-                                &commits,
-                                ticket_regex,
-                                &mut stats,
-                            )
-                            .await?;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                path = %relative.display(),
-                                error = %err,
-                                "skipping history for symbol"
-                            );
-                        }
+            let commits =
+                match symbol_history(&cache, repo, relative, symbol, &content_hash, last_commit)
+                    .await
+                {
+                    HistoryOutcome::Hit(commits) => {
+                        stats.history_hits += 1;
+                        commits
                     }
-                }
-            }
+                    HistoryOutcome::Miss(commits) => {
+                        stats.history_misses += 1;
+                        commits
+                    }
+                    HistoryOutcome::Failed => {
+                        stats.history_skipped += 1;
+                        continue;
+                    }
+                };
+            attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats).await?;
         }
     }
 
@@ -231,12 +201,73 @@ pub async fn build_index(
         tickets = stats.tickets,
         history_hits = stats.history_hits,
         history_misses = stats.history_misses,
+        history_skipped = stats.history_skipped,
         empty = stats.empty,
         parse_errors = stats.parse_errors,
         unreadable = stats.unreadable,
         "indexed repository"
     );
     Ok(stats)
+}
+
+/// Where one symbol's history came from.
+enum HistoryOutcome {
+    /// Reused from `history_cache` without a git call.
+    Hit(Vec<Commit>),
+    /// Recomputed with `git log -L`: no row, an outdated row or an unreadable one.
+    Miss(Vec<Commit>),
+    /// `git log -L` failed; the symbol is indexed without history.
+    Failed,
+}
+
+/// The commits for one symbol: from the cache when its key still matches,
+/// otherwise from `git log -L`, which then refills the cache.
+///
+/// The cache is disposable, so a read or decode fault is a miss and a failed
+/// write only loses the reuse; both warn and never abort the run. A failed
+/// `git log -L` warns and yields [`HistoryOutcome::Failed`].
+async fn symbol_history(
+    cache: &HistoryCache<'_>,
+    repo: &Path,
+    file: &Path,
+    symbol: &Symbol,
+    content_hash: &str,
+    last_commit: &str,
+) -> HistoryOutcome {
+    match cache.get(&symbol.fqn, content_hash, last_commit).await {
+        Ok(Some(commits)) => return HistoryOutcome::Hit(commits),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                fqn = %symbol.fqn,
+                error = format!("{err:#}"),
+                "unreadable history cache row; treating it as a miss"
+            );
+        }
+    }
+    let commits = match history::history_for_span(repo, file, symbol.start_line, symbol.end_line) {
+        Ok(commits) => commits,
+        Err(err) => {
+            tracing::warn!(
+                path = %file.display(),
+                fqn = %symbol.fqn,
+                error = %err,
+                "skipping history for symbol"
+            );
+            return HistoryOutcome::Failed;
+        }
+    };
+    if let Err(err) = cache
+        .put(&symbol.fqn, content_hash, last_commit, &commits)
+        .await
+    {
+        tracing::warn!(
+            fqn = %symbol.fqn,
+            error = format!("{err:#}"),
+            "could not write history cache row"
+        );
+    }
+    HistoryOutcome::Miss(commits)
 }
 
 /// Write one symbol, returning its new row id, or `None` on a duplicate fqn.
@@ -653,20 +684,7 @@ public class UserService {
         let data = tempfile::tempdir().unwrap();
 
         let stats = build(repo.path(), data.path()).await.unwrap();
-        assert_eq!(
-            stats,
-            IndexStats {
-                files: 0,
-                symbols: 0,
-                commits: 0,
-                tickets: 0,
-                history_hits: 0,
-                history_misses: 0,
-                empty: 0,
-                parse_errors: 0,
-                unreadable: 0,
-            }
-        );
+        assert_eq!(stats, IndexStats::default());
 
         let reader = IndexReader::open(data.path()).await.unwrap();
         let conn = reader.connection();
@@ -1036,6 +1054,104 @@ public class UserService {
             ticket_rows(data.path()).await,
             tickets_before,
             "a cached run stores the same ticket rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_file_is_skipped_once_and_counted() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &java_class("Service", 1),
+        );
+        commit(
+            repo.path(),
+            "GRLD-1 add service",
+            "2024-01-01T00:00:00+01:00",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Draft.java",
+            &java_class("Draft", 1),
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = index_git_repo(repo.path(), data.path()).await;
+
+        assert_eq!(stats.symbols, 4, "the untracked file is still indexed");
+        assert_eq!(
+            stats.history_misses, 2,
+            "only the committed file is looked up"
+        );
+        assert_eq!(stats.history_skipped, 2, "the untracked file's symbols");
+        assert_eq!(
+            stats.history_hits + stats.history_misses + stats.history_skipped,
+            stats.symbols,
+            "every symbol lands in exactly one history bucket"
+        );
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(
+            row_count(conn, "symbol_commits", id_of(conn, "com.acme.Draft").await).await,
+            0
+        );
+        assert_eq!(
+            row_count(
+                conn,
+                "symbol_commits",
+                id_of(conn, "com.acme.Service").await
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            cache_count(data.path(), "history_cache").await,
+            2,
+            "an untracked file is never cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_row_is_a_miss_and_is_rewritten() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        commit(
+            repo.path(),
+            "GRLD-1 add service",
+            "2024-01-01T00:00:00+01:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+        index_git_repo(repo.path(), data.path()).await;
+        let commits_before = commit_rows(data.path()).await;
+        {
+            let store = Store::open(data.path()).await.unwrap();
+            store
+                .cache()
+                .execute("UPDATE history_cache SET commits = '{'", ())
+                .await
+                .unwrap();
+        }
+
+        let corrupt = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            (corrupt.history_hits, corrupt.history_misses),
+            (0, 2),
+            "an undecodable row is a miss, not an error"
+        );
+        assert_eq!(
+            commit_rows(data.path()).await,
+            commits_before,
+            "history is recomputed and attached"
+        );
+
+        let healed = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            (healed.history_hits, healed.history_misses),
+            (2, 0),
+            "the miss rewrote the row with valid JSON"
         );
     }
 

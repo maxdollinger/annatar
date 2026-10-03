@@ -11,11 +11,29 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
-| Step | R5 Shared test helpers; exact benchmark assertions — **done** |
+| Step | R1 `symbol_history` helper; skip untracked files once; degrade cache faults — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R1 `symbol_history` helper; skip untracked files once; degrade cache
+  faults.** The cache get → `git log -L` → cache put sequence, copied twice in
+  `build_index`, is now one `symbol_history` function returning a
+  `HistoryOutcome` (`Hit` / `Miss` / `Failed`), which removes two nesting
+  levels from the loop. A file no commit touches (or whose `git log -1` fails)
+  now gets **one** warning naming the file and no `git log -L` at all; before,
+  every symbol in it spawned a doomed `-L` and warned (a 40-method class: 41
+  spawns, 41 warnings). Cache faults degrade instead of aborting the run: an
+  unreadable or undecodable `history_cache` row warns and counts as a miss
+  (and is rewritten), a failed cache write warns and keeps the commits.
+  `IndexStats` derives `Default` and gained `history_skipped`, so on a git
+  repo `hits + misses + skipped == symbols`; `index` prints it.
+  `history_misses` is documented as "no usable cache row". Verified with the
+  CLI on a scratch repo with one untracked 4-symbol file: one warning,
+  `4 history skipped`. Findings 1, 2, 4, 11, 13, 26; D-l now matches the code.
+  Decision D-q. 2 new tests; 71 lib + 1 integration tests green, benchmark
+  green (asserts `history_skipped == 0`).
 
 - **R5 Shared test helpers; exact benchmark assertions.** The four copies of
   the scratch-git helpers (`history`, `indexer`, `show`, `tests/benchmark.rs`)
@@ -286,11 +304,10 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2 audit remediation **R1**: extract a `symbol_history` helper in the
-  indexer — skip a file with no history once (one warning), degrade cache
-  faults to a miss, add `IndexStats.history_skipped` so
-  `hits + misses + skipped == symbols`. Then R2, R3, R4, R6, R7 per
-  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
+- Phase 2 audit remediation **R2**: detect dirty files once per run
+  (`git status --porcelain`), compute their history but never read or write
+  the cache for them, one summary warning; closes open #14. Then R3, R4, R6,
+  R7 per [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
 
 ## Step log
 
@@ -318,6 +335,7 @@ the decisions taken, and the tradeoffs behind them.
 | 2.3 Measure | done | `history_cache` in `cache.db` keyed by fqn + content hash + file last-commit sha; `HistoryCache`, `file_last_commit`; `IndexStats.history_hits/misses`; synthetic `tests/benchmark.rs` (`#[ignore]`): cold 9.75 s → warm 1.23 s (~8×), 10 %-edit 1.74 s; decisions D-o, D-p; 69 tests |
 | R0 State repair + Phase 2 deviations | done | phase 2 audit + remediation plan added; formatter damage in `state.md` discarded; Phase 2 marked complete with deviations; `plan.md` 2.2/2.3 deviation notes; docs only, 69 tests |
 | R5 Shared test helpers | done | one `src/test_support.rs` shared by lib tests and `tests/benchmark.rs` (`#[path]`); exact hit/miss benchmark assertions, no timing assertion; debug-build note; resolves open #16 / D-n; decision D-s; 69 tests |
+| R1 `symbol_history` helper | done | one cache → git → cache path; untracked file: one warning, no `-L`; cache read/decode/write faults warn and degrade; `IndexStats: Default` + `history_skipped`; 2 tests (untracked + corrupt row); decision D-q; 71 tests |
 
 ## Decisions and tradeoffs
 
@@ -377,12 +395,13 @@ the decisions taken, and the tradeoffs behind them.
 | D-h (H9) | Prune skip-dirs only outside source roots (no ancestor named `java`) | Prune by name anywhere (current); add `index.skip_dirs` config | Fixes the false negative with a one-function change; a config escape hatch is deferred to avoid cross-module scope creep |
 | D-i (H8) | Correct decision 41's wording and track deep-nesting overflow as an open question | Rewrite `show` to an explicit stack now | Doc/behaviour drift is the actual finding; `show`'s plain recursion is fine at POC scale, and reworking rendering for a pathological input is unwarranted until a real index needs it |
 | D-k (2.1) | `history_for_span` shells out to `git log -L` and parses a control-char-delimited `--format` (`%x1e`…`%x1d`), returning `Commit { sha, date (ISO `%aI`), subject, body }` newest first | A pure-Rust git implementation; `git blame` + `git show`; diff parsing | `-L` already tracks a line range backwards through history (including renames), which is exactly the per-symbol history 2.2 needs. Control chars can't appear in commit text, so diff hunks after the format record are dropped safely. Newest-first preserves git's order so 2.2 can take the last element as "introduced". A non-zero git exit is surfaced as an error rather than an empty history, so a misconfigured repo fails loudly |
-| D-l (2.2) | The indexer degrades to a structure-only index when `repo` is not a git work tree (one warning), and skips a symbol whose history lookup fails (one warning naming the file); `history_for_span` itself still errors | Fail the whole run on a non-git repo or on any single file's history failure; or require git and initialize git in every unit-test fixture | Keeps the 57 existing non-git temp-dir tests meaningful without a test-wide git rewrite, and matches the product: structure is still useful without history. A single untracked file must not sink a whole index. The strict contract stays on the leaf function so a caller that truly needs history still gets an error |
+| D-l (2.2) | The indexer degrades to a structure-only index when `repo` is not a git work tree (one warning), and indexes a file with no commit, or whose last-commit lookup fails, without history (one warning naming the file, symbols counted in `history_skipped`; R1); `history_for_span` itself still errors | Fail the whole run on a non-git repo or on any single file's history failure; or require git and initialize git in every unit-test fixture | Keeps the 57 existing non-git temp-dir tests meaningful without a test-wide git rewrite, and matches the product: structure is still useful without history. A single untracked file must not sink a whole index. The strict contract stays on the leaf function so a caller that truly needs history still gets an error |
 | D-m (2.2) | Ticket `first_date`/`last_date` are derived from git's newest-first commit order (first sighting = most recent, later sightings move the first date back), never by comparing ISO strings | Parse dates / compare `%aI` strings lexicographically | `%aI` carries a timezone offset, so lexicographic comparison is wrong across offsets (e.g. `+01:00` vs `-05:00`); git's ordering is already correct and needs no date library. `symbol_commits`/`symbol_tickets` are `UNIQUE` per symbol so `INSERT OR IGNORE` is idempotent |
 | D-n (2.2 decision, resolved by R5) | The git test helpers (`git`/`git_ok`/`init_repo`/`commit`) are currently duplicated in `history`, `indexer` and `show` test modules; consolidating into a `#[cfg(test)]` support module is queued, not done here | Extract now | Keeps step 2.2 scoped (AGENTS: one step = one small PR, no unrelated refactors). Recorded as open question #16 so the hygiene pass does not lose it |
 | D-o (2.3) | `history_cache` in `cache.db`, keyed by fqn + content hash + the file's last commit sha, storing commits as JSON; one row per fqn (upsert on miss); per-file `git log -1` supplies the sha | Key by fqn + content hash only (zero git on a warm run, but blind to history rewrites); key by fqn + span only; bounded parallelism for the cold run | Follows the plan's stated key. The content hash alone would be faster, but the file's last commit sha is what catches a rewrite/revert that leaves the bytes identical (proved by a test). One `git log -1` (~22 ms on the 98k-commit repo) is ~4× cheaper than `-L` and is paid once per file, not per symbol. Parallelism would help only the one-time cold run and is a larger refactor; deferred (open #17) |
 | D-p (2.3) | The measurement target is a **synthetic benchmark repo** (`tests/benchmark.rs`, `#[ignore]`), not a specific real product repo | Measure against `grld-spring-auth` (single-module) or `grld-core` (multi-module, 98k commits) | Product-owner choice: a controlled repo makes the numbers reproducible and independent of a checkout, and avoids the multi-module test-pruning gap (open #13) confounding the measurement. A real-repo end-to-end validation is deferred to Phase 6 (agent trial) or earlier if wanted. Recon numbers on real repos are recorded in the Done entry as context |
 | D-s (R5) | One scratch-git helper file, `src/test_support.rs`: a `#[cfg(test)]` module for the lib, included by integration tests via `#[path = "../src/test_support.rs"]` | A second copy in `tests/common/mod.rs`; a `test-support` cargo feature exposing the helpers publicly | `#[path]` gives a single source without widening the public API or adding a feature. The constraint is that the file may depend on `std` only (no `crate::` paths), which the helpers already satisfy |
+| D-q (R1) | Cache faults degrade: an unreadable/undecodable `history_cache` row is a miss (and is rewritten), a failed write warns and keeps the commits. A file with no commit is skipped once with one warning, counted in `history_skipped` | Propagate cache errors (previous behaviour); count skipped symbols as misses | The cache is disposable by the ground rules, so it must never sink an index — the same degrade-don't-abort policy D-l chose for git. A separate `history_skipped` bucket keeps `history_misses` meaning "paid for a `git log -L`", which is what the benchmark and cold-run estimates need |
 
 ## Open questions
 

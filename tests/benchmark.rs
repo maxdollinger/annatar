@@ -161,6 +161,9 @@ async fn synthetic_index_benchmark() {
 
     let symbols = FILES * (METHODS + 1);
     assert_eq!(cold.symbols, symbols, "every generated symbol is indexed");
+    for stats in [cold, warm, changed] {
+        assert_eq!(stats.history_skipped, 0, "every file is committed");
+    }
     assert_eq!(
         (cold.history_hits, cold.history_misses),
         (0, symbols),
