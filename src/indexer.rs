@@ -97,7 +97,6 @@ pub async fn build_index(
         HashSet::new()
     };
     let build = store.begin_index().await?;
-    let cache = HistoryCache::new(store.cache());
     let mut stats = IndexStats::default();
     let mut parser = JavaParser::new()?;
     let mut ids: HashMap<String, i64> = HashMap::new();
@@ -160,6 +159,25 @@ pub async fn build_index(
         };
 
         let cacheable = !dirty.contains(relative);
+        // A file's cache writes share one transaction on the cache connection,
+        // so a cold run commits once per file rather than once per symbol. It
+        // stays separate from the index transaction, so an aborted index never
+        // rolls back history that was already computed.
+        let cache_transaction = if file_last_commit.is_some() && cacheable {
+            match store.cache().transaction().await {
+                Ok(cache_transaction) => Some(cache_transaction),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "cannot batch history cache writes; writing them one by one"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cache = HistoryCache::new(cache_transaction.as_deref().unwrap_or(store.cache()));
         for symbol in &parsed.symbols {
             let content_hash = content_hash(symbol, &source)
                 .with_context(|| format!("hashing symbol {}", symbol.fqn))?;
@@ -201,6 +219,15 @@ pub async fn build_index(
                 }
             };
             attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats).await?;
+        }
+        if let Some(cache_transaction) = cache_transaction
+            && let Err(err) = cache_transaction.commit().await
+        {
+            tracing::warn!(
+                path = %relative.display(),
+                error = %err,
+                "could not commit history cache writes"
+            );
         }
     }
 

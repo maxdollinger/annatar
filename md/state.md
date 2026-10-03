@@ -11,11 +11,26 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
-| Step | R3 Javadoc-inclusive history span — **done** |
+| Step | R4 Deterministic, cheaper git output; batched cache writes — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R4 Deterministic, cheaper git output; batched cache writes.** Every
+  production `git log` now passes `--no-color --no-ext-diff
+  --no-show-signature` (`history::LOG_FLAGS`), and `git log -L` adds `-s`, so
+  git no longer prints (and the parser no longer reads and discards) the diff
+  hunks; `git diff HEAD` in `dirty_files` gets `--no-color --no-ext-diff`. The
+  parser still tolerates hunks, for gits that ignore `-s` with `-L`. A file's
+  history-cache writes now share one transaction on the cache connection (one
+  commit per file instead of one autocommit per symbol), still separate from
+  the index transaction (D-o); failing to begin or commit it only warns.
+  Benchmark (linux, debug, 3 runs each): cold **~2.78 s** vs ~3.55 s before
+  R4 (≈22 % faster); warm/changed unchanged (~0.4 s / ~0.6 s). Findings 6, 7,
+  15. 1 new test (output unchanged with `color.ui=always`,
+  `log.showSignature=true`, `diff.external=false` in the repo config — a
+  regression guard); 78 lib + 1 integration tests green, benchmark green.
 
 - **R3 Javadoc-inclusive history span.** Decision J0 taken as recommended: a
   commit that only edits a symbol's Javadoc is part of its history (the
@@ -334,9 +349,10 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2 audit remediation **R4**: deterministic, cheaper git output
-  (`-s --no-color --no-ext-diff --no-show-signature`), batched cache writes in
-  one cache transaction per file, re-measure the benchmark. Then R6, R7 per
+- Phase 2 audit remediation **R6**: `TicketSpan` struct instead of the
+  `(String, String, String)` tuple (removes the production `expect`), the
+  compiled ticket regex kept on `Config`, and `--path` starting the walk at
+  `repo/prefix`. Then R7 (doc drift) per
   [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
 
 ## Step log
@@ -368,6 +384,7 @@ the decisions taken, and the tradeoffs behind them.
 | R1 `symbol_history` helper | done | one cache → git → cache path; untracked file: one warning, no `-L`; cache read/decode/write faults warn and degrade; `IndexStats: Default` + `history_skipped`; 2 tests (untracked + corrupt row); decision D-q; 71 tests |
 | R2 Dirty working tree | done | `history::dirty_files` (`git diff HEAD --name-only --relative`), once per run; dirty files get history but bypass the cache; one summary warning; closes open #14; decision D-r; 3 tests; 74 tests |
 | R3 Javadoc-inclusive history span | done | `Symbol.history_start_line` (Javadoc start or `start_line`) feeds `-L`; `history_cache` → `history_cache_v2`, old table dropped; 3 tests; decision D-t (J0); 77 tests |
+| R4 Deterministic git, batched cache writes | done | `LOG_FLAGS` (`--no-color --no-ext-diff --no-show-signature`) + `-s` on `-L`; one cache transaction per file; cold ~2.78 s vs ~3.55 s (debug); 1 config-independence test; 78 tests |
 
 ## Decisions and tradeoffs
 
@@ -436,6 +453,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-q (R1) | Cache faults degrade: an unreadable/undecodable `history_cache` row is a miss (and is rewritten), a failed write warns and keeps the commits. A file with no commit is skipped once with one warning, counted in `history_skipped` | Propagate cache errors (previous behaviour); count skipped symbols as misses | The cache is disposable by the ground rules, so it must never sink an index — the same degrade-don't-abort policy D-l chose for git. A separate `history_skipped` bucket keeps `history_misses` meaning "paid for a `git log -L`", which is what the benchmark and cold-run estimates need |
 | D-r (R2) | Detect files with uncommitted changes once per run (`git diff HEAD --name-only -z --relative --no-renames`); give them `-L` history but never read or write the cache for them; one summary warning. A failed check treats every file as dirty | Skip history for dirty files; map working-copy lines onto `HEAD` via `git diff`; ignore it (status quo) | Skipping would blank history in exactly the `--path` dev loop; line mapping is a lot of machinery for a POC. Not caching is the minimal fix for the real harm (a wrong result persisted under `HEAD`'s sha and reused). `git diff --relative` instead of `git status --porcelain` because its paths are relative to `repo`, not the work-tree root, so a `repo` below the root still matches the walker |
 | D-t (R3, J0) | The history span starts at the Javadoc (`Symbol.history_start_line`), so a doc-only commit and its ticket belong to the symbol. `start_line` is unchanged for display. The cache table is renamed `history_cache_v2` and the old `history_cache` is dropped on open | Keep the declaration-only span and pin it with a test; bump a version column inside `history_cache` | The content hash already treats the Javadoc as part of the symbol, and doc commits often carry the "why". The key (fqn + hash + file sha) does not change when the span does, so old rows would be silently wrong: dropping the table is the ground-rule answer, and a new name makes the one-off `DROP TABLE IF EXISTS` idempotent |
+| D-u (R4) | `git log` runs with `--no-color --no-ext-diff --no-show-signature`, `-L` with `-s`; history-cache writes are batched in one cache-connection transaction per file | Enforce a minimum git version for `-s` with `-L`; one cache transaction per run | The flags make output independent of the developer's git config and stop git from producing hunks nobody reads; keeping the hunk-tolerant parser avoids a version check. Per file (not per run) bounds what a crash loses to one file's results while still removing the per-symbol fsync |
 
 ## Open questions
 
