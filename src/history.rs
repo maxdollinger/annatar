@@ -26,6 +26,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 
 /// Start of a format record (ASCII record separator).
 const RECORD_START: char = '\u{1e}';
@@ -50,6 +51,41 @@ pub struct Commit {
     /// Commit message body, without the subject and without git's trailing
     /// newline (`%b`).
     pub body: String,
+}
+
+/// Whether `repo` is (inside) a git work tree, checked once per index run so
+/// the caller can degrade to a structure-only index instead of failing.
+///
+/// Any failure to run `git` at all (not installed, not a repo) is reported as
+/// `false`, never as an error: the caller only uses this to decide whether to
+/// look for history, and a missing `git` is itself a reason not to.
+pub fn is_repository(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// The distinct ticket keys `regex` finds in `text`, in first-seen order.
+///
+/// Zero-width matches are ignored: an empty pattern (an empty `ticket_regex`
+/// in config) matches at every position with width zero, and yielding empty
+/// keys would pollute `symbol_tickets`. Duplicates are dropped so one text
+/// yields each key once.
+pub fn ticket_keys(regex: &Regex, text: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for matched in regex.find_iter(text) {
+        let key = matched.as_str();
+        if key.is_empty() || keys.iter().any(|seen| seen == key) {
+            continue;
+        }
+        keys.push(key.to_string());
+    }
+    keys
 }
 
 /// The commits that touched `file`'s inclusive, 1-based line range
@@ -299,6 +335,46 @@ mod tests {
         assert!(
             history_for_span(repo, Path::new("f.txt"), 99, 99).is_err(),
             "a range past the end of the file should fail"
+        );
+    }
+
+    #[test]
+    fn is_repository_distinguishes_a_plain_directory_from_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !is_repository(dir.path()),
+            "a plain directory is not a git work tree"
+        );
+
+        init_repo(dir.path());
+        assert!(
+            is_repository(dir.path()),
+            "an initialized repo should be detected"
+        );
+    }
+
+    #[test]
+    fn ticket_keys_finds_distinct_keys_and_drops_duplicates() {
+        let regex = Regex::new(crate::config::DEFAULT_TICKET_REGEX).unwrap();
+
+        assert_eq!(
+            ticket_keys(&regex, "GRLD-1 add, GRLD-2 refine GRLD-1"),
+            vec!["GRLD-1".to_string(), "GRLD-2".to_string()],
+            "keys are deduplicated in first-seen order"
+        );
+        assert!(ticket_keys(&regex, "no ticket here").is_empty());
+    }
+
+    #[test]
+    fn ticket_keys_ignores_zero_width_matches() {
+        let empty = Regex::new("").unwrap();
+        assert!(
+            ticket_keys(&empty, "abc").is_empty(),
+            "an empty pattern matches everywhere with width zero and must yield no keys"
+        );
+        assert!(
+            ticket_keys(&empty, "").is_empty(),
+            "an empty pattern on empty text must also yield nothing"
         );
     }
 }

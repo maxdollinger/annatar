@@ -11,11 +11,32 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys |
-| Step | 2.1 History for a span — **done** |
+| Step | 2.2 Store history and ticket keys — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **2.2 Store history and ticket keys.** `build_index` now takes the compiled
+  `ticket_regex` and, for every symbol it writes, records the commits that
+  touched its span and the ticket keys those commits mention. New index tables
+  `symbol_commits(symbol_id, sha, date, subject)` and
+  `symbol_tickets(symbol_id, ticket_key, first_date, last_date)` (both
+  `UNIQUE` per symbol, FK to `symbols`, indexed by `symbol_id`); commit subjects
+  are kept as the fallback for when a ticket is unavailable. Keys come from the
+  configured regex on subject **and** body via a pure `history::ticket_keys`
+  (drops zero-width matches from an empty pattern, dedups). A key's `first_date`
+  / `last_date` are the oldest / newest commit that mentions it, taken from git's
+  newest-first order rather than comparing ISO strings (timezone-safe). `show`
+  lists a `- commits:` and `- tickets:` section per symbol, omitted when empty.
+  `IndexStats` gained `commits`/`tickets` counts; `main` compiles the regex and
+  prints them. **Graceful degradation:** `history::is_repository` is checked
+  once; a non-git `repo` warns once and builds a structure-only index, and a
+  per-symbol history failure (untracked file) warns and is skipped — one bad
+  file never aborts the run. `history_for_span` keeps its strict error contract.
+  Verified end to end on a scratch git repo (3 symbols, 4 commit rows, 5 ticket
+  rows; `show` lists both). 65 tests + 1 integration, green. Decisions D-l, D-m
+  (2.2).
 
 - **2.1 History for a span.** New `history` module: `history_for_span(repo,
   file, start_line, end_line) -> Result<Vec<Commit>>` shells out to
@@ -223,12 +244,12 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2.2 Store history and ticket keys: run history per symbol (types and
-  members), extract ticket keys with the configured `ticket_regex` from subject
-  and body, and persist `symbol_commits(symbol_id, sha, date, subject)` and
-  `symbol_tickets(symbol_id, ticket_key, first_date, last_date)`. `show` lists
-  both. Keyed by fqn for caches later; commit subjects kept as the fallback for
-  when a ticket is unavailable.
+- Phase 2.3 Measure: a full run on the target repo must be fast enough to
+  iterate on daily. The current pipeline shells out to `git log -L` once per
+  symbol (types *and* members), so this step first measures a real run; if it is
+  too slow, add bounded parallelism (one writer) or a `cache.db` history cache
+  keyed by fqn + content hash + the file's last commit sha. Run time goes in the
+  PR.
 
 ## Step log
 
@@ -252,6 +273,7 @@ the decisions taken, and the tradeoffs behind them.
 | H9 Narrow walker pruning of `build`/`generated` | done | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample out of source root; 1 new walker test; decision D-h, D-j; 52 tests |
 | H8 Doc drift, test smells and minor cleanups | done | decision 41 wording corrected, deep-nesting open question added; `minimal_without` asserts presence/removal; store helper inserts via `params!`; `relative_path` uses `replace('\\', "/")`; `Config::load` clones instead of `mem::take`; decision D-i; 52 tests |
 | 2.1 History for a span | done | `history::history_for_span` over `git log -L`; control-char `--format`; `Commit {sha,date,subject,body}`, newest first; `-L` follows renames, `--follow` rejected; 6 history tests; decision D-k; 57 tests |
+| 2.2 Store history and ticket keys | done | `symbol_commits` + `symbol_tickets`; per-symbol history in the build transaction; pure `history::ticket_keys`; structure-only degradation when `repo` is not a git work tree; `show` lists commits/tickets; `IndexStats.commits/tickets`; 8 new tests; decisions D-l, D-m; 65 tests |
 
 ## Decisions and tradeoffs
 
@@ -311,6 +333,9 @@ the decisions taken, and the tradeoffs behind them.
 | D-h (H9) | Prune skip-dirs only outside source roots (no ancestor named `java`) | Prune by name anywhere (current); add `index.skip_dirs` config | Fixes the false negative with a one-function change; a config escape hatch is deferred to avoid cross-module scope creep |
 | D-i (H8) | Correct decision 41's wording and track deep-nesting overflow as an open question | Rewrite `show` to an explicit stack now | Doc/behaviour drift is the actual finding; `show`'s plain recursion is fine at POC scale, and reworking rendering for a pathological input is unwarranted until a real index needs it |
 | D-k (2.1) | `history_for_span` shells out to `git log -L` and parses a control-char-delimited `--format` (`%x1e`…`%x1d`), returning `Commit { sha, date (ISO `%aI`), subject, body }` newest first | A pure-Rust git implementation; `git blame` + `git show`; diff parsing | `-L` already tracks a line range backwards through history (including renames), which is exactly the per-symbol history 2.2 needs. Control chars can't appear in commit text, so diff hunks after the format record are dropped safely. Newest-first preserves git's order so 2.2 can take the last element as "introduced". A non-zero git exit is surfaced as an error rather than an empty history, so a misconfigured repo fails loudly |
+| D-l (2.2) | The indexer degrades to a structure-only index when `repo` is not a git work tree (one warning), and skips a symbol whose history lookup fails (one warning naming the file); `history_for_span` itself still errors | Fail the whole run on a non-git repo or on any single file's history failure; or require git and initialize git in every unit-test fixture | Keeps the 57 existing non-git temp-dir tests meaningful without a test-wide git rewrite, and matches the product: structure is still useful without history. A single untracked file must not sink a whole index. The strict contract stays on the leaf function so a caller that truly needs history still gets an error |
+| D-m (2.2) | Ticket `first_date`/`last_date` are derived from git's newest-first commit order (first sighting = most recent, later sightings move the first date back), never by comparing ISO strings | Parse dates / compare `%aI` strings lexicographically | `%aI` carries a timezone offset, so lexicographic comparison is wrong across offsets (e.g. `+01:00` vs `-05:00`); git's ordering is already correct and needs no date library. `symbol_commits`/`symbol_tickets` are `UNIQUE` per symbol so `INSERT OR IGNORE` is idempotent |
+| D-n (2.2 decision, deferred) | The git test helpers (`git`/`git_ok`/`init_repo`/`commit`) are currently duplicated in `history`, `indexer` and `show` test modules; consolidating into a `#[cfg(test)]` support module is queued, not done here | Extract now | Keeps step 2.2 scoped (AGENTS: one step = one small PR, no unrelated refactors). Recorded as open question #16 so the hygiene pass does not lose it |
 
 ## Open questions
 
@@ -331,3 +356,4 @@ the decisions taken, and the tradeoffs behind them.
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | partially resolved by 2.1 — renamed files are fine (`git log -L` follows renames by default; verified). Remaining: a **dirty** working tree's stored line numbers come from the working copy, while `-L` resolves the range against committed revisions, so uncommitted edits can mis-attribute. 2.2 runs history before/while writing symbols; decide whether to warn on a dirty tree or accept it for the POC |
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
+| 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer` and `show` test modules (three copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | open, defer — queued as a small hygiene step (decision D-n); not mixed into 2.2 to keep the step scoped |

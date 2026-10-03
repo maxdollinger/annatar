@@ -31,9 +31,28 @@ pub const INDEX_TABLES: &[&str] = &[
         content_hash TEXT NOT NULL
     )",
     "CREATE INDEX symbols_parent_id ON symbols(parent_id)",
-    // 2.2 adds `symbol_commits` + `symbol_tickets`; 4.3/4.4 add the what/why
-    // columns to `symbols`; 5.1 adds `symbol_vec` (`F32_BLOB` +
-    // `libsql_vector_idx`).
+    // 2.2 `symbol_commits`.
+    "CREATE TABLE symbol_commits (
+        id INTEGER PRIMARY KEY,
+        symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+        sha TEXT NOT NULL,
+        date TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        UNIQUE(symbol_id, sha)
+    )",
+    "CREATE INDEX symbol_commits_symbol_id ON symbol_commits(symbol_id)",
+    // 2.2 `symbol_tickets`.
+    "CREATE TABLE symbol_tickets (
+        id INTEGER PRIMARY KEY,
+        symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+        ticket_key TEXT NOT NULL,
+        first_date TEXT NOT NULL,
+        last_date TEXT NOT NULL,
+        UNIQUE(symbol_id, ticket_key)
+    )",
+    "CREATE INDEX symbol_tickets_symbol_id ON symbol_tickets(symbol_id)",
+    // 4.3/4.4 add the what/why columns to `symbols`; 5.1 adds `symbol_vec`
+    // (`F32_BLOB` + `libsql_vector_idx`).
 ];
 
 /// `CREATE TABLE IF NOT EXISTS` statements for the persistent `cache.db`.

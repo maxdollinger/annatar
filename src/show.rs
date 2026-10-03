@@ -10,6 +10,22 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use libsql::{Connection, Row};
 
+/// One row of the `symbol_commits` table, as read back for display.
+struct StoredCommit {
+    symbol_id: i64,
+    sha: String,
+    date: String,
+    subject: String,
+}
+
+/// One row of the `symbol_tickets` table, as read back for display.
+struct StoredTicket {
+    symbol_id: i64,
+    ticket_key: String,
+    first_date: String,
+    last_date: String,
+}
+
 /// One row of the `symbols` table, as read back for display.
 struct StoredSymbol {
     id: i64,
@@ -48,6 +64,8 @@ impl StoredSymbol {
 /// A missing `fqn` is an error that names the symbol.
 pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
     let symbols = load_all(conn).await?;
+    let commits = load_commits(conn).await?;
+    let tickets = load_tickets(conn).await?;
     let root = symbols
         .iter()
         .find(|symbol| symbol.fqn == fqn)
@@ -64,7 +82,7 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
     }
 
     let mut out = String::new();
-    write_symbol(root, &children, 0, &mut out)?;
+    write_symbol(root, &children, &commits, &tickets, 0, &mut out)?;
     Ok(out)
 }
 
@@ -84,9 +102,54 @@ async fn load_all(conn: &Connection) -> Result<Vec<StoredSymbol>> {
     Ok(symbols)
 }
 
+async fn load_commits(conn: &Connection) -> Result<HashMap<i64, Vec<StoredCommit>>> {
+    let mut rows = conn
+        .query(
+            "SELECT symbol_id, sha, date, subject FROM symbol_commits ORDER BY id",
+            (),
+        )
+        .await
+        .context("reading symbol_commits")?;
+    let mut commits: HashMap<i64, Vec<StoredCommit>> = HashMap::new();
+    while let Some(row) = rows.next().await.context("reading symbol_commits row")? {
+        let commit = StoredCommit {
+            symbol_id: row.get(0).context("reading symbol_commits.symbol_id")?,
+            sha: row.get(1).context("reading symbol_commits.sha")?,
+            date: row.get(2).context("reading symbol_commits.date")?,
+            subject: row.get(3).context("reading symbol_commits.subject")?,
+        };
+        commits.entry(commit.symbol_id).or_default().push(commit);
+    }
+    Ok(commits)
+}
+
+async fn load_tickets(conn: &Connection) -> Result<HashMap<i64, Vec<StoredTicket>>> {
+    let mut rows = conn
+        .query(
+            "SELECT symbol_id, ticket_key, first_date, last_date
+             FROM symbol_tickets ORDER BY ticket_key",
+            (),
+        )
+        .await
+        .context("reading symbol_tickets")?;
+    let mut tickets: HashMap<i64, Vec<StoredTicket>> = HashMap::new();
+    while let Some(row) = rows.next().await.context("reading symbol_tickets row")? {
+        let ticket = StoredTicket {
+            symbol_id: row.get(0).context("reading symbol_tickets.symbol_id")?,
+            ticket_key: row.get(1).context("reading symbol_tickets.ticket_key")?,
+            first_date: row.get(2).context("reading symbol_tickets.first_date")?,
+            last_date: row.get(3).context("reading symbol_tickets.last_date")?,
+        };
+        tickets.entry(ticket.symbol_id).or_default().push(ticket);
+    }
+    Ok(tickets)
+}
+
 fn write_symbol(
     symbol: &StoredSymbol,
     children: &HashMap<i64, Vec<&StoredSymbol>>,
+    commits: &HashMap<i64, Vec<StoredCommit>>,
+    tickets: &HashMap<i64, Vec<StoredTicket>>,
     depth: usize,
     out: &mut String,
 ) -> Result<()> {
@@ -121,12 +184,37 @@ fn write_symbol(
         }
     }
 
+    if let Some(list) = commits.get(&symbol.id) {
+        out.push_str(&format!("{field}- commits:\n"));
+        for commit in list {
+            let short = short_sha(&commit.sha);
+            out.push_str(&format!(
+                "{field}  {short} {} {}\n",
+                commit.date, commit.subject
+            ));
+        }
+    }
+    if let Some(list) = tickets.get(&symbol.id) {
+        out.push_str(&format!("{field}- tickets:\n"));
+        for ticket in list {
+            out.push_str(&format!(
+                "{field}  {} (first: {}, last: {})\n",
+                ticket.ticket_key, ticket.first_date, ticket.last_date
+            ));
+        }
+    }
+
     if let Some(list) = children.get(&symbol.id) {
         for child in list {
-            write_symbol(child, children, depth + 1, out)?;
+            write_symbol(child, children, commits, tickets, depth + 1, out)?;
         }
     }
     Ok(())
+}
+
+/// The first 8 characters of a sha, enough to identify a commit in the index.
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 fn parse_annotations(raw: &str) -> Result<Vec<String>> {
@@ -136,8 +224,11 @@ fn parse_annotations(raw: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_TICKET_REGEX;
     use crate::indexer::build_index;
     use crate::store::{IndexReader, Store};
+    use regex::Regex;
+    use std::process::Command;
 
     const SOURCE: &str = "\
 package com.acme.show;
@@ -160,7 +251,10 @@ public class Widget {
         std::fs::write(&file, SOURCE).unwrap();
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
-        build_index(&store, repo.path(), None).await.unwrap();
+        let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
+        build_index(&store, repo.path(), None, &regex)
+            .await
+            .unwrap();
         (repo, data)
     }
 
@@ -232,6 +326,89 @@ com.acme.show.Widget [class]
         assert!(
             format!("{err:#}").contains("com.acme.show.Broken"),
             "error should name the fqn, got: {err:#}"
+        );
+    }
+
+    fn git(repo: &std::path::Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Annatar Test")
+            .env("GIT_AUTHOR_EMAIL", "annatar@test.invalid")
+            .env("GIT_COMMITTER_NAME", "Annatar Test")
+            .env("GIT_COMMITTER_EMAIL", "annatar@test.invalid");
+        command
+    }
+
+    fn git_ok(repo: &std::path::Path, args: &[&str]) {
+        let output = git(repo).args(args).output().expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit(repo: &std::path::Path, message: &str, date: &str) {
+        git_ok(repo, &["add", "-A"]);
+        let output = git(repo)
+            .args(["commit", "-q", "-m", message])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn render_lists_commits_and_tickets_for_a_git_backed_symbol() {
+        let repo = tempfile::tempdir().unwrap();
+        git_ok(repo.path(), &["init", "-q"]);
+        git_ok(
+            repo.path(),
+            &["config", "user.email", "annatar@test.invalid"],
+        );
+        git_ok(repo.path(), &["config", "user.name", "Annatar Test"]);
+        git_ok(repo.path(), &["config", "commit.gpgsign", "false"]);
+        let file = repo.path().join("src/main/java/com/acme/show/Widget.java");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, SOURCE).unwrap();
+        commit(
+            repo.path(),
+            "GRLD-42 build the widget",
+            "2024-01-01T00:00:00+01:00",
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).await.unwrap();
+        let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
+        build_index(&store, repo.path(), None, &regex)
+            .await
+            .unwrap();
+        drop(store);
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let output = render(reader.connection(), "com.acme.show.Widget")
+            .await
+            .unwrap();
+
+        assert!(output.contains("- commits:"), "commits section: {output}");
+        assert!(
+            output.contains("2024-01-01T00:00:00+01:00 GRLD-42 build the widget"),
+            "commit line: {output}"
+        );
+        assert!(output.contains("- tickets:"), "tickets section: {output}");
+        assert!(
+            output.contains(
+                "GRLD-42 (first: 2024-01-01T00:00:00+01:00, last: 2024-01-01T00:00:00+01:00)"
+            ),
+            "ticket line: {output}"
         );
     }
 }
