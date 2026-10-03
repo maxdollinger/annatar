@@ -17,6 +17,13 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Done
 
+- **Pre-Phase-2 review.** Verified all five steps on edge-case Java (enums,
+  interfaces with default methods, records, annotations, generics, varargs,
+  receiver parameters) and the CLI end to end. Fixes: `build_index` now errors
+  when `repo` is not a directory instead of committing an empty index; a valid
+  file with no symbols (`package-info.java`) is logged at debug, not warn (the
+  parse-error log stays). 41 tests, green.
+
 - **1.5 Write symbols and `show`.** `symbols` table (id, parent_id, kind,
   role, fqn unique, file, start/end line, signature, javadoc, annotations,
   content_hash) in `INDEX_TABLES`; `indexer::build_index` walks, parses and
@@ -102,6 +109,7 @@ the decisions taken, and the tradeoffs behind them.
 | 1.3 Methods/constructors | done | unified `Symbol`; fqn `Type#name(params)`, ctors `<init>`; 10 symbols tests (25 total) |
 | 1.4 Text + role | done | signature/javadoc/annotations/role; 17 symbols tests (32 total) |
 | 1.5 Write + show | done | `symbols` table, `indexer::build_index`, `Store::open_index`, `show::render`; 40 tests |
+| Pre-Phase-2 review | done | edge-case + CLI verification; missing-repo error; quieter empty-file log; 41 tests |
 
 ## Decisions and tradeoffs
 
@@ -149,6 +157,7 @@ the decisions taken, and the tradeoffs behind them.
 | 40 | `kind`/`role` stored as lower-case strings via `as_str()`, part of the on-disk contract | Store the Rust enum via an integer/serde tag | The index is inspected by SQL and later the MCP tools; readable stable strings are the simplest contract |
 | 41 | `show::render` loads the whole `symbols` table, builds a child map in memory, recurses with an explicit stack | One query per node / recursive CTEs | POC-scale tables make this cheap and it avoids async recursion; revisit when the index grows |
 | 42 | `IndexStats.files` counts files that produced a symbol; a genuinely empty or unparseable file counts as `skipped` | Count every walked file as `files` | Keeps `files + skipped` = walked, and treats "nothing to index" uniformly until the parser can report parse-error vs empty |
+| 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
 
 ## Open questions
 
@@ -166,3 +175,5 @@ the decisions taken, and the tradeoffs behind them.
 | 10 | `--path` is a literal prefix; should it accept globs (e.g. `src/main/java/com/acme/**`)? | 1.1 | open, defer — literal prefix matches the plan wording |
 | 11 | A valid but symbol-less file (e.g. `package-info.java`) is counted `skipped` like a parse error. Distinguish parse-error vs empty? | 1.5 | open — resolve before 2.3 reports run quality; needs `parse_file` to signal a parse failure |
 | 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |
+| 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
+| 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | open — decide handling (error, warn, or blame working tree) when 2.1 lands |
