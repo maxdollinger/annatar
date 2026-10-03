@@ -135,7 +135,7 @@ fn parse_annotations(raw: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::indexer::build_index;
-    use crate::store::Store;
+    use crate::store::{IndexReader, Store};
 
     const SOURCE: &str = "\
 package com.acme.show;
@@ -151,7 +151,7 @@ public class Widget {
 }
 ";
 
-    async fn indexed() -> (tempfile::TempDir, tempfile::TempDir, Store) {
+    async fn indexed() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = tempfile::tempdir().unwrap();
         let file = repo.path().join("src/main/java/com/acme/show/Widget.java");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -159,15 +159,17 @@ public class Widget {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         build_index(&store, repo.path(), None).await.unwrap();
-        (repo, data, store)
+        (repo, data)
     }
 
     #[tokio::test]
     async fn renders_a_symbol_and_its_children_in_source_order() {
-        let (_repo, _data, store) = indexed().await;
-        let conn = store.open_index().await.unwrap();
+        let (_repo, data) = indexed().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
 
-        let output = render(&conn, "com.acme.show.Widget").await.unwrap();
+        let output = render(reader.connection(), "com.acme.show.Widget")
+            .await
+            .unwrap();
 
         let expected = "\
 com.acme.show.Widget [class]
@@ -192,10 +194,10 @@ com.acme.show.Widget [class]
 
     #[tokio::test]
     async fn unknown_fqn_is_an_error_that_names_it() {
-        let (_repo, _data, store) = indexed().await;
-        let conn = store.open_index().await.unwrap();
+        let (_repo, data) = indexed().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
 
-        let err = render(&conn, "com.acme.show.Missing")
+        let err = render(reader.connection(), "com.acme.show.Missing")
             .await
             .expect_err("unknown fqn should fail");
         assert!(

@@ -473,3 +473,33 @@ For each item and at the end of the series:
 H7 may alternatively be the opening work of Phase 2.3 if the team prefers to
 hold all run-time work together; either is fine, but it must land before the
 2.3 measurement.
+
+## 9. Execution log
+
+Status of each item as it lands. One commit per item (Conventional Commits);
+`md/state.md` carries the detailed Done/Decisions entries.
+
+| Item | Status | Commit | Test total | Notes |
+| --- | --- | --- | --- | --- |
+| Prep | done | `c3a863c` | 41 | audit docs committed; `state.md` Next points here |
+| H1 | done | `a3156c8` | 43 | `JavaParser`/`ParsedFile`; `skipped` → `empty`/`parse_errors`/`unreadable`; open #11 resolved |
+| H2 | done | `86fd786` | 44 | `content_hash` uses `.get(range)` and returns contextual error |
+| H3 | done | `087ee6f` | 46 | `PRAGMA foreign_keys = ON` per index connection |
+| H4 | done | — | 48 | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing |
+| H5 | pending | — | — | |
+| H6 | pending | — | — | |
+| H7 | pending | — | — | |
+| H9 | pending | — | — | |
+| H8 | pending | — | — | |
+
+### Deviations from the plan
+
+- **H3.** The plan's H3 test note assumed `INSERT OR IGNORE` would silently
+  ignore a foreign-key violation and the test would assert the row count did
+  not grow. Empirically **it does not**: SQLite/`libSQL`'s `OR IGNORE` covers
+  UNIQUE/NOT NULL/CHECK conflicts, but not foreign keys, so a dangling
+  `parent_id` raises `FOREIGN KEY constraint failed` and is never stored. The
+  implemented tests assert the error (plus an unchanged row count) instead of a
+  silent ignore. The acceptance still holds — dangling parents are rejected,
+  never stored — and a future linking bug now fails loudly. This is the
+  intended consequence of enabling the constraint (decision D-c).

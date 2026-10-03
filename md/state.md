@@ -11,11 +11,23 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H3 Enforce the foreign key — **done** |
+| Step | H4 Read path has no side effects — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H4 Side-effect-free read path.** Added `store::IndexReader`
+  (`connection()` + `open(data_dir)`) that opens only `index.db` with
+  `OpenFlags::SQLITE_OPEN_READ_ONLY` and the per-connection
+  `PRAGMA foreign_keys = ON`. Opening a reader creates neither the data
+  directory nor `cache.db`; a missing index keeps the friendly "run
+  `annatar index` first" error. Removed `Store::open_index`, `Store::data_dir`
+  and `Store::cache_path`; `main`'s `show` arm now uses `IndexReader::open`, so
+  `annatar show` creates nothing. `show::render` still takes `&Connection`. Two
+  new store tests: reader-open on an absent index leaves no `data_dir`/`index.db`
+  /`cache.db`, and a read after deleting `cache.db` does not recreate it.
+  Decision D-d (H4). 48 tests, green.
 
 - **H3 Enforce the declared foreign key.** `PRAGMA foreign_keys = ON` now runs
   on the build connection in `Store::begin_index` (immediately after `connect`,
@@ -125,8 +137,8 @@ the decisions taken, and the tradeoffs behind them.
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
   items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1
-  through H3 are done; next is **H4** (read path has no side effects; honest
-  open; drop dead API).
+  through H4 are done; next is **H5** (surface decode failures instead of
+  swallowing them).
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -146,6 +158,7 @@ the decisions taken, and the tradeoffs behind them.
 | H1 Parse contract + parser reuse | done | `JavaParser`/`ParsedFile`; `IndexStats` buckets `empty`/`parse_errors`/`unreadable`; parser built once per run; resolves open #11; 43 tests |
 | H2 Bounds-safe `content_hash` | done | `.get(start..end)` + `Result`; out-of-range span errors with fqn/span context; unit test; decision D-b |
 | H3 Enforce foreign key | done | `PRAGMA foreign_keys = ON` per build/read connection; dangling `parent_id` errors and is not stored (libSQL verified); valid parent-child insert works; decision D-c |
+| H4 Side-effect-free read path | done | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing; 2 reader tests; decision D-d; 48 tests |
 
 ## Decisions and tradeoffs
 
@@ -166,7 +179,7 @@ the decisions taken, and the tradeoffs behind them.
 | 13 | libSQL via the `libsql` crate with `default-features = false, features = ["core"]` | Default features (remote, replication, sync, tls) | Only local files are needed; avoids tonic/hyper/rustls and keeps compile times down. Vector functions still live in `libsql-sys` |
 | 14 | Index temp file via `tempfile` in `data_dir`, committed with `NamedTempFile::persist` (rename) | Hand-rolled temp name + `fs::rename` | `persist` is atomic on Unix and deletes the temp file on drop, so an aborted run cleans itself up. Same directory guarantees the same filesystem |
 | 15 | Rely on libSQL local leaving a single file (default `journal_mode=delete`) | WAL for the index, checkpoint + sidecar handling | Verified empirically: closed local db leaves only `index.db`. If the index ever moves to WAL, `IndexBuild::commit` must checkpoint before rename |
-| 16 | `Store` is async; `tokio` is the runtime | Synchronous wrapper | The `libsql` API is async. `Store::open`/`begin_index`/`open_index` are async, `IndexBuild::commit` is sync (drop + rename). Tests use `#[tokio::test]` |
+| 16 | `Store`/`IndexReader` are async; `tokio` is the runtime | Synchronous wrapper | The `libsql` API is async. `Store::open`/`begin_index` and `IndexReader::open` are async, `IndexBuild::commit` is sync (drop + rename). Tests use `#[tokio::test]` |
 | 17 | `Store` owns no schema in 0.2; it exposes `cache()` and the `begin_index()` connection | Bundle table creation into 0.2 | Each phase adds its own tables (plan). Keeps this step to the file lifecycle and lets schema land with the data it stores |
 | 18 | Drop order: connection fields before their `Database`; `_cache_db` field anchors the cache connection | Rely on `Connection` alone | Explicit and safe: the connection is closed before the database handle; the anchor field is underscore-prefixed to stay intentionally unread |
 | 19 | `repo` and `data_dir` resolve relative to the config file's directory, not the cwd (`Config::load`) | Resolve against the cwd | A config file describes its own repo/data layout, so the same file works from any working directory. Absolute paths are returned unchanged |
@@ -198,6 +211,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-b (H2) | An out-of-range symbol span is a hard error carrying the fqn and span; `content_hash` returns `Result` | Clamp the span to the source length and hash the wrong bytes | A span past the end is a parser bug, so the run must fail with context, never panic or hash a truncated slice |
 | D-c (H3) | Enable `PRAGMA foreign_keys = ON` per index connection (build in `begin_index`, read in `open_index`) | Drop the `REFERENCES` clause | Keeps the schema's advertised integrity real; pre-order insert already satisfies it, so enabling is safe. SQLite/libSQL is per-connection and the pragma is a no-op inside a transaction, so it runs right after `connect`. Empirically, `INSERT OR IGNORE` does not suppress an FK violation (it errors), so a linking bug fails loudly |
 | 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
+| D-d (H4) | `IndexReader::open(data_dir)` returns a read-only reader; `Store::open_index` is removed; `show` no longer opens `Store` | Keep opening read-write and fix only the doc; or keep both open paths | The read path must not create `cache.db`/the data dir; a single read entry point becomes the contract 6.1 reuses. `_db` anchors the connection (decision 18) |
 
 ## Open questions
 
@@ -208,7 +222,7 @@ the decisions taken, and the tradeoffs behind them.
 | 3 | Should `jira` / `ollama` sections become optional per command (e.g. `show` may not need Jira)? | 0.1 | resolved — both sections are now `Option`; commands require them when wired |
 | 4 | `--path` is currently a `String`; make it a `PathBuf` once the walker lands (1.1)? | 0.1 | resolved — now `PathBuf` |
 | 5 | Should `cache.db` use WAL for concurrent reader access (MCP server)? The index stays rollback-journal so rename is single-file. | 0.2 | open, defer |
-| 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | resolved — `Store::open_index` returns a read connection; 6.1 will reopen on file replace |
+| 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | resolved — `IndexReader::open` returns a read-only reader; 6.1 will reopen on file replace |
 | 7 | Is `data_dir` resolved relative to the cwd or to the config file's directory? | 0.2 | resolved — relative to the config file's directory (also applies to `repo`) |
 | 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | resolved — one `schema` module (decision 23) |
 | 9 | Walker uses `parents(false)`: if `repo` ever points at a subdirectory of a larger checkout, `.ignore`/`.gitignore` above it are not read. Acceptable? | 1.1 | open, defer — fine while `repo` is a repo root |
