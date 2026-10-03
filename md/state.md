@@ -10,12 +10,20 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 0 — Skeleton |
-| Step | 0.2 Database files — **done** |
+| Phase | 1 — Symbols |
+| Step | 1.1 File walker — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **1.1 File walker.** `walk::java_files(repo, path_prefix)` returns the
+  production `.java` files under `repo` as repo-relative, sorted paths. Uses
+  `ignore` with standard filters (so `.gitignore` applies), prunes
+  `build`/`target`/`generated`/`generated-sources` anywhere in the tree, drops
+  `src/test`, and applies `--path` as a literal path prefix. 6 tests
+  (exact-set, gitignore, skip dirs, `src/test`, prefix forms, empty prefix);
+  15 total, green; clippy clean.
 
 - **Pre-Phase-1 rework.** Config paths (`repo`, `data_dir`) now resolve
   relative to the config file's directory, `--path` is a `PathBuf`, and the
@@ -44,8 +52,8 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- 1.1 File walker: `ignore` crate, `.gitignore`, skip `build/`/`target/`/
-  generated/`src/test/`, apply `--path`.
+- 1.2 Parse types: `tree-sitter` + `tree-sitter-java`, classes/interfaces/
+  enums/records incl. nesting, spans and parent; log and skip parse errors.
 
 ## Step log
 
@@ -53,7 +61,7 @@ the decisions taken, and the tradeoffs behind them.
 | --- | --- | --- |
 | 0.1 CLI, config, logging | done | `--help` works; 5 config tests green; realigned to refined plan (`data_dir`, no `embedding_dim`) |
 | 0.2 Database files | done | two-file `Store`, temp file + atomic rename; 4 tests |
-| 1.1 File walker | next | — |
+| 1.1 File walker | done | `walk::java_files`; `ignore` crate; 6 tests (15 total) |
 
 ## Decisions and tradeoffs
 
@@ -83,6 +91,9 @@ the decisions taken, and the tradeoffs behind them.
 | 22 | `Store::begin_index` returns an owned `IndexBuild` with `commit()`; `Store` no longer tracks the in-progress build | Return `&Connection` from `&mut Store`, then `finish_index` on `Store` | The borrow blocked holding the connection across an async pipeline while later calling finish, and mixed a sync finish with an async build. An owned guard survives the whole run and aborting is just a drop |
 | 23 | All DDL lives in one `schema` module: `INDEX_TABLES` applied by `begin_index`, `CACHE_TABLES` by `open` | Per-phase DDL scattered in each step | `index.db` is disposable, so no migrations or versioning; one file keeps the whole shape reviewable as phases 1–5 add tables. Lists are empty until 1.5 |
 | 24 | A working dummy `annatar.toml` is committed (data dir `.annatar`, gitignored) | No config in the repo | The binary's default config now loads out of the box; secrets still come only from the environment, so the file stays committable |
+| 25 | Generated sources detected by directory name (`generated`, `generated-sources`), pruned anywhere | Parse Maven/Gradle build files | Language/build-system agnostic, cheap, and testable; revisit if a repo names its tree differently |
+| 26 | `--path` is a literal path prefix (`Path::starts_with`), not a glob | Glob/pattern matching | The plan calls it a prefix; prefix semantics cover both a directory and a single file with no pattern engine |
+| 27 | Walker sets `require_git(false)` and `parents(false)` | Require a git repo / honour ancestor ignores | Temp-dir tests need no `git init` and stay deterministic; `parents(false)` also stops a parent `.gitignore` outside the repo from affecting a run |
 
 ## Open questions
 
@@ -96,3 +107,5 @@ the decisions taken, and the tradeoffs behind them.
 | 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | open |
 | 7 | Is `data_dir` resolved relative to the cwd or to the config file's directory? | 0.2 | resolved — relative to the config file's directory (also applies to `repo`) |
 | 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | resolved — one `schema` module (decision 23) |
+| 9 | Walker uses `parents(false)`: if `repo` ever points at a subdirectory of a larger checkout, `.ignore`/`.gitignore` above it are not read. Acceptable? | 1.1 | open, defer — fine while `repo` is a repo root |
+| 10 | `--path` is a literal prefix; should it accept globs (e.g. `src/main/java/com/acme/**`)? | 1.1 | open, defer — literal prefix matches the plan wording |
