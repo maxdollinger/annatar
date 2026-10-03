@@ -122,7 +122,8 @@ async fn write_symbol(
     let parent_id = symbol.parent.as_ref().and_then(|parent| ids.get(parent));
     let annotations = serde_json::to_string(&symbol.annotations)
         .context("serializing symbol annotations as JSON")?;
-    let content_hash = content_hash(symbol, source);
+    let content_hash =
+        content_hash(symbol, source).with_context(|| format!("hashing symbol {}", symbol.fqn))?;
 
     let inserted = conn
         .execute(
@@ -157,12 +158,24 @@ async fn write_symbol(
 /// A content hash over the Javadoc and the symbol's source. Including the
 /// Javadoc means a documentation-only edit changes the hash, so later
 /// summaries keyed by it are invalidated.
-fn content_hash(symbol: &Symbol, source: &str) -> String {
+fn content_hash(symbol: &Symbol, source: &str) -> Result<String> {
+    let slice = source
+        .as_bytes()
+        .get(symbol.start_byte..symbol.end_byte)
+        .with_context(|| {
+            format!(
+                "source span {}..{} is out of range for symbol {} (source length {})",
+                symbol.start_byte,
+                symbol.end_byte,
+                symbol.fqn,
+                source.len()
+            )
+        })?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(symbol.javadoc.as_deref().unwrap_or_default().as_bytes());
     hasher.update(b"\n");
-    hasher.update(&source.as_bytes()[symbol.start_byte..symbol.end_byte]);
-    hasher.finalize().to_hex().to_string()
+    hasher.update(slice);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// The repo-relative path with `/` separators, e.g.
@@ -258,6 +271,40 @@ public class UserService {
     }
 }
 "#;
+
+    fn symbol_with_span(fqn: &str, start_byte: usize, end_byte: usize) -> Symbol {
+        Symbol {
+            package: String::new(),
+            name: "Broken".to_string(),
+            fqn: fqn.to_string(),
+            kind: crate::symbols::SymbolKind::Class,
+            start_line: 1,
+            end_line: 1,
+            start_byte,
+            end_byte,
+            parent: None,
+            signature: "class Broken".to_string(),
+            javadoc: None,
+            annotations: Vec::new(),
+            role: None,
+        }
+    }
+
+    #[test]
+    fn content_hash_errors_on_out_of_range_span() {
+        let symbol = symbol_with_span("com.acme.Broken", 0, 999);
+        let err = content_hash(&symbol, "class Broken {}")
+            .expect_err("a span past the end of the source should fail, not panic");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("com.acme.Broken"),
+            "error should name the fqn, got: {message}"
+        );
+        assert!(
+            message.contains("0..999"),
+            "error should name the span, got: {message}"
+        );
+    }
 
     #[tokio::test]
     async fn indexes_symbols_with_parent_links_and_content_hashes() {
