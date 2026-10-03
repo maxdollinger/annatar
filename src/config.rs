@@ -10,6 +10,9 @@ pub const DEFAULT_TICKET_REGEX: &str = r"\bGRLD-\d+\b";
 /// Default URL of the local Ollama server.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
+/// Default number of Jira requests in flight during the ticket stage.
+pub const DEFAULT_JIRA_CONCURRENCY: usize = 4;
+
 /// Environment variable holding the Jira API token.
 pub const ENV_JIRA_TOKEN: &str = "ANNATAR_JIRA_TOKEN";
 
@@ -30,8 +33,7 @@ pub struct Config {
         deserialize_with = "deserialize_regex"
     )]
     pub ticket_regex: Regex,
-    /// Jira connection. Optional for now; a command that talks to Jira will
-    /// require it once Phase 3 lands.
+    /// Jira connection. Optional: without it `index` uses cached tickets only.
     #[serde(default)]
     pub jira: Option<JiraConfig>,
     /// Ollama connection. Optional for now; a command that calls the LLM will
@@ -57,6 +59,9 @@ pub struct JiraConfig {
     /// Server/DC), used when an issue has no `parent`. Unset = ignored.
     #[serde(default)]
     pub epic_link_field: Option<String>,
+    /// Maximum Jira requests in flight during the ticket stage; at least 1.
+    #[serde(default = "default_jira_concurrency")]
+    pub concurrency: usize,
 }
 
 impl std::fmt::Debug for JiraConfig {
@@ -66,6 +71,7 @@ impl std::fmt::Debug for JiraConfig {
             .field("token", &self.token.as_ref().map(|_| "***"))
             .field("email", &self.email)
             .field("epic_link_field", &self.epic_link_field)
+            .field("concurrency", &self.concurrency)
             .finish()
     }
 }
@@ -126,6 +132,10 @@ fn deserialize_regex<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Regex
     let pattern = String::deserialize(deserializer)?;
     Regex::new(&pattern)
         .map_err(|err| serde::de::Error::custom(format!("invalid ticket_regex {pattern:?}: {err}")))
+}
+
+fn default_jira_concurrency() -> usize {
+    DEFAULT_JIRA_CONCURRENCY
 }
 
 fn default_ollama_url() -> String {
@@ -213,7 +223,9 @@ data_dir = "data"
     #[test]
     fn epic_link_field_is_optional() {
         let config = Config::parse(MINIMAL).expect("config should parse");
-        assert_eq!(config.jira.expect("section present").epic_link_field, None);
+        let jira = config.jira.expect("section present");
+        assert_eq!(jira.epic_link_field, None);
+        assert_eq!(jira.concurrency, DEFAULT_JIRA_CONCURRENCY);
 
         let text = MINIMAL.replace(
             r#"base_url = "https://example.atlassian.net""#,

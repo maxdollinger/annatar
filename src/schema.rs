@@ -51,6 +51,18 @@ pub const INDEX_TABLES: &[&str] = &[
         UNIQUE(symbol_id, ticket_key)
     )",
     "CREATE INDEX symbol_tickets_symbol_id ON symbol_tickets(symbol_id)",
+    // 3.2 `tickets`: the readers' copy of `ticket_cache` for every key in
+    // `symbol_tickets` that the cache knows (content or unavailable), so `show`
+    // and MCP never open `cache.db`. Content columns are NULL when
+    // `unavailable = 1`.
+    "CREATE TABLE tickets (
+        key TEXT PRIMARY KEY,
+        unavailable INTEGER NOT NULL,
+        issue_type TEXT,
+        summary TEXT,
+        description TEXT,
+        parent_key TEXT
+    )",
     // 4.3/4.4 add the what/why columns to `symbols`; 5.1 adds `symbol_vec`
     // (`F32_BLOB` + `libsql_vector_idx`).
 ];
@@ -69,7 +81,21 @@ pub const CACHE_TABLES: &[&str] = &[
         file_last_commit TEXT NOT NULL,
         commits TEXT NOT NULL
     )",
-    // 3.2 `tickets`; 4.1 LLM cache and embedding cache.
+    // 3.2 `ticket_cache`: one row per *requested* ticket key (Jira may answer
+    // a moved issue with its new key). `unavailable = 1` (with the HTTP
+    // `status`) for a 403/404, content columns otherwise. `fetched_at` is UTC;
+    // rows never expire, dropping the table refreshes them.
+    "CREATE TABLE IF NOT EXISTS ticket_cache (
+        key TEXT PRIMARY KEY,
+        unavailable INTEGER NOT NULL,
+        status INTEGER,
+        issue_type TEXT,
+        summary TEXT,
+        description TEXT,
+        parent_key TEXT,
+        fetched_at TEXT NOT NULL
+    )",
+    // 4.1 LLM cache and embedding cache.
 ];
 
 /// Create every index table on a fresh build connection. Called by

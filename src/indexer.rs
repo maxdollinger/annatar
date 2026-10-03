@@ -9,9 +9,13 @@
 //!    every symbol to `symbols`;
 //! 2. **history** (`index_history`) attaches each written symbol's commits
 //!    and ticket keys (`symbol_commits`, `symbol_tickets`); skipped when the
-//!    repository is not a git work tree.
+//!    repository is not a git work tree;
+//! 3. **tickets** (`index_tickets`) makes sure every distinct key in
+//!    `symbol_tickets` is in the `cache.db` ticket cache, fetching only the
+//!    missing ones from Jira, and copies the cached fields into the index
+//!    `tickets` table; runs after history, on git work trees only.
 //!
-//! Later stages (tickets, summaries) slot in after history the same way. A
+//! Later stages (summaries) slot in after tickets the same way. A
 //! stage never commits: the transaction commits and the temporary file is
 //! atomically renamed over `index.db` exactly once, after the last stage. Any
 //! stage error drops the transaction and the build, leaving the previous index
@@ -23,7 +27,7 @@
 //! id supplies each child's `parent_id`. A file that cannot be read or parsed is
 //! counted in its own bucket, never fatal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -31,8 +35,10 @@ use libsql::{Connection, Transaction, params};
 use regex::Regex;
 
 use crate::history::{self, Commit, HistoryCache};
+use crate::jira::{FetchError, Ticket};
 use crate::store::Store;
 use crate::symbols::{JavaParser, Symbol};
+use crate::tickets::{CachedTicket, Fetched, TicketCache, TicketFetch, fetch_with_retry};
 use crate::walk;
 
 /// A summary of one index run.
@@ -54,6 +60,24 @@ pub struct IndexStats {
     /// commit (untracked) or its lookup failed. On a git repository,
     /// `history_hits + history_misses + history_skipped == symbols`.
     pub history_skipped: usize,
+    /// Distinct ticket keys in `symbol_tickets`. When the ticket stage runs,
+    /// `ticket_hits + tickets_fetched + tickets_unavailable + tickets_failed +
+    /// tickets_not_fetched == ticket_keys`.
+    pub ticket_keys: usize,
+    /// Keys served from the ticket cache (content or unavailable), no Jira call.
+    pub ticket_hits: usize,
+    /// Keys fetched from Jira this run and cached with content.
+    pub tickets_fetched: usize,
+    /// Keys Jira answered 403/404 for this run, cached as unavailable.
+    pub tickets_unavailable: usize,
+    /// Keys whose fetch failed this run (rate limit after retries, transport,
+    /// other status, unparseable response); not cached, retried next run.
+    pub tickets_failed: usize,
+    /// Keys missing from the cache that were not fetched because Jira is not
+    /// configured, has no token, or the run is `--offline`.
+    pub tickets_not_fetched: usize,
+    /// Jira requests made, retries included. Zero on a fully cached run.
+    pub jira_requests: usize,
     /// Files that parsed cleanly but produced no symbols (`package-info.java`).
     pub empty: usize,
     /// Files tree-sitter could not parse, or for which it produced no tree.
@@ -85,11 +109,17 @@ pub struct IndexStats {
 /// as a miss. Neither can abort the whole index. A file with uncommitted
 /// changes still gets history, which may be mis-attributed because `-L`
 /// resolves its span against `HEAD`, but that history is never cached.
+///
+/// `jira` is how missing tickets are fetched; `None` (offline, or Jira not
+/// configured) still copies already-cached tickets into the index but makes no
+/// request. Bad Jira credentials abort the run; see `index_tickets` for the
+/// other outcomes.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
     path_prefix: Option<&Path>,
     ticket_regex: &Regex,
+    jira: Option<&TicketFetch>,
 ) -> Result<IndexStats> {
     anyhow::ensure!(
         repo.is_dir(),
@@ -132,6 +162,7 @@ pub async fn build_index(
             &mut stats,
         )
         .await?;
+        index_tickets(&transaction, store.cache(), jira, &mut stats).await?;
     }
 
     transaction
@@ -147,6 +178,13 @@ pub async fn build_index(
         history_hits = stats.history_hits,
         history_misses = stats.history_misses,
         history_skipped = stats.history_skipped,
+        ticket_keys = stats.ticket_keys,
+        ticket_hits = stats.ticket_hits,
+        tickets_fetched = stats.tickets_fetched,
+        tickets_unavailable = stats.tickets_unavailable,
+        tickets_failed = stats.tickets_failed,
+        tickets_not_fetched = stats.tickets_not_fetched,
+        jira_requests = stats.jira_requests,
         empty = stats.empty,
         parse_errors = stats.parse_errors,
         unreadable = stats.unreadable,
@@ -334,6 +372,177 @@ async fn index_history(
             );
         }
     }
+    Ok(())
+}
+
+/// Ticket stage: every distinct key in `symbol_tickets` (read on the build
+/// transaction, so this run's uncommitted rows) is looked up in the ticket
+/// cache; only the missing keys are fetched, at most `jira.concurrency` at a
+/// time, and every cached entry is copied into the index `tickets` table.
+///
+/// Outcomes per fetched key: content → cached and copied; 403/404 → cached
+/// and copied as unavailable; bad credentials → the run fails and nothing is
+/// cached for that key; anything else (429 after the retries, transport,
+/// other status, unparseable issue) → one warning, counted in
+/// `tickets_failed`, not cached, so the next run retries it. Results are
+/// written by this function alone, as they arrive, so the fetches of an
+/// aborted run are kept in the cache. A cache read fault is a miss and a
+/// failed cache write only loses the reuse; both warn.
+async fn index_tickets(
+    transaction: &Transaction,
+    cache_conn: &Connection,
+    jira: Option<&TicketFetch>,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let keys = distinct_ticket_keys(transaction).await?;
+    stats.ticket_keys = keys.len();
+    let cache = TicketCache::new(cache_conn);
+    let mut known: BTreeMap<String, CachedTicket> = BTreeMap::new();
+    let mut missing = Vec::new();
+    for key in keys {
+        match cache.get(&key).await {
+            Ok(Some(entry)) => {
+                stats.ticket_hits += 1;
+                known.insert(key, entry);
+            }
+            Ok(None) => missing.push(key),
+            Err(err) => {
+                tracing::warn!(
+                    key,
+                    error = format!("{err:#}"),
+                    "unreadable ticket cache row; treating it as a miss"
+                );
+                missing.push(key);
+            }
+        }
+    }
+
+    match jira {
+        Some(jira) => fetch_tickets(&cache, jira, missing, &mut known, stats).await?,
+        None => stats.tickets_not_fetched += missing.len(),
+    }
+    if stats.tickets_failed > 0 {
+        tracing::warn!(
+            tickets = stats.tickets_failed,
+            "some tickets could not be fetched; they are not cached and are retried next run"
+        );
+    }
+
+    for (key, entry) in &known {
+        write_ticket(transaction, key, entry).await?;
+    }
+    Ok(())
+}
+
+/// Fetch `missing` through `jira` with bounded concurrency, caching and
+/// collecting each outcome as it arrives (see [`index_tickets`]).
+async fn fetch_tickets(
+    cache: &TicketCache<'_>,
+    jira: &TicketFetch,
+    missing: Vec<String>,
+    known: &mut BTreeMap<String, CachedTicket>,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let mut pending = missing.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < jira.concurrency.max(1)
+            && let Some(key) = pending.next()
+        {
+            let jira = jira.clone();
+            tasks.spawn(async move { fetch_with_retry(&jira, key).await });
+        }
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        let Fetched {
+            key,
+            result,
+            requests,
+        } = joined.context("ticket fetch task failed")?;
+        stats.jira_requests += requests;
+        let entry = match result {
+            Ok(ticket) => {
+                if ticket.key != key {
+                    tracing::debug!(
+                        requested = key,
+                        returned = ticket.key,
+                        "Jira returned another key (moved issue?); caching under the requested key"
+                    );
+                }
+                stats.tickets_fetched += 1;
+                CachedTicket::Available(Ticket {
+                    key: key.clone(),
+                    ..ticket
+                })
+            }
+            Err(FetchError::Unavailable { status }) => {
+                stats.tickets_unavailable += 1;
+                if let Err(err) = cache.put_unavailable(&key, status).await {
+                    tracing::warn!(key, error = format!("{err:#}"), "could not cache ticket");
+                }
+                known.insert(key, CachedTicket::Unavailable);
+                continue;
+            }
+            Err(err @ FetchError::Unauthorized { .. }) => {
+                return Err(anyhow::Error::new(err))
+                    .with_context(|| format!("fetching ticket {key}"));
+            }
+            Err(err) => {
+                tracing::warn!(key, error = %err, "could not fetch ticket; skipping it this run");
+                stats.tickets_failed += 1;
+                continue;
+            }
+        };
+        if let CachedTicket::Available(ticket) = &entry
+            && let Err(err) = cache.put_available(&key, ticket).await
+        {
+            tracing::warn!(key, error = format!("{err:#}"), "could not cache ticket");
+        }
+        known.insert(key, entry);
+    }
+    Ok(())
+}
+
+/// The distinct ticket keys in `symbol_tickets`, sorted.
+async fn distinct_ticket_keys(conn: &Connection) -> Result<Vec<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT DISTINCT ticket_key FROM symbol_tickets ORDER BY ticket_key",
+            (),
+        )
+        .await
+        .context("reading ticket keys")?;
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next().await.context("reading ticket key row")? {
+        keys.push(
+            row.get::<String>(0)
+                .context("reading symbol_tickets.ticket_key")?,
+        );
+    }
+    Ok(keys)
+}
+
+/// Copy one cached entry into the index `tickets` table.
+async fn write_ticket(conn: &Connection, key: &str, entry: &CachedTicket) -> Result<()> {
+    let ticket = match entry {
+        CachedTicket::Available(ticket) => Some(ticket),
+        CachedTicket::Unavailable => None,
+    };
+    conn.execute(
+        "INSERT INTO tickets (key, unavailable, issue_type, summary, description, parent_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            key,
+            i64::from(ticket.is_none()),
+            ticket.map(|ticket| ticket.issue_type.as_str()),
+            ticket.map(|ticket| ticket.summary.as_str()),
+            ticket.and_then(|ticket| ticket.description.as_deref()),
+            ticket.and_then(|ticket| ticket.parent_key.as_deref()),
+        ],
+    )
+    .await
+    .with_context(|| format!("writing ticket {key}"))?;
     Ok(())
 }
 
@@ -610,6 +819,7 @@ mod tests {
     use crate::config::DEFAULT_TICKET_REGEX;
     use crate::store::IndexReader;
     use crate::test_support::{commit, init_repo};
+    use crate::tickets::fake::{self, Answer, FakeSource};
     use libsql::params;
 
     fn ticket_regex() -> Regex {
@@ -618,7 +828,7 @@ mod tests {
 
     async fn build(repo: &Path, data_dir: &Path) -> Result<IndexStats> {
         let store = Store::open(data_dir).await.unwrap();
-        build_index(&store, repo, None, &ticket_regex()).await
+        build_index(&store, repo, None, &ticket_regex(), None).await
     }
 
     async fn id_of(conn: &Connection, fqn: &str) -> i64 {
@@ -874,9 +1084,15 @@ public class UserService {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
 
-        let err = build_index(&store, Path::new("/does/not/exist"), None, &ticket_regex())
-            .await
-            .expect_err("a missing repo path should fail");
+        let err = build_index(
+            &store,
+            Path::new("/does/not/exist"),
+            None,
+            &ticket_regex(),
+            None,
+        )
+        .await
+        .expect_err("a missing repo path should fail");
 
         assert!(
             format!("{err:#}").contains("not a directory"),
@@ -962,7 +1178,7 @@ public class UserService {
 
     async fn index_git_repo(repo: &Path, data: &Path) -> IndexStats {
         let store = Store::open(data).await.unwrap();
-        build_index(&store, repo, None, &ticket_regex())
+        build_index(&store, repo, None, &ticket_regex(), None)
             .await
             .unwrap()
     }
@@ -1654,7 +1870,7 @@ public class UserService {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
 
-        build_index(&store, repo.path(), None, &ticket_regex())
+        build_index(&store, repo.path(), None, &ticket_regex(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1667,6 +1883,7 @@ public class UserService {
             repo.path(),
             Some(Path::new("src/main/java/com/acme/a")),
             &ticket_regex(),
+            None,
         )
         .await
         .unwrap();
@@ -1676,5 +1893,275 @@ public class UserService {
             vec!["com.acme.a.A"],
             "--path narrows the whole index by design (open #19)"
         );
+    }
+
+    async fn index_with(
+        repo: &Path,
+        data: &Path,
+        jira: Option<&TicketFetch>,
+    ) -> Result<IndexStats> {
+        let store = Store::open(data).await.unwrap();
+        build_index(&store, repo, None, &ticket_regex(), jira).await
+    }
+
+    /// A git repo whose one file was committed once per message.
+    fn repo_with_commits(messages: &[&str]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        for (value, message) in messages.iter().enumerate() {
+            write(
+                repo.path(),
+                "src/main/java/com/acme/Service.java",
+                &java(value as i64),
+            );
+            commit(
+                repo.path(),
+                message,
+                &format!("2024-01-{:02}T00:00:00+00:00", value + 1),
+            );
+        }
+        repo
+    }
+
+    /// `(key, unavailable, summary)` for every row of the index `tickets`.
+    async fn indexed_tickets(data: &Path) -> Vec<(String, i64, Option<String>)> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query(
+                "SELECT key, unavailable, summary FROM tickets ORDER BY key",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<i64>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            ));
+        }
+        out
+    }
+
+    fn assert_ticket_buckets(stats: &IndexStats) {
+        assert_eq!(
+            stats.ticket_hits
+                + stats.tickets_fetched
+                + stats.tickets_unavailable
+                + stats.tickets_failed
+                + stats.tickets_not_fetched,
+            stats.ticket_keys,
+            "{stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_run_makes_no_jira_calls() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change", "GRLD-3 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+        source.script("GRLD-2", &[Answer::Unavailable(404)]);
+        source.script("GRLD-3", &[Answer::Unavailable(403)]);
+        let jira = fake::instant(source.clone(), 4);
+
+        let cold = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+        assert_eq!(cold.ticket_keys, 3);
+        assert_eq!(cold.tickets_fetched, 1);
+        assert_eq!(cold.tickets_unavailable, 2);
+        assert_eq!(cold.ticket_hits, 0);
+        assert_eq!(cold.jira_requests, 3);
+        assert_eq!(source.calls(), 3);
+        assert_ticket_buckets(&cold);
+        assert_eq!(
+            cold.history_hits + cold.history_misses + cold.history_skipped,
+            cold.symbols,
+            "the R1 invariant still holds"
+        );
+        let expected = vec![
+            (
+                "GRLD-1".to_string(),
+                0,
+                Some("Summary of GRLD-1".to_string()),
+            ),
+            ("GRLD-2".to_string(), 1, None),
+            ("GRLD-3".to_string(), 1, None),
+        ];
+        assert_eq!(indexed_tickets(data.path()).await, expected);
+        assert_eq!(cache_count(data.path(), "ticket_cache").await, 3);
+
+        let warm = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+        assert_eq!(source.calls(), 3, "a second run makes no Jira calls");
+        assert_eq!(warm.jira_requests, 0);
+        assert_eq!(warm.ticket_hits, 3);
+        assert_eq!(warm.tickets_fetched + warm.tickets_unavailable, 0);
+        assert_ticket_buckets(&warm);
+        assert_eq!(indexed_tickets(data.path()).await, expected);
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let output = crate::show::render(reader.connection(), "com.acme.Service#value()")
+            .await
+            .unwrap();
+        assert!(
+            output.contains(
+                ") [Story] Summary of GRLD-1
+"
+            ),
+            "{output}"
+        );
+        assert!(output.contains(") (unavailable)"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn failed_fetches_are_not_cached_and_are_retried_next_run() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script(
+            "GRLD-1",
+            &[Answer::Status(503), Answer::Ok(fake::ticket("GRLD-1"))],
+        );
+        source.script("GRLD-2", &[Answer::RateLimited(None)]);
+        let jira = fake::instant(source.clone(), 4);
+
+        let first = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .expect("transport-class failures do not fail the run");
+        assert_eq!(first.tickets_failed, 2);
+        assert_eq!(first.tickets_fetched, 0);
+        assert_eq!(
+            first.jira_requests,
+            1 + 1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize,
+            "503 once, 429 plus its retries"
+        );
+        assert_ticket_buckets(&first);
+        assert_eq!(cache_count(data.path(), "ticket_cache").await, 0);
+        assert!(indexed_tickets(data.path()).await.is_empty());
+
+        let second = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+        assert_eq!(second.tickets_fetched, 1, "GRLD-1 is retried and succeeds");
+        assert_eq!(second.tickets_failed, 1);
+        assert_eq!(source.calls_for("GRLD-1"), 2);
+        assert_eq!(cache_count(data.path(), "ticket_cache").await, 1);
+    }
+
+    #[tokio::test]
+    async fn bad_credentials_fail_the_run_cache_nothing_and_keep_the_previous_index() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        index_with(repo.path(), data.path(), None).await.unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Other.java",
+            &java_class("Other", 1),
+        );
+        commit(repo.path(), "GRLD-2 other", "2024-02-01T00:00:00+00:00");
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Unauthorized]);
+        source.script("GRLD-2", &[Answer::Unauthorized]);
+
+        let err = index_with(repo.path(), data.path(), Some(&fake::instant(source, 1)))
+            .await
+            .expect_err("bad credentials must fail the run");
+
+        assert!(format!("{err:#}").contains("credentials"), "{err:#}");
+        assert_eq!(cache_count(data.path(), "ticket_cache").await, 0);
+        assert_eq!(
+            fqns(data.path()).await,
+            vec!["com.acme.Service", "com.acme.Service#value()"],
+            "the previous index is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_run_uses_cached_tickets_and_makes_no_calls() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+        index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 4)),
+        )
+        .await
+        .unwrap();
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(9));
+        commit(repo.path(), "GRLD-2 change", "2024-02-01T00:00:00+00:00");
+
+        let offline = index_with(repo.path(), data.path(), None).await.unwrap();
+
+        assert_eq!(source.calls(), 1);
+        assert_eq!(offline.jira_requests, 0);
+        assert_eq!(offline.ticket_hits, 1);
+        assert_eq!(offline.tickets_not_fetched, 1, "GRLD-2 is not in the cache");
+        assert_ticket_buckets(&offline);
+        assert_eq!(
+            indexed_tickets(data.path()).await,
+            vec![(
+                "GRLD-1".to_string(),
+                0,
+                Some("Summary of GRLD-1".to_string())
+            )],
+            "cached tickets reach the index offline; uncached ones have no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_issue_is_cached_under_the_requested_key() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("NEW-7"))]);
+        let jira = fake::instant(source.clone(), 4);
+
+        index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+        let warm = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+
+        assert_eq!(source.calls(), 1);
+        assert_eq!(warm.ticket_hits, 1);
+        assert_eq!(
+            indexed_tickets(data.path()).await,
+            vec![(
+                "GRLD-1".to_string(),
+                0,
+                Some("Summary of NEW-7".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_run_concurrently_up_to_the_cap() {
+        let keys: Vec<String> = (1..=10).map(|n| format!("GRLD-{n}")).collect();
+        let repo = repo_with_commits(&[&keys.join(" ")]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        for key in &keys {
+            source.script(key, &[Answer::Ok(fake::ticket(key))]);
+        }
+
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 3)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.tickets_fetched, 10);
+        assert_eq!(source.calls(), 10);
+        assert_eq!(source.peak(), 3, "three requests overlap, never more");
     }
 }

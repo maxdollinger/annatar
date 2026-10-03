@@ -23,8 +23,11 @@ Configure `annatar.toml` (the default file; `--config <FILE>` points elsewhere).
 cargo build --release                     # binary in target/release/annatar
 annatar index                             # rebuild .annatar/index.db
 annatar index --path src/main/java/com/acme   # only part of the repo
+annatar index --offline                   # no Jira requests; cached tickets only
 annatar show com.acme.user.UserRepository     # a symbol, its children, commits and tickets
 ```
+
+`index` fetches every ticket key found in the history from Jira once and caches it in `cache.db` (403/404 are cached as unavailable), so later runs make no Jira requests for known keys; the `tickets:` line of its output counts cached, fetched, unavailable and failed keys and the Jira requests made. Without a `[jira]` section or without `ANNATAR_JIRA_TOKEN` it warns once and uses cached tickets only; `--offline` does the same on purpose. Rejected credentials fail the run. `show` lists each ticket with its type and summary, or `(unavailable)`.
 
 `--path <PREFIX>` is for fast iteration on part of the repo, not for refreshing a slice: a `--path` run still replaces the whole `index.db`, which then holds only that prefix (empty if the prefix matches nothing). The run logs a warning saying so; run `annatar index` without `--path` to get the full index back.
 

@@ -89,7 +89,7 @@ fn generate(repo: &Path) {
 async fn time_run(repo: &Path, data: &Path, regex: &Regex) -> (IndexStats, Duration) {
     let store = Store::open(data).await.unwrap();
     let start = Instant::now();
-    let stats = indexer::build_index(&store, repo, None, regex)
+    let stats = indexer::build_index(&store, repo, None, regex, None)
         .await
         .unwrap();
     (stats, start.elapsed())
