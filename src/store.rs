@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database};
 use tempfile::NamedTempFile;
+
+use crate::schema;
 
 /// Rebuilt from scratch by every index run.
 pub const INDEX_DB: &str = "index.db";
@@ -12,19 +14,22 @@ pub const CACHE_DB: &str = "cache.db";
 /// Opens the two database files and manages the index rebuild lifecycle.
 ///
 /// `<data_dir>/cache.db` is opened once and shared. `<data_dir>/index.db` is
-/// never written in place: a run builds a temporary file next to it and
-/// atomically renames it over the old index when [`Store::finish_index`] is
-/// called. An aborted run drops the temporary file and leaves the previous
-/// index untouched.
+/// never written in place: [`Store::begin_index`] hands out an owned
+/// [`IndexBuild`] that writes to a temporary file next to the real index, and
+/// [`IndexBuild::commit`] atomically renames it over `index.db`. A build that
+/// is dropped instead of committed deletes its temporary file, leaving the
+/// previous index untouched.
 pub struct Store {
     data_dir: PathBuf,
     cache: Connection,
     // Anchors the cache connection; never read directly.
     _cache_db: Database,
-    index: Option<IndexBuild>,
 }
 
-struct IndexBuild {
+/// An owned, in-progress index build. Hold it for the whole run, write tables
+/// through [`IndexBuild::connection`], then call [`IndexBuild::commit`] once at
+/// the end. Dropping it aborts the build.
+pub struct IndexBuild {
     conn: Connection,
     db: Database,
     temp: NamedTempFile,
@@ -44,11 +49,13 @@ impl Store {
             .await
             .with_context(|| format!("opening cache database {}", cache_path.display()))?;
         let cache = cache_db.connect().context("connecting to cache database")?;
+        schema::create_cache(&cache)
+            .await
+            .context("creating cache schema")?;
         Ok(Self {
             data_dir,
             cache,
             _cache_db: cache_db,
-            index: None,
         })
     }
 
@@ -70,11 +77,11 @@ impl Store {
         self.data_dir.join(CACHE_DB)
     }
 
-    /// Start a fresh index build in a temporary file. Any previous unfinished
-    /// build is discarded. Later phases create their index tables on the
-    /// returned connection.
-    pub async fn begin_index(&mut self) -> Result<&Connection> {
-        self.index = None;
+    /// Start a fresh index build in a temporary file. The returned
+    /// [`IndexBuild`] is owned by the caller and must be committed to become
+    /// the new `index.db`. Later phases create their index tables on the
+    /// build's connection.
+    pub async fn begin_index(&self) -> Result<IndexBuild> {
         let final_path = self.index_path();
         let temp = tempfile::Builder::new()
             .prefix(".index-")
@@ -86,31 +93,32 @@ impl Store {
             .await
             .context("opening temporary index database")?;
         let conn = db.connect().context("connecting to temporary index")?;
-        self.index = Some(IndexBuild {
+        schema::create_index(&conn)
+            .await
+            .context("creating index schema")?;
+        Ok(IndexBuild {
             conn,
             db,
             temp,
             final_path,
-        });
-        Ok(&self.index.as_ref().expect("just set").conn)
+        })
     }
+}
 
-    /// The in-progress index connection, if a build has been started.
-    pub fn index(&self) -> Option<&Connection> {
-        self.index.as_ref().map(|build| &build.conn)
+impl IndexBuild {
+    /// The connection to the in-progress index. Create and fill tables here.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     /// Close the temporary index and atomically rename it over `index.db`.
-    pub fn finish_index(&mut self) -> Result<()> {
-        let Some(build) = self.index.take() else {
-            bail!("no index build in progress");
-        };
+    pub fn commit(self) -> Result<()> {
         let IndexBuild {
-            db,
             conn,
+            db,
             temp,
             final_path,
-        } = build;
+        } = self;
         drop(conn);
         drop(db);
         temp.persist(&final_path)
@@ -130,37 +138,58 @@ mod tests {
         Some(row.get::<String>(0).unwrap())
     }
 
-    async fn write_index(store: &mut Store, table: &str, value: &str) {
-        let conn = store.begin_index().await.unwrap();
-        conn.execute(&format!("CREATE TABLE {table} (v TEXT)"), ())
+    async fn write_index(store: &Store, table: &str, value: &str) {
+        let build = store.begin_index().await.unwrap();
+        build
+            .connection()
+            .execute(&format!("CREATE TABLE {table} (v TEXT)"), ())
             .await
             .unwrap();
-        conn.execute(&format!("INSERT INTO {table} VALUES ('{value}')"), ())
+        build
+            .connection()
+            .execute(&format!("INSERT INTO {table} VALUES ('{value}')"), ())
             .await
             .unwrap();
-        store.finish_index().unwrap();
+        build.commit().unwrap();
+    }
+
+    fn temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".index-"))
+            .collect()
     }
 
     #[tokio::test]
-    async fn finished_run_replaces_index_and_aborted_run_keeps_the_old_one() {
+    async fn committed_build_replaces_index_and_aborted_build_keeps_the_old_one() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let index_path = store.index_path();
         drop(store);
 
-        let mut store = Store::open(dir.path()).await.unwrap();
-        write_index(&mut store, "t", "first").await;
-        assert!(index_path.exists(), "finished run should create index.db");
+        let store = Store::open(dir.path()).await.unwrap();
+        write_index(&store, "t", "first").await;
+        assert!(
+            index_path.exists(),
+            "committed build should create index.db"
+        );
         drop(store);
 
-        // A second run that never finishes must not touch the committed index.
-        let mut store = Store::open(dir.path()).await.unwrap();
-        let conn = store.begin_index().await.unwrap();
-        conn.execute("CREATE TABLE t2 (v TEXT)", ()).await.unwrap();
-        conn.execute("INSERT INTO t2 VALUES ('second')", ())
+        // A second run that never commits must not touch the committed index.
+        let store = Store::open(dir.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+        build
+            .connection()
+            .execute("CREATE TABLE t2 (v TEXT)", ())
             .await
             .unwrap();
-        drop(store);
+        build
+            .connection()
+            .execute("INSERT INTO t2 VALUES ('second')", ())
+            .await
+            .unwrap();
+        drop(build);
 
         let db = Builder::new_local(&index_path).build().await.unwrap();
         let conn = db.connect().unwrap();
@@ -184,7 +213,7 @@ mod tests {
     async fn cache_survives_rebuilds_and_aborts() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut store = Store::open(dir.path()).await.unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
         store
             .cache()
             .execute("CREATE TABLE c (v TEXT)", ())
@@ -195,14 +224,18 @@ mod tests {
             .execute("INSERT INTO c VALUES ('keep')", ())
             .await
             .unwrap();
-        write_index(&mut store, "t", "run1").await;
+        write_index(&store, "t", "run1").await;
         drop(store);
 
         // Another run aborts while a rebuild is in progress.
-        let mut store = Store::open(dir.path()).await.unwrap();
-        let conn = store.begin_index().await.unwrap();
-        conn.execute("CREATE TABLE t (v TEXT)", ()).await.unwrap();
-        drop(store);
+        let store = Store::open(dir.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+        build
+            .connection()
+            .execute("CREATE TABLE t (v TEXT)", ())
+            .await
+            .unwrap();
+        drop(build);
 
         let store = Store::open(dir.path()).await.unwrap();
         assert_eq!(
@@ -215,31 +248,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_index_discards_a_previous_unfinished_build() {
+    async fn aborted_build_leaves_no_temp_file_or_index() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(dir.path()).await.unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
 
-        store.begin_index().await.unwrap();
-        let conn = store.begin_index().await.unwrap();
-        conn.execute("CREATE TABLE fresh (v TEXT)", ())
+        let build = store.begin_index().await.unwrap();
+        build
+            .connection()
+            .execute("CREATE TABLE fresh (v TEXT)", ())
             .await
             .unwrap();
-
-        let leftover: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|name| name.starts_with(".index-"))
-            .collect();
-        assert!(
-            leftover.len() <= 1,
-            "only the current temporary index should exist, found {leftover:?}"
+        assert_eq!(
+            temp_files(dir.path()).len(),
+            1,
+            "an in-progress build should own exactly one temporary file"
         );
-    }
+        drop(build);
 
-    #[tokio::test]
-    async fn finish_without_begin_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(dir.path()).await.unwrap();
-        assert!(store.finish_index().is_err());
+        assert!(
+            temp_files(dir.path()).is_empty(),
+            "aborting a build should delete its temporary file"
+        );
+        assert!(
+            !store.index_path().exists(),
+            "aborting a build should never create index.db"
+        );
     }
 }

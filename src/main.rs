@@ -11,7 +11,7 @@ use annatar::config::Config;
 struct Cli {
     /// Limit the run to paths under this prefix.
     #[arg(long, global = true, value_name = "PREFIX")]
-    path: Option<String>,
+    path: Option<PathBuf>,
 
     /// Increase log verbosity (-v info, -vv debug, -vvv trace).
     #[arg(short, long, global = true, action = ArgAction::Count)]
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
     tracing::debug!(
         repo = %config.repo.display(),
         data_dir = %config.data_dir.display(),
-        path = cli.path.as_deref().unwrap_or("<all>"),
+        path = ?cli.path,
         "loaded configuration"
     );
 

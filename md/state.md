@@ -17,6 +17,15 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Done
 
+- **Pre-Phase-1 rework.** Config paths (`repo`, `data_dir`) now resolve
+  relative to the config file's directory, `--path` is a `PathBuf`, and the
+  `jira`/`ollama` sections are optional. `Store::begin_index` now returns an
+  owned `IndexBuild` with `commit()` (dropping it aborts); `Store` no longer
+  tracks the in-progress build. Added `schema` module (empty table lists for
+  now), a committed example `annatar.toml`, and framed `project.md` as the
+  target with `plan.md` as its POC subset. 9 tests, green; `cargo clippy
+  -D warnings` clean.
+
 - **0.1 CLI, config, logging.** `annatar` binary with `clap` subcommands
   `index`, `show`, `search`, `serve` (stubs), global `--path`, `-v` and
   `--config`. `annatar.toml` loaded into a typed `Config` (`repo`, `data_dir`,
@@ -68,6 +77,12 @@ the decisions taken, and the tradeoffs behind them.
 | 16 | `Store` is async; `tokio` is the runtime | Synchronous wrapper | The `libsql` API is async. `open`/`begin_index` are async, `finish_index` is sync (drop + rename). Tests use `#[tokio::test]` |
 | 17 | `Store` owns no schema in 0.2; it exposes `cache()` and the `begin_index()` connection | Bundle table creation into 0.2 | Each phase adds its own tables (plan). Keeps this step to the file lifecycle and lets schema land with the data it stores |
 | 18 | Drop order: connection fields before their `Database`; `_cache_db` field anchors the cache connection | Rely on `Connection` alone | Explicit and safe: the connection is closed before the database handle; the anchor field is underscore-prefixed to stay intentionally unread |
+| 19 | `repo` and `data_dir` resolve relative to the config file's directory, not the cwd (`Config::load`) | Resolve against the cwd | A config file describes its own repo/data layout, so the same file works from any working directory. Absolute paths are returned unchanged |
+| 20 | `--path` is a `PathBuf` | `String` | It is a filesystem path prefix; parse it as one so the walker (1.1) doesn't re-parse or re-validate |
+| 21 | `jira` and `ollama` are `Option<...>` in `Config` | Keep them required | Phases 1–2 (`index`, `show`) don't talk to Jira or Ollama; requiring them taxes the `--path` iteration loop. A command that needs them will require them once wired (3.x/4.x) |
+| 22 | `Store::begin_index` returns an owned `IndexBuild` with `commit()`; `Store` no longer tracks the in-progress build | Return `&Connection` from `&mut Store`, then `finish_index` on `Store` | The borrow blocked holding the connection across an async pipeline while later calling finish, and mixed a sync finish with an async build. An owned guard survives the whole run and aborting is just a drop |
+| 23 | All DDL lives in one `schema` module: `INDEX_TABLES` applied by `begin_index`, `CACHE_TABLES` by `open` | Per-phase DDL scattered in each step | `index.db` is disposable, so no migrations or versioning; one file keeps the whole shape reviewable as phases 1–5 add tables. Lists are empty until 1.5 |
+| 24 | A working dummy `annatar.toml` is committed (data dir `.annatar`, gitignored) | No config in the repo | The binary's default config now loads out of the box; secrets still come only from the environment, so the file stays committable |
 
 ## Open questions
 
@@ -75,9 +90,9 @@ the decisions taken, and the tradeoffs behind them.
 | --- | --- | --- | --- |
 | 1 | Jira auth scheme: Cloud uses email + API token (basic auth), Server/DC often uses a personal access token (bearer). Assume Cloud for now? | 0.1 | open |
 | 2 | Config discovery: search parent directories, or add `ANNATAR_CONFIG`? Currently only cwd/`--config`. | 0.1 | open, defer |
-| 3 | Should `jira` / `ollama` sections become optional per command (e.g. `show` may not need Jira)? | 0.1 | open |
-| 4 | `--path` is currently a `String`; make it a `PathBuf` once the walker lands (1.1)? | 0.1 | open |
+| 3 | Should `jira` / `ollama` sections become optional per command (e.g. `show` may not need Jira)? | 0.1 | resolved — both sections are now `Option`; commands require them when wired |
+| 4 | `--path` is currently a `String`; make it a `PathBuf` once the walker lands (1.1)? | 0.1 | resolved — now `PathBuf` |
 | 5 | Should `cache.db` use WAL for concurrent reader access (MCP server)? The index stays rollback-journal so rename is single-file. | 0.2 | open, defer |
 | 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | open |
-| 7 | Is `data_dir` resolved relative to the cwd or to the config file's directory? Currently cwd. | 0.2 | open |
-| 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | open |
+| 7 | Is `data_dir` resolved relative to the cwd or to the config file's directory? | 0.2 | resolved — relative to the config file's directory (also applies to `repo`) |
+| 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | resolved — one `schema` module (decision 23) |
