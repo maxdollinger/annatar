@@ -57,10 +57,13 @@ pub const INDEX_TABLES: &[&str] = &[
 
 /// `CREATE TABLE IF NOT EXISTS` statements for the persistent `cache.db`.
 pub const CACHE_TABLES: &[&str] = &[
-    // 2.3 `history_cache`: one current row per fqn, keyed by fqn plus the
+    // 2.3 `history_cache`, dropped by R3: its rows were computed from a span
+    // that started at the declaration, not the Javadoc, under the same key.
+    "DROP TABLE IF EXISTS history_cache",
+    // R3 `history_cache_v2`: one current row per fqn, keyed by fqn plus the
     // symbol's content hash and the file's last commit sha; `commits` is a JSON
-    // array of [`crate::history::Commit`].
-    "CREATE TABLE IF NOT EXISTS history_cache (
+    // array of [`crate::history::Commit`] for the Javadoc-inclusive span.
+    "CREATE TABLE IF NOT EXISTS history_cache_v2 (
         fqn TEXT PRIMARY KEY,
         content_hash TEXT NOT NULL,
         file_last_commit TEXT NOT NULL,

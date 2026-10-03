@@ -348,3 +348,4 @@ Never paste the token into chat, `annatar.toml` or a fixture. Scrub
 | R5 | test: share scratch-git helpers, exact benchmark counts | `#[path]` include instead of a second copy in `tests/common/` (D-s); benchmark re-run on linux/debug: cold 3.41 s, warm 0.39 s, changed 0.72 s |
 | R1 | fix(indexer): skip untracked files once, degrade cache faults | `HistoryOutcome` enum instead of updating stats inside the helper; corrupt-row test proves the row is rewritten (third run hits) |
 | R2 | fix(indexer): never cache history of dirty files | Used `git diff HEAD --relative` instead of the planned `git status --porcelain`: porcelain paths are relative to the work-tree root, `--relative` paths match the walker; a failed check disables the cache for the run |
+| R3 | fix(history): include the Javadoc in a symbol's history span | J0 taken as recommended; cache renamed rather than versioned in-row; mutation-checked the doc-only test |
