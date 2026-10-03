@@ -485,12 +485,16 @@ Status of each item as it lands. One commit per item (Conventional Commits);
 | H1 | done | `a3156c8` | 43 | `JavaParser`/`ParsedFile`; `skipped` → `empty`/`parse_errors`/`unreadable`; open #11 resolved |
 | H2 | done | `86fd786` | 44 | `content_hash` uses `.get(range)` and returns contextual error |
 | H3 | done | `087ee6f` | 46 | `PRAGMA foreign_keys = ON` per index connection |
-| H4 | done | — | 48 | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing |
-| H5 | done | — | 49 | `parse_annotations` returns `Result` with the fqn; `text()` warns (kind/span) and returns empty; corrupt-annotations `show` test |
-| H6 | done | — | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
-| H7 | done | — | 51 | one transaction wraps all symbol writes, committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` |
-| H9 | done | — | 52 | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample under source root → `generated/`; 1 new walker test |
-| H8 | done | — | 52 | decision 41 wording fixed + deep-nesting open #15; `minimal_without` presence/removal asserts; store test inserts via `params!`; `relative_path` → `replace('\\', "/")`; `Config::load` clones instead of `mem::take` |
+| H4 | done | `0a1ebdf` | 48 | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing |
+| H5 | done | `ec3493b` | 49 | `parse_annotations` returns `Result` with the fqn; `text()` warns (kind/span) and returns empty; corrupt-annotations `show` test |
+| H6 | done | `8e463d9` | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
+| H7 | done | `ff18d6d` | 51 | one transaction wraps all symbol writes, committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` |
+| H9 | done | `e13e846` | 52 | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample under source root → `generated/`; 1 new walker test |
+| H8 | done | `3eef617` | 52 | decision 41 wording fixed + deep-nesting open #15; `minimal_without` presence/removal asserts; store test inserts via `params!`; `relative_path` → `replace('\\', "/")`; `Config::load` clones instead of `mem::take` |
+
+All 18 findings are closed; `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
+and `cargo test` (52 tests: 51 unit + 1 integration) are clean. The remediation
+queue in `state.md` now points at Phase 2.1.
 
 ### Deviations from the plan
 
