@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
-use annatar::store::Store;
+use annatar::store::{IndexReader, Store};
 use annatar::{indexer, show};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
@@ -73,9 +73,8 @@ async fn main() -> Result<()> {
             );
         }
         Command::Show { fqn } => {
-            let store = Store::open(&config.data_dir).await?;
-            let conn = store.open_index().await?;
-            print!("{}", show::render(&conn, fqn).await?);
+            let reader = IndexReader::open(&config.data_dir).await?;
+            print!("{}", show::render(reader.connection(), fqn).await?);
         }
         Command::Search { query } => not_implemented(&format!("search {query}")),
         Command::Serve => not_implemented("serve"),

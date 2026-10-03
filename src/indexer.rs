@@ -190,12 +190,12 @@ fn relative_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::IndexReader;
     use libsql::params;
 
-    async fn build(repo: &Path, data_dir: &Path) -> Result<(Store, IndexStats)> {
+    async fn build(repo: &Path, data_dir: &Path) -> Result<IndexStats> {
         let store = Store::open(data_dir).await.unwrap();
-        let stats = build_index(&store, repo, None).await?;
-        Ok((store, stats))
+        build_index(&store, repo, None).await
     }
 
     async fn id_of(conn: &Connection, fqn: &str) -> i64 {
@@ -316,72 +316,73 @@ public class UserService {
         );
         let data = tempfile::tempdir().unwrap();
 
-        let (store, stats) = build(repo.path(), data.path()).await.unwrap();
+        let stats = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(stats.files, 1);
         assert_eq!(stats.empty, 0);
         assert_eq!(stats.parse_errors, 0);
         assert_eq!(stats.unreadable, 0);
         assert_eq!(stats.symbols, 5, "class, two methods, nested type, ping");
 
-        let conn = store.open_index().await.unwrap();
-        assert_eq!(count(&conn).await, 5);
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(count(conn).await, 5);
 
-        let class_id = id_of(&conn, "com.acme.sample.UserService").await;
-        let nested_id = id_of(&conn, "com.acme.sample.UserService.Nested").await;
+        let class_id = id_of(conn, "com.acme.sample.UserService").await;
+        let nested_id = id_of(conn, "com.acme.sample.UserService.Nested").await;
 
         assert_eq!(
-            parent_of(&conn, "com.acme.sample.UserService").await,
+            parent_of(conn, "com.acme.sample.UserService").await,
             None,
             "a top-level type has no parent"
         );
         assert_eq!(
-            parent_of(&conn, "com.acme.sample.UserService#find(Long)").await,
+            parent_of(conn, "com.acme.sample.UserService#find(Long)").await,
             Some(class_id),
             "members link to their type"
         );
         assert_eq!(
-            parent_of(&conn, "com.acme.sample.UserService.Nested").await,
+            parent_of(conn, "com.acme.sample.UserService.Nested").await,
             Some(class_id),
             "nested types link to their enclosing type"
         );
         assert_eq!(
-            parent_of(&conn, "com.acme.sample.UserService.Nested#ping()").await,
+            parent_of(conn, "com.acme.sample.UserService.Nested#ping()").await,
             Some(nested_id),
             "members of a nested type link to that nested type"
         );
 
         assert_eq!(
-            text_of(&conn, "com.acme.sample.UserService", "kind")
+            text_of(conn, "com.acme.sample.UserService", "kind")
                 .await
                 .as_deref(),
             Some("class")
         );
         assert_eq!(
-            text_of(&conn, "com.acme.sample.UserService", "role")
+            text_of(conn, "com.acme.sample.UserService", "role")
                 .await
                 .as_deref(),
             Some("service")
         );
         assert_eq!(
-            text_of(&conn, "com.acme.sample.UserService#find(Long)", "kind")
+            text_of(conn, "com.acme.sample.UserService#find(Long)", "kind")
                 .await
                 .as_deref(),
             Some("method")
         );
         assert_eq!(
-            text_of(&conn, "com.acme.sample.UserService#find(Long)", "file")
+            text_of(conn, "com.acme.sample.UserService#find(Long)", "file")
                 .await
                 .as_deref(),
             Some("src/main/java/com/acme/sample/UserService.java")
         );
         assert_eq!(
-            text_of(&conn, "com.acme.sample.UserService", "annotations")
+            text_of(conn, "com.acme.sample.UserService", "annotations")
                 .await
                 .as_deref(),
             Some(r#"["@Service"]"#)
         );
         assert_eq!(
-            text_of(&conn, "com.acme.sample.UserService", "javadoc")
+            text_of(conn, "com.acme.sample.UserService", "javadoc")
                 .await
                 .as_deref(),
             Some("Handles users.")
@@ -423,11 +424,12 @@ public class UserService {
         );
         let data = tempfile::tempdir().unwrap();
 
-        let (store, stats) = build(repo.path(), data.path()).await.unwrap();
+        let stats = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(stats.symbols, 1, "the duplicate is not counted");
 
-        let conn = store.open_index().await.unwrap();
-        assert_eq!(count(&conn).await, 1);
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(count(conn).await, 1);
     }
 
     #[tokio::test]
@@ -435,7 +437,7 @@ public class UserService {
         let repo = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
 
-        let (store, stats) = build(repo.path(), data.path()).await.unwrap();
+        let stats = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(
             stats,
             IndexStats {
@@ -447,8 +449,9 @@ public class UserService {
             }
         );
 
-        let conn = store.open_index().await.unwrap();
-        assert_eq!(count(&conn).await, 0);
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(count(conn).await, 0);
     }
 
     #[tokio::test]
@@ -481,15 +484,16 @@ public class UserService {
         );
         let data = tempfile::tempdir().unwrap();
 
-        let (store, stats) = build(repo.path(), data.path()).await.unwrap();
+        let stats = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(stats.files, 1);
         assert_eq!(stats.parse_errors, 1);
         assert_eq!(stats.empty, 0);
         assert_eq!(stats.unreadable, 0);
         assert_eq!(stats.symbols, 1);
 
-        let conn = store.open_index().await.unwrap();
-        assert_eq!(count(&conn).await, 1);
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(count(conn).await, 1);
     }
 
     #[tokio::test]
@@ -512,7 +516,7 @@ public class UserService {
         );
         let data = tempfile::tempdir().unwrap();
 
-        let (store, stats) = build(repo.path(), data.path()).await.unwrap();
+        let stats = build(repo.path(), data.path()).await.unwrap();
         assert_eq!(stats.files, 1, "only Good.java produced a symbol");
         assert_eq!(
             stats.empty, 1,
@@ -522,7 +526,8 @@ public class UserService {
         assert_eq!(stats.unreadable, 0);
         assert_eq!(stats.symbols, 1);
 
-        let conn = store.open_index().await.unwrap();
-        assert_eq!(count(&conn).await, 1);
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let conn = reader.connection();
+        assert_eq!(count(conn).await, 1);
     }
 }

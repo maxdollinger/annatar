@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use annatar::indexer;
 use annatar::show;
-use annatar::store::Store;
+use annatar::store::{IndexReader, Store};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-project")
@@ -22,9 +22,12 @@ async fn sample_project_indexes_and_show_lists_children() {
     assert_eq!(stats.unreadable, 0);
     assert_eq!(stats.symbols, 14);
 
-    let conn = store.open_index().await.unwrap();
+    drop(store);
 
-    let controller = show::render(&conn, "com.acme.sample.UserController")
+    let reader = IndexReader::open(data.path()).await.unwrap();
+    let conn = reader.connection();
+
+    let controller = show::render(conn, "com.acme.sample.UserController")
         .await
         .unwrap();
     assert!(
@@ -43,7 +46,7 @@ async fn sample_project_indexes_and_show_lists_children() {
         "nested type listed as a child: {controller}"
     );
 
-    let repository = show::render(&conn, "com.acme.sample.UserRepository")
+    let repository = show::render(conn, "com.acme.sample.UserRepository")
         .await
         .unwrap();
     assert!(
@@ -52,7 +55,7 @@ async fn sample_project_indexes_and_show_lists_children() {
     );
     assert!(repository.contains("com.acme.sample.UserRepository#findByEmail(String) [method]"));
 
-    let service = show::render(&conn, "com.acme.sample.UserService")
+    let service = show::render(conn, "com.acme.sample.UserService")
         .await
         .unwrap();
     assert!(service.contains("com.acme.sample.UserService#find(Long) [method]"));

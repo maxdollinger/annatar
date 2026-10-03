@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use libsql::{Builder, Connection, Database};
+use libsql::{Builder, Connection, Database, OpenFlags};
 use tempfile::NamedTempFile;
 
 use crate::schema;
@@ -36,6 +36,45 @@ pub struct IndexBuild {
     final_path: PathBuf,
 }
 
+/// A side-effect-free, read-only handle on the committed `index.db`.
+///
+/// Opening a reader touches only `index.db`: it never creates the data
+/// directory, `cache.db`, the index file, or its schema. Reading before a run
+/// has committed an index is an error pointing the caller at `annatar index`.
+pub struct IndexReader {
+    conn: Connection,
+    // Anchors the index connection; never read directly.
+    _db: Database,
+}
+
+impl IndexReader {
+    /// Open `<data_dir>/index.db` read-only, without creating anything.
+    pub async fn open(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join(INDEX_DB);
+        if !path.exists() {
+            anyhow::bail!(
+                "index database {} does not exist; run `annatar index` first",
+                path.display()
+            );
+        }
+        let db = Builder::new_local(&path)
+            .flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .build()
+            .await
+            .with_context(|| format!("opening index database {}", path.display()))?;
+        let conn = db
+            .connect()
+            .with_context(|| format!("connecting to index database {}", path.display()))?;
+        enable_foreign_keys(&conn).await?;
+        Ok(Self { conn, _db: db })
+    }
+
+    /// The read-only connection to the committed index.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+}
+
 impl Store {
     /// Open the data directory, creating it if needed, and the persistent
     /// cache database.
@@ -65,39 +104,8 @@ impl Store {
         &self.cache
     }
 
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
     pub fn index_path(&self) -> PathBuf {
         self.data_dir.join(INDEX_DB)
-    }
-
-    pub fn cache_path(&self) -> PathBuf {
-        self.data_dir.join(CACHE_DB)
-    }
-
-    /// Open a read-only connection to the committed `index.db`.
-    ///
-    /// This never creates the file or its schema: reading before a run has
-    /// committed an index is an error, pointing the caller at `annatar index`.
-    pub async fn open_index(&self) -> Result<Connection> {
-        let path = self.index_path();
-        if !path.exists() {
-            anyhow::bail!(
-                "index database {} does not exist; run `annatar index` first",
-                path.display()
-            );
-        }
-        let db = Builder::new_local(&path)
-            .build()
-            .await
-            .with_context(|| format!("opening index database {}", path.display()))?;
-        let conn = db
-            .connect()
-            .with_context(|| format!("connecting to index database {}", path.display()))?;
-        enable_foreign_keys(&conn).await?;
-        Ok(conn)
     }
 
     /// Start a fresh index build in a temporary file. The returned
@@ -314,25 +322,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_index_errors_before_the_first_build_and_reads_after_one() {
+    async fn reader_errors_before_the_first_build_and_reads_after_one() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
 
-        let err = store
-            .open_index()
+        let err = IndexReader::open(dir.path())
             .await
-            .expect_err("there is no index before the first build");
+            .err()
+            .expect("there is no index before the first build");
         assert!(
             format!("{err:#}").contains("does not exist"),
             "error should say the index is missing, got: {err:#}"
         );
 
         write_index(&store, "t", "one").await;
-        let conn = store.open_index().await.unwrap();
+        let reader = IndexReader::open(dir.path()).await.unwrap();
         assert_eq!(
-            first_string(&conn, "SELECT v FROM t").await.as_deref(),
+            first_string(reader.connection(), "SELECT v FROM t")
+                .await
+                .as_deref(),
             Some("one"),
-            "the read connection should see the committed index"
+            "the reader should see the committed index"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_open_without_an_index_creates_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let data_dir = parent.path().join("data");
+
+        let err = IndexReader::open(&data_dir)
+            .await
+            .err()
+            .expect("there is no index before the first build");
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "error should name the missing index, got: {err:#}"
+        );
+        assert!(
+            !data_dir.exists(),
+            "opening a reader must not create the data directory"
+        );
+        assert!(!data_dir.join(INDEX_DB).exists());
+        assert!(!data_dir.join(CACHE_DB).exists());
+    }
+
+    #[tokio::test]
+    async fn reader_reads_without_recreating_cache_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        write_index(&store, "t", "one").await;
+        drop(store);
+
+        let cache_path = dir.path().join(CACHE_DB);
+        std::fs::remove_file(&cache_path).unwrap();
+        assert!(!cache_path.exists(), "cache.db should be gone for the test");
+
+        let reader = IndexReader::open(dir.path()).await.unwrap();
+        assert_eq!(
+            first_string(reader.connection(), "SELECT v FROM t")
+                .await
+                .as_deref(),
+            Some("one"),
+            "the reader should read the committed index"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the read path must not recreate cache.db"
         );
     }
 
