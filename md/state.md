@@ -11,11 +11,21 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols |
-| Step | 1.4 Signature, Javadoc, annotations, Spring role — **done** |
+| Step | 1.5 Write symbols and `show` — **done** (Phase 1 complete) |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **1.5 Write symbols and `show`.** `symbols` table (id, parent_id, kind,
+  role, fqn unique, file, start/end line, signature, javadoc, annotations,
+  content_hash) in `INDEX_TABLES`; `indexer::build_index` walks, parses and
+  writes all symbols in one temp-file build, linking `parent_id` via an in-memory
+  fqn map. `Store::open_index` reads the committed index; `show::render` prints a
+  symbol and its descendants recursively. `index`/`show` wired in `main`;
+  `content_hash` is blake3 of javadoc + source slice; annotations stored as JSON.
+  Manual run on the fixture project: 4 files, 14 symbols, show works. 39 lib + 1
+  integration test, green; clippy clean.
 
 - **1.4 Signature, Javadoc, annotations, Spring role.** `Symbol` gained
   `signature` (declaration without body, annotations removed, whitespace
@@ -77,9 +87,9 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- 1.5 Write symbols and `show`: `symbols` table in `index.db`, content hash,
-  and `annatar show <fqn>` printing a symbol and its children. Needs a read
-  connection to the committed index (open question 6).
+- 2.1 History for a span: `git log -L <start>,<end>:<file>` via
+  `std::process::Command`, with a custom `--format` and record delimiter. Note
+  behaviour on renamed files in the PR.
 
 ## Step log
 
@@ -91,6 +101,7 @@ the decisions taken, and the tradeoffs behind them.
 | 1.2 Parse types | done | `symbols::parse_types`; tree-sitter 0.25 + tree-sitter-java 0.23; 6 tests (21 total) |
 | 1.3 Methods/constructors | done | unified `Symbol`; fqn `Type#name(params)`, ctors `<init>`; 10 symbols tests (25 total) |
 | 1.4 Text + role | done | signature/javadoc/annotations/role; 17 symbols tests (32 total) |
+| 1.5 Write + show | done | `symbols` table, `indexer::build_index`, `Store::open_index`, `show::render`; 40 tests |
 
 ## Decisions and tradeoffs
 
@@ -118,7 +129,7 @@ the decisions taken, and the tradeoffs behind them.
 | 20 | `--path` is a `PathBuf` | `String` | It is a filesystem path prefix; parse it as one so the walker (1.1) doesn't re-parse or re-validate |
 | 21 | `jira` and `ollama` are `Option<...>` in `Config` | Keep them required | Phases 1–2 (`index`, `show`) don't talk to Jira or Ollama; requiring them taxes the `--path` iteration loop. A command that needs them will require them once wired (3.x/4.x) |
 | 22 | `Store::begin_index` returns an owned `IndexBuild` with `commit()`; `Store` no longer tracks the in-progress build | Return `&Connection` from `&mut Store`, then `finish_index` on `Store` | The borrow blocked holding the connection across an async pipeline while later calling finish, and mixed a sync finish with an async build. An owned guard survives the whole run and aborting is just a drop |
-| 23 | All DDL lives in one `schema` module: `INDEX_TABLES` applied by `begin_index`, `CACHE_TABLES` by `open` | Per-phase DDL scattered in each step | `index.db` is disposable, so no migrations or versioning; one file keeps the whole shape reviewable as phases 1–5 add tables. Lists are empty until 1.5 |
+| 23 | All DDL lives in one `schema` module: `INDEX_TABLES` applied by `begin_index`, `CACHE_TABLES` by `open` | Per-phase DDL scattered in each step | `index.db` is disposable, so no migrations or versioning; one file keeps the whole shape reviewable as phases 1–5 add tables |
 | 24 | A working dummy `annatar.toml` is committed (data dir `.annatar`, gitignored) | No config in the repo | The binary's default config now loads out of the box; secrets still come only from the environment, so the file stays committable |
 | 25 | Generated sources detected by directory name (`generated`, `generated-sources`), pruned anywhere | Parse Maven/Gradle build files | Language/build-system agnostic, cheap, and testable; revisit if a repo names its tree differently |
 | 26 | `--path` is a literal path prefix (`Path::starts_with`), not a glob | Glob/pattern matching | The plan calls it a prefix; prefix semantics cover both a directory and a single file with no pattern engine |
@@ -133,6 +144,11 @@ the decisions taken, and the tradeoffs behind them.
 | 35 | Javadoc is cleaned (delimiters and leading `*` stripped) and only the immediately preceding `block_comment` counts | Store raw comment / search further back | Clean text goes straight into the LLM prompt; a comment separated by code is not a doc comment for the declaration |
 | 36 | Role precedence puts `Configuration` above `Component` (plan lists component first) | Follow the plan's list order verbatim | `@Configuration` is a specialization of `@Component`, so it is the more specific role; classes carrying both are configurations |
 | 37 | Spring Data repository = known base-interface list or a superinterface simple name ending in `Repository`; the type's own name does not matter | Match the type's own name too / use imports for exactness | The `extends` chain is what makes it a Spring Data repo; own-name matching would tag unrelated interfaces. Import resolution is deferred |
+| 38 | `symbols` table lives in `INDEX_TABLES` with `fqn UNIQUE`, an in-memory fqn→id map for `parent_id`, and `INSERT OR IGNORE` with first-definition-wins on duplicates | Resolve parents by fqn subquery, or error on duplicates | The parser is pre-order so parents are always written first; a stray duplicate must not orphan the real symbol's children |
+| 39 | `content_hash` = blake3(javadoc + `\n` + source slice); annotations stored as a JSON array string | Hash source only / newline-join annotations | A doc-only edit must invalidate later summaries; JSON survives multi-line annotation text |
+| 40 | `kind`/`role` stored as lower-case strings via `as_str()`, part of the on-disk contract | Store the Rust enum via an integer/serde tag | The index is inspected by SQL and later the MCP tools; readable stable strings are the simplest contract |
+| 41 | `show::render` loads the whole `symbols` table, builds a child map in memory, recurses with an explicit stack | One query per node / recursive CTEs | POC-scale tables make this cheap and it avoids async recursion; revisit when the index grows |
+| 42 | `IndexStats.files` counts files that produced a symbol; a genuinely empty or unparseable file counts as `skipped` | Count every walked file as `files` | Keeps `files + skipped` = walked, and treats "nothing to index" uniformly until the parser can report parse-error vs empty |
 
 ## Open questions
 
@@ -143,8 +159,10 @@ the decisions taken, and the tradeoffs behind them.
 | 3 | Should `jira` / `ollama` sections become optional per command (e.g. `show` may not need Jira)? | 0.1 | resolved — both sections are now `Option`; commands require them when wired |
 | 4 | `--path` is currently a `String`; make it a `PathBuf` once the walker lands (1.1)? | 0.1 | resolved — now `PathBuf` |
 | 5 | Should `cache.db` use WAL for concurrent reader access (MCP server)? The index stays rollback-journal so rename is single-file. | 0.2 | open, defer |
-| 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | open |
+| 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | resolved — `Store::open_index` returns a read connection; 6.1 will reopen on file replace |
 | 7 | Is `data_dir` resolved relative to the cwd or to the config file's directory? | 0.2 | resolved — relative to the config file's directory (also applies to `repo`) |
 | 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | resolved — one `schema` module (decision 23) |
 | 9 | Walker uses `parents(false)`: if `repo` ever points at a subdirectory of a larger checkout, `.ignore`/`.gitignore` above it are not read. Acceptable? | 1.1 | open, defer — fine while `repo` is a repo root |
 | 10 | `--path` is a literal prefix; should it accept globs (e.g. `src/main/java/com/acme/**`)? | 1.1 | open, defer — literal prefix matches the plan wording |
+| 11 | A valid but symbol-less file (e.g. `package-info.java`) is counted `skipped` like a parse error. Distinguish parse-error vs empty? | 1.5 | open — resolve before 2.3 reports run quality; needs `parse_file` to signal a parse failure |
+| 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |

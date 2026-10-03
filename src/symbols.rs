@@ -32,6 +32,19 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
+    /// The stable lowercase text stored in `symbols.kind`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SymbolKind::Class => "class",
+            SymbolKind::Interface => "interface",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Record => "record",
+            SymbolKind::Annotation => "annotation",
+            SymbolKind::Method => "method",
+            SymbolKind::Constructor => "constructor",
+        }
+    }
+
     /// Whether this kind is a type (as opposed to a method or constructor).
     pub fn is_type(self) -> bool {
         matches!(
@@ -55,6 +68,20 @@ pub enum Role {
     Component,
     Configuration,
     Entity,
+}
+
+impl Role {
+    /// The stable lowercase text stored in `symbols.role`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Controller => "controller",
+            Role::Service => "service",
+            Role::Repository => "repository",
+            Role::Component => "component",
+            Role::Configuration => "configuration",
+            Role::Entity => "entity",
+        }
+    }
 }
 
 /// A named symbol in one source file: a type or a method/constructor.
