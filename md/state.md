@@ -10,7 +10,7 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 1 — Symbols |
+| Phase | 1 — Symbols (Phase 1 audit remediation) |
 | Step | 1.5 Write symbols and `show` — **done** (Phase 1 complete) |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
@@ -94,9 +94,12 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- 2.1 History for a span: `git log -L <start>,<end>:<file>` via
-  `std::process::Command`, with a custom `--format` and record delimiter. Note
-  behaviour on renamed files in the PR.
+- Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
+  items `H1`–`H9` in order. This is the active queue before Phase 2.1. Start
+  with **H1** (parse contract + parser reuse), which unblocks 2.3.
+- After the remediation series: 2.1 History for a span:
+  `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
+  `--format` and record delimiter. Note behaviour on renamed files in the PR.
 
 ## Step log
 
