@@ -10,12 +10,87 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation R0–R7 complete, R8 pending (product owner) |
-| Step | R7 Doc drift — **done** |
+| Phase | 2 — History and ticket keys (**complete**; open #18 closed by R8); Phase 2 audit remediation R0–R8 complete |
+| Step | R8 Real-repo run — **done** (release build, verified gates) |
 | Last updated | 2026-10-03 |
-| Toolchain | rustc 1.97.0, edition 2024 |
+| Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **R8 Real-repo run.** Indexed `argus` (Greenland, single-module Java
+  backend, 217 Java files, 1375 commits; mounted at `/Repos/argus`), which
+  avoids the multi-module gap of open #13. Numbers are from a `--release`
+  build on rustc 1.99.0 (linux/aarch64).
+
+  | | |
+  | --- | --- |
+  | Files / symbols | 217 / **960** (671 method, 213 class, 58 constructor, 12 interface, 4 annotation, 2 enum) |
+  | Cold run | **14.97 s** — 0 hits / 960 misses / 0 skipped → **15.6 ms/symbol** |
+  | Warm run | **1.92 s** (and 1.93 s again) — 960 hits / 0 misses → 2.0 ms/symbol, **~7.8×** |
+  | `--path` subset | 54 files / 247 symbols warm in **0.52 s** |
+  | Stored | 2920 `symbol_commits`, 1821 `symbol_tickets` rows, 79 distinct keys |
+  | **Ticket coverage** | **888 / 960 symbols = 92.5 %** with ≥1 ticket |
+  | Degradation | 0 empty, 0 parse errors, 0 unreadable, 0 history-skipped |
+  | On disk | `index.db` 1.37 MB, `cache.db` 0.96 MB |
+
+  The R1 invariant `hits + misses + skipped == symbols` holds on both runs
+  (0+960+0 and 960+0+0). Every symbol got history; no file fell into the
+  untracked/failed path.
+
+  **The cold run is git-bound, not CPU-bound.** The same run on the debug
+  binary took 15.02 s / 2.05 s — within noise of release. The cold run spends
+  6.7 s of CPU across 15.0 s wall (**44 % CPU**), i.e. most of it is spent
+  waiting on sequential `git log -L` subprocesses. Optimising the Rust side
+  cannot move this number; only cutting or overlapping git calls can (see
+  open #17).
+
+  **Spot-checked against git, not just counted.** For
+  `AuthDataCacheRest#findUsers(String)` the stored commits are exactly the four
+  `git log -L` reports, same shas and order. **R3 (Javadoc span) is live on
+  real data:** of 40 sampled Javadoc'd symbols, 2 have a span whose history
+  differs from the declaration-only span, and in both the stored set matches
+  the Javadoc-inclusive `-L` exactly. **R2 (dirty tree) is live:** shifting
+  lines in one file of a clone produced exactly one summary warning, 6 misses
+  for that file's 6 symbols and **zero** cache writes (960 rows before and
+  after); after committing, the rows were rewritten and the next run was 960
+  hits. Non-`GRLD` keys in subjects (`RDRK-2380`) are correctly not extracted.
+
+  **Finding 5 (keys in merge commits) — measured, no action needed.** 336
+  merges (229 mention a key) vs 1039 non-merges (760 mention a key), but only
+  **8 of 194** distinct keys appear *exclusively* in merge subjects/bodies
+  (4 %). A first-parent/merge-message pass would buy ~4 % of keys; **not**
+  worth a follow-up item before Phase 4.
+
+  **Finding 8 (type `-L` ≈ file history) — the premise does not hold here, so
+  the cold-run lever on open #17 is withdrawn.** For 30 sampled top-level
+  types, the stored span history equals `git log -- <file>` in only 9 cases,
+  and the span yields **1.89× more** commits on average (e.g.
+  `AuthDataCacheRest`: 24 vs 18). `git log -- <file>` applies history
+  simplification and drops commits that are TREESAME through a merge, which
+  `-L` still reports (`--full-history` gives 33). Substituting it would *lose*
+  roughly a quarter of a type's commits, so it is a correctness regression,
+  not a free speedup.
+
+  **New finding (not in the audit): a `--path` run narrows the whole index.**
+  `index.db` is rebuilt into a temp file and atomically renamed on every run,
+  so a `--path` run leaves an index containing *only* that prefix, and
+  `--path <missing-dir>` (the "missing prefix → empty list" contract kept by
+  R6, D-v) leaves it with **0 symbols** — `show` then fails for every symbol
+  in the repo. Nothing in `plan.md`, `AGENTS.md` or `README.md` says the flag
+  is destructive; it is documented as "limits a run to part of the repo, for
+  fast iteration". Logged as open #19 for R9/J4 to resolve.
+
+  **Toolchain installed; the gates ran for the first time.** Earlier phases
+  recorded test counts without `cargo` being present in the container. A
+  stable toolchain is now installed (rustup 1.29.1 → rustc 1.99.0, via
+  `static.rust-lang.org`; the proxy allowlist needed subdomain entries for the
+  Rust domains). On rustc 1.99.0, two versions newer than the recorded 1.97.0:
+  `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings`
+  clean, `cargo test` **80 lib + 1 integration passed, 0 failed**. The
+  `#[ignore]` benchmark passes its R5 count assertions; on release it is cold
+  2.42 s, warm 0.30 s, changed 0.52 s (the recorded 3.41 / 0.39 / 0.72 were
+  debug). Every previously claimed-but-unverified green gate is now actually
+  verified.
 
 - **R7 Doc drift.** (21) `project.md` no longer contradicts the ground
   rules: storage is two libSQL files (`index.db` portable and atomically
@@ -382,13 +457,12 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Product owner:** R8 — index a real GRLD repo after R1–R7 (release
-  build, cold + warm), record files, symbols, cold/warm time, ms/symbol and
-  ticket coverage (open #18, informs #13 and #17); answer the Phase 3
-  decisions J1–J9 in [`audit_phase_2_plan.md`](./audit_phase_2_plan.md) §5
-  and run the token end-to-end test (§3.1) when 3.1 lands.
+- **Product owner:** answer the Phase 3 decisions J1–J9 in
+  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md) §5, and run the token
+  end-to-end test (§3.1) when 3.1 lands. Also: decide open #19 (`--path`
+  narrows the whole index).
 - **Agent:** Phase 3.1 Fetch and parse (needs J1, J2, J9); R9 (staged
-  pipeline, needs J4) before 3.2.
+  pipeline, needs J4, and the natural home for open #19) before 3.2.
 
 ## Step log
 
@@ -422,6 +496,7 @@ the decisions taken, and the tradeoffs behind them.
 | R4 Deterministic git, batched cache writes | done | `LOG_FLAGS` (`--no-color --no-ext-diff --no-show-signature`) + `-s` on `-L`; one cache transaction per file; cold ~2.78 s vs ~3.55 s (debug); 1 config-independence test; 78 tests |
 | R6 Small cleanups | done | `TicketSpan` struct (no production `expect`); `Config.ticket_regex: Regex` via `deserialize_with`, compiled once; `--path` prunes the walk to the prefix path, ancestor `.gitignore` kept; 2 walk tests; decision D-v; 80 tests |
 | R7 Doc drift | done | `project.md` storage/fqn/MCP signatures/broken export fixed; `AGENTS.md` clippy `--all-targets`; README usage + git requirement; findings 8/10/16 recorded as notes; docs only; 80 tests |
+| R8 Real-repo run | done | `argus` (release, rustc 1.99.0): 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (~7.8×), 15.6 ms/symbol, **92.5 % ticket coverage**, 0 degraded; cold run is git-bound (44 % CPU), release ≈ debug; R2/R3 verified live, history spot-checked against git; closes open #18; finding 5 measured (4 % merge-only keys → no action), finding 8 withdrawn; new open #19 (`--path` narrows the index). Toolchain installed: fmt/clippy/`cargo test` (80+1) green for the first time |
 
 ## Decisions and tradeoffs
 
@@ -513,5 +588,6 @@ the decisions taken, and the tradeoffs behind them.
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | resolved by R2 — dirty files get history but never touch the cache; one warning per run (decision D-r) |
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it. Before 6.1, also replace the load-everything `render` (all `symbols`, `symbol_commits`, `symbol_tickets` rows per call) with a subtree query (audit 2, finding 10) |
 | 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | resolved by R5 — `src/test_support.rs`, shared with `tests/benchmark.rs` via `#[path]` (decision D-s) |
-| 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end (R8). Cheaper lever: a top-level type's `-L` span is its whole body (the most expensive call, ~file history), so `git log -- <file>` could replace it (audit 2, finding 8) |
-| 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | open — Phase 2 is marked *complete with deviations* (R0); closed by audit item R8 (real-repo run: symbols, cold/warm time, ticket coverage) before Phase 3.2; may force a decision on #13 |
+| 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end (R8). **R8 measured it:** cold 14.97 s for 960 symbols on `argus` (release), which does not hurt, so parallelism stays deferred — but note the cold run sits at 44 % CPU, waiting on sequential `git log -L` subprocesses, so bounded parallelism (not faster Rust) is the only lever that would move it if a larger repo does start to hurt. The proposed cheaper lever — replacing a top-level type's `-L` with `git log -- <file>` (audit 2, finding 8) — is **withdrawn**: measured over 30 types it matches in only 9 cases and drops ~47 % of the commits (history simplification hides TREESAME-through-merge commits that `-L` reports), so it would lose history rather than save time |
+| 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | **resolved** (R8) — `argus` indexed end to end: 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (release), 92.5 % ticket coverage. Single-module, so #13 is still untested by a real repo |
+| 19 | A `--path` run rebuilds `index.db` wholesale, so it leaves an index holding only that prefix, and a missing prefix empties it (`show` then fails repo-wide). Should `--path` merge into the existing index, refuse to replace it, or is narrowing intended and merely undocumented? | R8 | open — found by the R8 run; decide with R9/J4 (the staged pipeline owns the build until commit), or document the flag as destructive |

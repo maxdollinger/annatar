@@ -38,8 +38,13 @@ I checked every finding against the code at `4ff0c8b` and the uncommitted
 | 24–27 | Confirmed | For 27: the span starts at `declaration.start_position()` (`symbols.rs:299`). A Javadoc is a preceding sibling comment, so it falls outside `-L`, but `content_hash` includes it. |
 | 28–37 | Confirmed as gaps | |
 
-**Not re-verified:** `cargo` isn't installed in this container either, so fmt,
-clippy and tests weren't run. Run all three before starting R1.
+**Not re-verified at the time:** `cargo` wasn't installed in this container, so
+fmt, clippy and tests weren't run. ~~Run all three before starting R1.~~
+**Resolved during R8:** a stable toolchain is now installed (rustc 1.99.0) and
+all three are green (`cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test` = 80 lib + 1
+integration). The container's proxy needed subdomain entries for the Rust
+domains it already allowlisted.
 
 ## 2. Work items at a glance
 
@@ -352,3 +357,4 @@ Never paste the token into chat, `annatar.toml` or a fixture. Scrub
 | R4 | perf(history): suppress diff output and batch cache writes | Benchmark A/B via `git stash`, 3 runs each: cold 2.74/2.87/2.73 s vs 3.64/3.69/3.31 s |
 | R6 | refactor: ticket spans, compiled ticket regex, pruned --path walk | Kept the "missing prefix → empty list" contract instead of the plan's "error naming the path" (behaviour change not needed for the finding); pruning via `filter_entry` instead of starting at `repo/prefix` to keep ancestor `.gitignore` semantics |
 | R7 | docs: fix phase 2 doc drift | Also recorded the §6 deferrals (8 → plan 4.4 + open #17, 10 → open #15, 16 → plan Later) |
+| R8 | docs(state): record the real-repo run | Target was `argus` (single-module, mounted), not `grld-spring-auth`. Rust toolchain installed (rustc 1.99.0), so fmt/clippy/test ran for the first time — all green (80+1). Release build: 217 files / 960 symbols, cold 14.97 s, warm 1.92 s, 92.5 % ticket coverage; cold is git-bound at 44 % CPU, so debug measured the same. Finding 5 measured: only 8 of 194 keys are merge-only (4 %), so no merge-message pass. Finding 8 **withdrawn**: a type's `-L` is *not* ≈ file history here (matches 9/30, and `git log -- <file>` drops ~47 % of the commits), so the open #17 lever would lose history. R2 and R3 verified live on real data. New open #19: a `--path` run rebuilds `index.db` wholesale and so narrows (or, on a missing prefix, empties) the index |

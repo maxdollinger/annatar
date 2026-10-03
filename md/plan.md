@@ -76,13 +76,13 @@ Run `git log -L <start>,<end>:<file>` via `std::process::Command` with a custom 
 *Goal:* for every symbol (types and members), its commits and ticket keys with the dates needed to pick "first" and "most recent".
 Tables: `symbol_commits(symbol_id, sha, date, subject)` and `symbol_tickets(symbol_id, ticket_key, first_date, last_date)`. Keys come from the configured regex on subject and body. Commit subjects are kept as a fallback for when a ticket is unavailable. `show` lists both.
 *Done when:* tests cover multiple, duplicate and missing keys; `show` on a real symbol lists its tickets.
-*Deviation:* verified on a scratch git repo, not a real one; closed by the real-repo run (audit item R8, `state.md` open #18).
+*Deviation:* verified on a scratch git repo, not a real one; **closed** by the real-repo run (audit item R8): `argus`, 960 symbols, 92.5 % with ≥1 ticket, history spot-checked against `git log -L`.
 
 **2.3 Measure**
 *Goal:* a full run on the target repo is fast enough to iterate on daily.
 If it isn't, add bounded parallelism (results written by one writer) or a history cache in `cache.db` keyed by fqn + content hash + the file's last commit sha.
 *Done when:* run time is noted in the PR and acceptable.
-*Deviation:* measured on a synthetic benchmark repo by product-owner choice (`state.md` D-p); the target-repo cold/warm numbers come from audit item R8 (open #18).
+*Deviation:* measured on a synthetic benchmark repo by product-owner choice (`state.md` D-p); **closed** by audit item R8 — `argus`, cold 14.97 s / warm 1.92 s for 960 symbols (release build; the cold run is git-subprocess-bound, so debug measured the same).
 
 ## Phase 3 — Jira
 
