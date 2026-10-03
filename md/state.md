@@ -11,11 +11,22 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H4 Read path has no side effects — **done** |
+| Step | H5 Surface decode failures — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H5 Surface decode failures.** `show::parse_annotations` now returns
+  `Result<Vec<String>>`; corrupt `annotations` JSON propagates as an error with
+  the symbol's fqn in the context (`parsing annotations for `<fqn>``), and
+  `write_symbol`/`render` thread the `Result` so a corrupt row fails loudly
+  instead of rendering as "none". `symbols::text` stays infallible but logs a
+  `tracing::warn!` with the node kind and byte range on a `utf8_text` failure,
+  then returns the empty string (tree-sitter spans never split a UTF-8 char, so
+  this is the proportionate signal). New `show` test inserts a row with
+  `annotations = 'not json'` via `IndexBuild` and asserts the error names the
+  fqn. Decision D-e (H5). 49 tests, green.
 
 - **H4 Side-effect-free read path.** Added `store::IndexReader`
   (`connection()` + `open(data_dir)`) that opens only `index.db` with
@@ -137,8 +148,8 @@ the decisions taken, and the tradeoffs behind them.
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
   items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1
-  through H4 are done; next is **H5** (surface decode failures instead of
-  swallowing them).
+  through H5 are done; next is **H6** (de-duplicate `Symbol` construction and
+  walk annotations once).
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -159,6 +170,7 @@ the decisions taken, and the tradeoffs behind them.
 | H2 Bounds-safe `content_hash` | done | `.get(start..end)` + `Result`; out-of-range span errors with fqn/span context; unit test; decision D-b |
 | H3 Enforce foreign key | done | `PRAGMA foreign_keys = ON` per build/read connection; dangling `parent_id` errors and is not stored (libSQL verified); valid parent-child insert works; decision D-c |
 | H4 Side-effect-free read path | done | `IndexReader::open` read-only; `Store::open_index`/`data_dir`/`cache_path` removed; `show` creates nothing; 2 reader tests; decision D-d; 48 tests |
+| H5 Surface decode failures | done | corrupt annotations error with the fqn; `text()` warns with kind/span and returns empty; 1 show test; decision D-e; 49 tests |
 
 ## Decisions and tradeoffs
 
@@ -212,6 +224,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-c (H3) | Enable `PRAGMA foreign_keys = ON` per index connection (build in `begin_index`, read in `open_index`) | Drop the `REFERENCES` clause | Keeps the schema's advertised integrity real; pre-order insert already satisfies it, so enabling is safe. SQLite/libSQL is per-connection and the pragma is a no-op inside a transaction, so it runs right after `connect`. Empirically, `INSERT OR IGNORE` does not suppress an FK violation (it errors), so a linking bug fails loudly |
 | 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
 | D-d (H4) | `IndexReader::open(data_dir)` returns a read-only reader; `Store::open_index` is removed; `show` no longer opens `Store` | Keep opening read-write and fix only the doc; or keep both open paths | The read path must not create `cache.db`/the data dir; a single read entry point becomes the contract 6.1 reuses. `_db` anchors the connection (decision 18) |
+| D-e (H5) | Corrupt annotation JSON is an error carrying the symbol fqn; `symbols::text` logs `tracing::warn!` (node kind + byte range) and returns empty | Make every text helper fallible | JSON corruption is a real, cheap-to-propagate failure; a UTF-8 failure is impossible for valid tree-sitter spans, so a log is the proportionate signal instead of rippling `Result` through every parser helper |
 
 ## Open questions
 

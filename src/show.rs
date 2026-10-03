@@ -64,7 +64,7 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
     }
 
     let mut out = String::new();
-    write_symbol(root, &children, 0, &mut out);
+    write_symbol(root, &children, 0, &mut out)?;
     Ok(out)
 }
 
@@ -89,7 +89,7 @@ fn write_symbol(
     children: &HashMap<i64, Vec<&StoredSymbol>>,
     depth: usize,
     out: &mut String,
-) {
+) -> Result<()> {
     let indent = "  ".repeat(depth);
     let mut header = format!("{indent}{} [{}]", symbol.fqn, symbol.kind);
     if let Some(role) = &symbol.role {
@@ -106,7 +106,8 @@ fn write_symbol(
     ));
     out.push_str(&format!("{field}- signature: {}\n", symbol.signature));
 
-    let annotations = parse_annotations(&symbol.annotations);
+    let annotations = parse_annotations(&symbol.annotations)
+        .with_context(|| format!("parsing annotations for `{}`", symbol.fqn))?;
     if !annotations.is_empty() {
         out.push_str(&format!(
             "{field}- annotations: {}\n",
@@ -122,13 +123,14 @@ fn write_symbol(
 
     if let Some(list) = children.get(&symbol.id) {
         for child in list {
-            write_symbol(child, children, depth + 1, out);
+            write_symbol(child, children, depth + 1, out)?;
         }
     }
+    Ok(())
 }
 
-fn parse_annotations(raw: &str) -> Vec<String> {
-    serde_json::from_str(raw).unwrap_or_default()
+fn parse_annotations(raw: &str) -> Result<Vec<String>> {
+    serde_json::from_str(raw).context("decoding annotations JSON")
 }
 
 #[cfg(test)]
@@ -203,6 +205,33 @@ com.acme.show.Widget [class]
         assert!(
             format!("{err:#}").contains("com.acme.show.Missing"),
             "error should name the missing fqn, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_annotations_error_and_name_the_fqn() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+        build
+            .connection()
+            .execute(
+                "INSERT INTO symbols
+                    (id, parent_id, kind, fqn, file, start_line, end_line, signature, annotations, content_hash)
+                 VALUES (1, NULL, 'class', 'com.acme.show.Broken', 'Broken.java', 1, 1, 'class Broken', 'not json', 'hash')",
+                (),
+            )
+            .await
+            .unwrap();
+        build.commit().unwrap();
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let err = render(reader.connection(), "com.acme.show.Broken")
+            .await
+            .expect_err("corrupt annotations should fail rendering");
+        assert!(
+            format!("{err:#}").contains("com.acme.show.Broken"),
+            "error should name the fqn, got: {err:#}"
         );
     }
 }

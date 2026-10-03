@@ -650,9 +650,18 @@ fn qualify(package: &str, name: &str) -> String {
 }
 
 fn text(node: Node<'_>, source: &str) -> String {
-    node.utf8_text(source.as_bytes())
-        .unwrap_or_default()
-        .to_string()
+    match node.utf8_text(source.as_bytes()) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            tracing::warn!(
+                kind = node.kind(),
+                start_byte = node.start_byte(),
+                end_byte = node.end_byte(),
+                "source span is not valid UTF-8; using an empty string"
+            );
+            String::new()
+        }
+    }
 }
 
 #[cfg(test)]
