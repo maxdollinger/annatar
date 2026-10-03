@@ -1,4 +1,5 @@
 pub mod config;
+pub mod history;
 pub mod indexer;
 pub mod schema;
 pub mod show;
