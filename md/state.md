@@ -10,12 +10,28 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 1 — Symbols (Phase 1 audit remediation complete) |
-| Step | H8 Doc drift, test smells and minor cleanups — **done** |
+| Phase | 2 — History and ticket keys |
+| Step | 2.1 History for a span — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **2.1 History for a span.** New `history` module: `history_for_span(repo,
+  file, start_line, end_line) -> Result<Vec<Commit>>` shells out to
+  `git -C <repo> log -L <start>,<end>:<file>` and parses only the format
+  records, discarding the diff hunks. `Commit { sha, date, subject, body }`,
+  `date` as strict ISO 8601 (`%aI`). The format (`%x1e%H%x1f%aI%x1f%s%x1f%b%x1d`)
+  uses ASCII control chars as record/field/end delimiters, so commit text can
+  never split a record. Records come back newest first (`git log` order), so the
+  last element is the commit that introduced the lines. A non-zero git exit
+  (untracked file, out-of-range span, non-repo) is an `anyhow` error carrying
+  git's stderr, never an empty list. Empirically documented in the module doc:
+  `git log -L` **does** follow renames via git's own rename detection (same
+  machinery as `git blame`), and `--follow` is rejected by git when combined
+  with `-L` (`fatal: --follow requires exactly one pathspec`) and unnecessary.
+  Six unit tests on scratch git repos (no network); 57 tests, green. Decision
+  D-k (2.1).
 
 - **H8 Doc drift, test smells and minor cleanups.** Five hygiene findings closed
   with no behaviour change. (13) Decision 41's wording now describes what
@@ -207,10 +223,12 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2.1 History for a span: `git log -L <start>,<end>:<file>` via
-  `std::process::Command`, with a custom `--format` and record delimiter. Note
-  behaviour on renamed files in the PR. Phase 1 audit remediation (`H1`–`H9`) is
-  complete; this is now the active queue.
+- Phase 2.2 Store history and ticket keys: run history per symbol (types and
+  members), extract ticket keys with the configured `ticket_regex` from subject
+  and body, and persist `symbol_commits(symbol_id, sha, date, subject)` and
+  `symbol_tickets(symbol_id, ticket_key, first_date, last_date)`. `show` lists
+  both. Keyed by fqn for caches later; commit subjects kept as the fallback for
+  when a ticket is unavailable.
 
 ## Step log
 
@@ -233,6 +251,7 @@ the decisions taken, and the tradeoffs behind them.
 | H7 Batch symbol writes in a transaction | done | one transaction wraps all symbol writes; committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` (no `IndexBuild::transaction()`); 1 store rollback test; decision D-g; 51 tests |
 | H9 Narrow walker pruning of `build`/`generated` | done | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample out of source root; 1 new walker test; decision D-h, D-j; 52 tests |
 | H8 Doc drift, test smells and minor cleanups | done | decision 41 wording corrected, deep-nesting open question added; `minimal_without` asserts presence/removal; store helper inserts via `params!`; `relative_path` uses `replace('\\', "/")`; `Config::load` clones instead of `mem::take`; decision D-i; 52 tests |
+| 2.1 History for a span | done | `history::history_for_span` over `git log -L`; control-char `--format`; `Commit {sha,date,subject,body}`, newest first; `-L` follows renames, `--follow` rejected; 6 history tests; decision D-k; 57 tests |
 
 ## Decisions and tradeoffs
 
@@ -291,6 +310,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-g (H7) | Wrap the whole build in one transaction (local to `build_index`), committed before the temp file is renamed | Per-file transactions; an `IndexBuild::transaction()` guard | Fewest round trips and the audit's first lever for the 2.3 batched baseline. A local transaction keeps the commit-before-`build.commit()` ordering explicit in one function and leaves `store.rs` production code untouched; a guard type would not really enforce ordering any harder. On error the transaction is dropped (rollback) before the temp file is discarded, so nothing partial is ever renamed over `index.db`. In libsql 0.9.30 `Connection::transaction()` is `async`, so the begin is `.await`ed (the plan text said sync) |
 | D-h (H9) | Prune skip-dirs only outside source roots (no ancestor named `java`) | Prune by name anywhere (current); add `index.skip_dirs` config | Fixes the false negative with a one-function change; a config escape hatch is deferred to avoid cross-module scope creep |
 | D-i (H8) | Correct decision 41's wording and track deep-nesting overflow as an open question | Rewrite `show` to an explicit stack now | Doc/behaviour drift is the actual finding; `show`'s plain recursion is fine at POC scale, and reworking rendering for a pathological input is unwarranted until a real index needs it |
+| D-k (2.1) | `history_for_span` shells out to `git log -L` and parses a control-char-delimited `--format` (`%x1e`…`%x1d`), returning `Commit { sha, date (ISO `%aI`), subject, body }` newest first | A pure-Rust git implementation; `git blame` + `git show`; diff parsing | `-L` already tracks a line range backwards through history (including renames), which is exactly the per-symbol history 2.2 needs. Control chars can't appear in commit text, so diff hunks after the format record are dropped safely. Newest-first preserves git's order so 2.2 can take the last element as "introduced". A non-zero git exit is surfaced as an error rather than an empty history, so a misconfigured repo fails loudly |
 
 ## Open questions
 
@@ -309,5 +329,5 @@ the decisions taken, and the tradeoffs behind them.
 | 11 | A valid but symbol-less file (e.g. `package-info.java`) is counted `skipped` like a parse error. Distinguish parse-error vs empty? | 1.5 | resolved by H1 — `ParsedFile.parse_error` separates them; `IndexStats` reports `empty` / `parse_errors` / `unreadable` |
 | 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
-| 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | open — decide handling (error, warn, or blame working tree) when 2.1 lands |
+| 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | partially resolved by 2.1 — renamed files are fine (`git log -L` follows renames by default; verified). Remaining: a **dirty** working tree's stored line numbers come from the working copy, while `-L` resolves the range against committed revisions, so uncommitted edits can mis-attribute. 2.2 runs history before/while writing symbols; decide whether to warn on a dirty tree or accept it for the POC |
 | 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
