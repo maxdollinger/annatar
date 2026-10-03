@@ -40,7 +40,9 @@ use crate::history::{self, Commit, HistoryCache};
 use crate::jira::{FetchError, Ticket};
 use crate::store::Store;
 use crate::symbols::{JavaParser, Symbol};
-use crate::tickets::{CachedTicket, Fetched, TicketCache, TicketFetch, fetch_with_retry};
+use crate::tickets::{
+    CachedTicket, Fetched, TicketCache, TicketFetch, check_auth_with_retry, fetch_with_retry,
+};
 use crate::walk;
 
 /// A summary of one index run.
@@ -391,10 +393,13 @@ async fn index_history(
 /// `tickets_failed`, not cached, so the next run retries it.
 ///
 /// Before the first fetch (never on a run with nothing to fetch) the source's
-/// auth check runs once and counts as one Jira request: rejected credentials
-/// fail the run before any key is fetched, so a server that answers every
-/// request with a plain 403 (Jira Cloud given a bearer token) cannot get every
-/// key cached as unavailable. Any other check failure skips all fetches like
+/// auth check runs once, with the fetches' 429 retries, each request counted
+/// in `jira_requests`: rejected credentials fail the run before any key is
+/// fetched, so a server that answers every request with a plain 403 (Jira
+/// Cloud given a bearer token) cannot get every key cached as unavailable. A
+/// 401 for a missing scope is inconclusive (`myself` needs a scope that
+/// reading issues does not): it is logged at debug and the fetches go ahead,
+/// where a 401 fails the run. Any other check failure skips all fetches like
 /// the circuit breaker: one warning, every missing key `tickets_not_fetched`.
 ///
 /// A transport failure or a 429 that outlasts its retries trips a circuit
@@ -465,14 +470,21 @@ async fn fetch_tickets(
     if missing.is_empty() {
         return Ok(());
     }
-    stats.jira_requests += 1;
-    match jira.source.check_auth().await {
+    let requests = Arc::new(AtomicUsize::new(0));
+    match check_auth_with_retry(jira, &requests).await {
         Ok(()) => {}
+        Err(err @ FetchError::Unauthorized { scope: true, .. }) => {
+            tracing::debug!(
+                error = %err,
+                "Jira auth check inconclusive (token lacks the scope for /myself); fetching anyway"
+            );
+        }
         Err(err @ FetchError::Unauthorized { .. }) => {
             return Err(anyhow::Error::new(err)).context("checking Jira credentials");
         }
         Err(err) => {
             stats.tickets_not_fetched += missing.len();
+            stats.jira_requests += requests.load(Ordering::Relaxed);
             tracing::warn!(
                 error = %err,
                 remaining = missing.len(),
@@ -481,7 +493,6 @@ async fn fetch_tickets(
             return Ok(());
         }
     }
-    let requests = Arc::new(AtomicUsize::new(0));
     let mut pending = missing.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
     let mut tripped = false;
@@ -2154,7 +2165,7 @@ public class UserService {
         let data = tempfile::tempdir().unwrap();
         index_with(repo.path(), data.path(), None).await.unwrap();
         let source = FakeSource::new();
-        source.script_auth(Answer::Unauthorized);
+        source.script_auth(&[Answer::Unauthorized]);
         source.script("GRLD-1", &[Answer::Unavailable(403)]);
         source.script("GRLD-2", &[Answer::Unavailable(403)]);
 
@@ -2182,7 +2193,7 @@ public class UserService {
         let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
         let data = tempfile::tempdir().unwrap();
         let source = FakeSource::new();
-        source.script_auth(Answer::Transport);
+        source.script_auth(&[Answer::Transport]);
         source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
 
         let stats = index_with(
@@ -2198,6 +2209,85 @@ public class UserService {
         assert_ticket_buckets(&stats);
         assert_eq!(source.calls(), 0);
         assert!(ticket_cache_keys(data.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scope_mismatch_on_the_auth_check_still_fetches() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script_auth(&[Answer::ScopeMismatch]);
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 4)),
+        )
+        .await
+        .expect("a scope-limited auth check is inconclusive");
+
+        assert_eq!(stats.tickets_fetched, 1);
+        assert_eq!(stats.jira_requests, 2);
+        assert_eq!(source.auth_checks(), 1);
+        assert_eq!(ticket_cache_keys(data.path()).await, vec!["GRLD-1"]);
+    }
+
+    #[tokio::test]
+    async fn scope_mismatch_on_a_fetch_fails_the_run_and_caches_nothing() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script_auth(&[Answer::ScopeMismatch]);
+        source.script("GRLD-1", &[Answer::ScopeMismatch]);
+
+        let err = index_with(repo.path(), data.path(), Some(&fake::instant(source, 4)))
+            .await
+            .expect_err("a fetch 401 is fatal");
+
+        assert!(format!("{err:#}").contains("read:jira-work"), "{err:#}");
+        assert!(ticket_cache_keys(data.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_auth_check_is_retried_before_fetching() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script_auth(&[
+            Answer::RateLimited(None),
+            Answer::Ok(fake::ticket("GRLD-1")),
+        ]);
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 4)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(source.auth_checks(), 2);
+        assert_eq!(stats.tickets_fetched, 1);
+        assert_eq!(stats.jira_requests, 3);
+
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script_auth(&[Answer::RateLimited(None)]);
+        let stats = index_with(
+            repo.path(),
+            data.path(),
+            Some(&fake::instant(source.clone(), 4)),
+        )
+        .await
+        .expect("a 429 that outlasts the retries skips fetching");
+
+        let checks = 1 + crate::tickets::MAX_RATE_LIMIT_RETRIES as usize;
+        assert_eq!(source.auth_checks(), checks);
+        assert_eq!(stats.jira_requests, checks);
+        assert_eq!(stats.tickets_not_fetched, 1);
+        assert_eq!(source.calls(), 0);
     }
 
     #[tokio::test]

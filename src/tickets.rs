@@ -9,10 +9,12 @@
 //!
 //! [`TicketFetch`] bundles a [`TicketSource`] with the request policy: the
 //! concurrency cap and the 429 back-off. [`fetch_with_retry`] fetches one key
-//! under that policy and counts the requests it sends. Which outcomes are
+//! and [`check_auth_with_retry`] runs the auth check under that policy; both
+//! count the requests they send. Which outcomes are
 //! cached, skipped or fatal, and when the source's auth check runs, is decided
 //! by the ticket stage in [`crate::indexer`].
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -211,22 +213,47 @@ pub(crate) async fn fetch_with_retry(
             key,
         };
     }
+    let result = with_retry(fetch, &key, requests, || fetch.source.fetch(&key)).await;
+    Fetched { key, result }
+}
+
+/// Run the source's auth check under the same 429 policy as
+/// [`fetch_with_retry`], counting each request in `requests`.
+pub(crate) async fn check_auth_with_retry(
+    fetch: &TicketFetch,
+    requests: &AtomicUsize,
+) -> Result<(), FetchError> {
+    with_retry(fetch, "auth check", requests, || fetch.source.check_auth()).await
+}
+
+/// Send `call` until it is not a 429 or `max_retries` retries are used up,
+/// waiting [`TicketFetch::backoff`] in between; `what` names the request in
+/// the debug log.
+async fn with_retry<T, F, Fut>(
+    fetch: &TicketFetch,
+    what: &str,
+    requests: &AtomicUsize,
+    mut call: F,
+) -> Result<T, FetchError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, FetchError>>,
+{
     let mut retry = 0;
     loop {
         requests.fetch_add(1, Ordering::Relaxed);
-        let result = fetch.source.fetch(&key).await;
-        match result {
+        match call().await {
             Err(FetchError::RateLimited { retry_after }) if retry < fetch.max_retries => {
                 let wait = fetch.backoff(retry_after, retry);
                 tracing::debug!(
-                    key,
+                    request = what,
                     wait_ms = wait.as_millis() as u64,
                     "rate limited; backing off"
                 );
                 tokio::time::sleep(wait).await;
                 retry += 1;
             }
-            result => return Fetched { key, result },
+            result => return result,
         }
     }
 }
@@ -246,6 +273,8 @@ pub(crate) mod fake {
         Ok(Ticket),
         Unavailable(u16),
         Unauthorized,
+        /// A 401 saying the token's scopes do not match the request.
+        ScopeMismatch,
         RateLimited(Option<Duration>),
         Status(u16),
         /// A connection failure.
@@ -262,6 +291,12 @@ pub(crate) mod fake {
                 Self::Unauthorized => Err(FetchError::Unauthorized {
                     basic: false,
                     cloud: false,
+                    scope: false,
+                }),
+                Self::ScopeMismatch => Err(FetchError::Unauthorized {
+                    basic: true,
+                    cloud: false,
+                    scope: true,
                 }),
                 Self::RateLimited(retry_after) => Err(FetchError::RateLimited { retry_after }),
                 Self::Status(status) => Err(FetchError::Status { status }),
@@ -291,12 +326,12 @@ pub(crate) mod fake {
     /// calls. Each call takes the next scripted answer; the last one repeats.
     /// An unscripted key is a 404. Every call yields once, so concurrent calls
     /// really overlap, and the peak number in flight is recorded. The auth
-    /// check answers its own scripted answer (`Ok` by default; any
-    /// [`Answer::Ok`] passes) and is counted apart from fetches.
+    /// check answers from its own script the same way (`Ok` when unscripted;
+    /// any [`Answer::Ok`] passes) and is counted apart from fetches.
     #[derive(Default)]
     pub struct FakeSource {
         script: Mutex<HashMap<String, VecDeque<Answer>>>,
-        auth: Mutex<Option<Answer>>,
+        auth: Mutex<VecDeque<Answer>>,
         auth_checks: AtomicUsize,
         calls: Mutex<Vec<String>>,
         in_flight: AtomicUsize,
@@ -315,8 +350,8 @@ pub(crate) mod fake {
                 .insert(key.to_string(), answers.iter().cloned().collect());
         }
 
-        pub fn script_auth(&self, answer: Answer) {
-            *self.auth.lock().unwrap() = Some(answer);
+        pub fn script_auth(&self, answers: &[Answer]) {
+            *self.auth.lock().unwrap() = answers.iter().cloned().collect();
         }
 
         pub fn auth_checks(&self) -> usize {
@@ -344,10 +379,18 @@ pub(crate) mod fake {
         fn answer(&self, key: &str) -> Answer {
             let mut script = self.script.lock().unwrap();
             match script.get_mut(key) {
-                Some(answers) if answers.len() > 1 => answers.pop_front().unwrap(),
-                Some(answers) => answers.front().cloned().unwrap_or(Answer::Unavailable(404)),
+                Some(answers) => next(answers).unwrap_or(Answer::Unavailable(404)),
                 None => Answer::Unavailable(404),
             }
+        }
+    }
+
+    /// The next scripted answer; the last one repeats.
+    fn next(answers: &mut VecDeque<Answer>) -> Option<Answer> {
+        if answers.len() > 1 {
+            answers.pop_front()
+        } else {
+            answers.front().cloned()
         }
     }
 
@@ -370,7 +413,8 @@ pub(crate) mod fake {
         fn check_auth(&self) -> CheckFuture<'_> {
             Box::pin(async move {
                 self.auth_checks.fetch_add(1, Ordering::SeqCst);
-                match self.auth.lock().unwrap().clone() {
+                let answer = next(&mut self.auth.lock().unwrap());
+                match answer {
                     None | Some(Answer::Ok(_)) => Ok(()),
                     Some(Answer::Hang) => unreachable!("the auth check is never scripted to hang"),
                     Some(answer) => answer.into_result().map(drop),
@@ -469,6 +513,34 @@ mod tests {
             Err(FetchError::RateLimited { .. })
         ));
         assert_eq!(source.calls(), 3 + 4);
+    }
+
+    #[tokio::test]
+    async fn auth_check_retries_a_rate_limit_like_a_fetch() {
+        let source = FakeSource::new();
+        source.script_auth(&[
+            Answer::RateLimited(Some(Duration::from_secs(0))),
+            Answer::RateLimited(None),
+            Answer::Ok(ticket("GRLD-1")),
+        ]);
+        let fetch = instant(source.clone(), 1);
+
+        let requests = AtomicUsize::new(0);
+        assert!(check_auth_with_retry(&fetch, &requests).await.is_ok());
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+
+        source.script_auth(&[Answer::RateLimited(None)]);
+        let requests = AtomicUsize::new(0);
+        assert!(matches!(
+            check_auth_with_retry(&fetch, &requests).await,
+            Err(FetchError::RateLimited { .. })
+        ));
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1 + MAX_RATE_LIMIT_RETRIES as usize
+        );
+        assert_eq!(source.auth_checks(), 3 + 4);
+        assert_eq!(source.calls(), 0);
     }
 
     #[tokio::test]
