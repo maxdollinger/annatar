@@ -42,6 +42,11 @@ pub async fn build_index(
     repo: &Path,
     path_prefix: Option<&Path>,
 ) -> Result<IndexStats> {
+    anyhow::ensure!(
+        repo.is_dir(),
+        "repository path {} is not a directory",
+        repo.display()
+    );
     let files = walk::java_files(repo, path_prefix)?;
     let build = store.begin_index().await?;
     let mut stats = IndexStats {
@@ -62,7 +67,10 @@ pub async fn build_index(
         };
         let symbols = symbols::parse_file(relative, &source)?;
         if symbols.is_empty() {
-            tracing::warn!(path = %relative.display(), "no symbols parsed; skipping file");
+            // A parse error was already logged by `parse_file`; this also
+            // covers valid files with no symbols (`package-info.java`), so it
+            // stays at debug to keep a normal run quiet.
+            tracing::debug!(path = %relative.display(), "no symbols parsed; skipping file");
             stats.skipped += 1;
             continue;
         }
@@ -376,6 +384,21 @@ public class UserService {
 
         let conn = store.open_index().await.unwrap();
         assert_eq!(count(&conn).await, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_repo_is_an_error_not_an_empty_index() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).await.unwrap();
+
+        let err = build_index(&store, Path::new("/does/not/exist"), None)
+            .await
+            .expect_err("a missing repo path should fail");
+
+        assert!(
+            format!("{err:#}").contains("not a directory"),
+            "error should name the bad repo path, got: {err:#}"
+        );
     }
 
     #[tokio::test]
