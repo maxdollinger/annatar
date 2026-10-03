@@ -11,11 +11,23 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols (Phase 1 audit remediation) |
-| Step | H2 Bounds-safe `content_hash` — **done** |
+| Step | H3 Enforce the foreign key — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **H3 Enforce the declared foreign key.** `PRAGMA foreign_keys = ON` now runs
+  on the build connection in `Store::begin_index` (immediately after `connect`,
+  before `schema::create_index`) and on the read connection from
+  `Store::open_index`, via an `enable_foreign_keys` helper. libSQL enforces it
+  per connection: the build tests insert a dangling `parent_id` and observe
+  `FOREIGN KEY constraint failed` with the row not stored (0 rows), while a
+  parent-then-child insert still succeeds. Note: `INSERT OR IGNORE` does **not**
+  swallow an FK violation here (SQLite semantics — `ON CONFLICT` does not cover
+  foreign keys), so a future linking bug fails the insert loudly rather than
+  silently skipping the row. Decision D-c (H3).
+
 
 - **H2 Bounds-safe `content_hash`.** `content_hash` now uses
   `as_bytes().get(start..end)` and returns `anyhow::Result<String>`; an
@@ -112,8 +124,9 @@ the decisions taken, and the tradeoffs behind them.
 ### Next
 
 - Phase 1 audit remediation ([`audit_phase_1_plan.md`](./audit_phase_1_plan.md)),
-  items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1 and
-  H2 are done; next is **H3** (make the declared foreign key real).
+  items `H1`–`H9` in order. This is the active queue before Phase 2.1. H1
+  through H3 are done; next is **H4** (read path has no side effects; honest
+  open; drop dead API).
 - After the remediation series: 2.1 History for a span:
   `git log -L <start>,<end>:<file>` via `std::process::Command`, with a custom
   `--format` and record delimiter. Note behaviour on renamed files in the PR.
@@ -132,6 +145,7 @@ the decisions taken, and the tradeoffs behind them.
 | Pre-Phase-2 review | done | edge-case + CLI verification; missing-repo error; quieter empty-file log; 41 tests |
 | H1 Parse contract + parser reuse | done | `JavaParser`/`ParsedFile`; `IndexStats` buckets `empty`/`parse_errors`/`unreadable`; parser built once per run; resolves open #11; 43 tests |
 | H2 Bounds-safe `content_hash` | done | `.get(start..end)` + `Result`; out-of-range span errors with fqn/span context; unit test; decision D-b |
+| H3 Enforce foreign key | done | `PRAGMA foreign_keys = ON` per build/read connection; dangling `parent_id` errors and is not stored (libSQL verified); valid parent-child insert works; decision D-c |
 
 ## Decisions and tradeoffs
 
@@ -182,6 +196,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-a (H1) | New `JavaParser`/`ParsedFile` API; `IndexStats.skipped` is replaced by `empty`/`parse_errors`/`unreadable`, `files` keeps its meaning | Keep `Ok(vec![])` for both | Distinguishes a broken file from a symbol-less one; resolves open #11; parser reused once per run (one grammar load) |
 | D-j (H1) | Update decision 42 (skip semantics) as above; decision 25 (walker pruning) is unaffected here | — | Decision 25 changes with H9, not H1 |
 | D-b (H2) | An out-of-range symbol span is a hard error carrying the fqn and span; `content_hash` returns `Result` | Clamp the span to the source length and hash the wrong bytes | A span past the end is a parser bug, so the run must fail with context, never panic or hash a truncated slice |
+| D-c (H3) | Enable `PRAGMA foreign_keys = ON` per index connection (build in `begin_index`, read in `open_index`) | Drop the `REFERENCES` clause | Keeps the schema's advertised integrity real; pre-order insert already satisfies it, so enabling is safe. SQLite/libSQL is per-connection and the pragma is a no-op inside a transaction, so it runs right after `connect`. Empirically, `INSERT OR IGNORE` does not suppress an FK violation (it errors), so a linking bug fails loudly |
 | 43 | `build_index` requires `repo` to be an existing directory; zero-symbol files log at debug | Let the walker silently yield nothing on a bad path | A typo in `repo` must fail loudly, not produce an empty index; `package-info.java` is normal, so it must not warn on every run |
 
 ## Open questions
