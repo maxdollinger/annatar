@@ -1,0 +1,38 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "id": "20305",
+  "self": "https://jira.example.com/rest/api/2/issue/20305",
+  "key": "GRLD-305",
+  "fields": {
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/10001",
+      "id": "10001",
+      "description": "A user-facing feature.",
+      "iconUrl": "https://jira.example.com/images/icons/issuetypes/story.svg",
+      "name": "Story",
+      "subtask": false
+    },
+    "summary": "Show invoice PDF download in the customer portal",
+    "description": "Customers can download each invoice as a PDF from the portal.",
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/10002",
+      "name": "Done",
+      "id": "10002",
+      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+    },
+    "customfield_10100": "GRLD-300",
+    "customfield_10101": "Sprint 12",
+    "created": "2024-06-01T08:45:00.000+0200",
+    "updated": "2024-06-20T17:05:00.000+0200"
+  },
+  "renderedFields": {
+    "issuetype": null,
+    "summary": null,
+    "description": "<p>Customers can download each invoice as a PDF from the portal.</p>",
+    "status": null,
+    "customfield_10100": null,
+    "customfield_10101": null,
+    "created": "01/Jun/24 8:45 AM",
+    "updated": "20/Jun/24 5:05 PM"
+  }
+}

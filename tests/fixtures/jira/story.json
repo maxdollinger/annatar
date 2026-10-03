@@ -1,0 +1,41 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "id": "20101",
+  "self": "https://jira.example.com/rest/api/2/issue/20101",
+  "key": "GRLD-101",
+  "fields": {
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/10001",
+      "id": "10001",
+      "description": "A user-facing feature.",
+      "iconUrl": "https://jira.example.com/images/icons/issuetypes/story.svg",
+      "name": "Story",
+      "subtask": false,
+      "hierarchyLevel": 0
+    },
+    "summary": "Users can reset their password by email",
+    "description": "As a user I want to reset my password so that I can log in again.\n\n*Acceptance criteria*\n* A reset link is sent to the registered address\n* The link expires after 30 minutes\n\n||Field||Rule||\n|token|single use|",
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/10002",
+      "name": "Done",
+      "id": "10002",
+      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+    },
+    "priority": { "self": "https://jira.example.com/rest/api/2/priority/3", "name": "Medium", "id": "3" },
+    "labels": ["auth"],
+    "customfield_10014": null,
+    "created": "2024-03-04T09:12:45.000+0100",
+    "updated": "2024-04-02T16:40:03.000+0200"
+  },
+  "renderedFields": {
+    "issuetype": null,
+    "summary": null,
+    "description": "<p>As a user I want to reset my password so that I can log in again.</p>\n\n<p><b>Acceptance criteria</b></p>\n<ul>\n\t<li>A reset link is sent to the registered address</li>\n\t<li>The link expires after 30 minutes</li>\n</ul>\n\n<div class='table-wrap'>\n<table class='confluenceTable'><tbody>\n<tr>\n<th class='confluenceTh'>Field</th>\n<th class='confluenceTh'>Rule</th>\n</tr>\n<tr>\n<td class='confluenceTd'>token</td>\n<td class='confluenceTd'>single use</td>\n</tr>\n</tbody></table>\n</div>\n",
+    "status": null,
+    "priority": null,
+    "labels": null,
+    "customfield_10014": null,
+    "created": "04/Mar/24 9:12 AM",
+    "updated": "02/Apr/24 4:40 PM"
+  }
+}

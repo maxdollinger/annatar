@@ -1,0 +1,60 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "id": "20102",
+  "self": "https://jira.example.com/rest/api/2/issue/20102",
+  "key": "GRLD-102",
+  "fields": {
+    "parent": {
+      "id": "20101",
+      "key": "GRLD-101",
+      "self": "https://jira.example.com/rest/api/2/issue/20101",
+      "fields": {
+        "summary": "Users can reset their password by email",
+        "status": {
+          "self": "https://jira.example.com/rest/api/2/status/10002",
+          "name": "Done",
+          "id": "10002",
+          "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+        },
+        "priority": { "self": "https://jira.example.com/rest/api/2/priority/3", "name": "Medium", "id": "3" },
+        "issuetype": {
+          "self": "https://jira.example.com/rest/api/2/issuetype/10001",
+          "id": "10001",
+          "name": "Story",
+          "subtask": false,
+          "hierarchyLevel": 0
+        }
+      }
+    },
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/10003",
+      "id": "10003",
+      "description": "A small piece of work that's part of a larger task.",
+      "iconUrl": "https://jira.example.com/images/icons/issuetypes/subtask.svg",
+      "name": "Sub-task",
+      "subtask": true,
+      "hierarchyLevel": -1
+    },
+    "summary": "Add expiry timestamp to password reset tokens",
+    "description": "Store {{expires_at}} next to the token and reject expired tokens.",
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/10002",
+      "name": "Done",
+      "id": "10002",
+      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+    },
+    "customfield_10014": null,
+    "created": "2024-03-05T10:00:00.000+0100",
+    "updated": "2024-03-12T15:30:00.000+0100"
+  },
+  "renderedFields": {
+    "parent": null,
+    "issuetype": null,
+    "summary": null,
+    "description": "<p>Store <tt>expires_at</tt> next to the token and reject expired tokens.</p>",
+    "status": null,
+    "customfield_10014": null,
+    "created": "05/Mar/24 10:00 AM",
+    "updated": "12/Mar/24 3:30 PM"
+  }
+}

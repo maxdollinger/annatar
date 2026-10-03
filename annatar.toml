@@ -12,10 +12,15 @@ data_dir = ".annatar"
 ticket_regex = '\bGRLD-\d+\b'
 
 # Jira connection. Optional for now; required once Phase 3 wires Jira fetching.
-# Secrets come from the environment (ANNATAR_JIRA_TOKEN, ANNATAR_JIRA_EMAIL),
-# never from this file.
+# Secrets come from the environment, never from this file:
+#   ANNATAR_JIRA_TOKEN  API token (Cloud) or personal access token (Server/DC)
+#   ANNATAR_JIRA_EMAIL  Cloud only; when set, requests use basic auth
+#                       email:token, otherwise the token is sent as a bearer PAT
 # [jira]
 # base_url = "https://acme.atlassian.net"
+# Custom field holding the epic link (Server/DC), used when an issue has no
+# parent. Unset = ignored.
+# epic_link_field = "customfield_10100"
 
 # Ollama connection. Optional for now; required once Phase 4 wires summaries
 # and embeddings.

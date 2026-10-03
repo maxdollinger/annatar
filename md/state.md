@@ -10,12 +10,33 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 2 — History and ticket keys (**complete**; open #18 closed by R8); Phase 2 audit remediation R0–R8 complete |
-| Step | R8 Real-repo run — **done** (release build, verified gates) |
+| Phase | 3 — Jira (in progress); Phase 2 and its audit remediation R0–R8 complete |
+| Step | 3.1 Fetch and parse — **done** (synthetic fixtures; real-token run pending, J3) |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **3.1 Fetch and parse.** New `jira` module: `Ticket { key, issue_type,
+  summary, description: Option<String>, parent_key }`, a pure
+  `parse_issue(&Value, epic_link_field)`, and an async `JiraClient::fetch`
+  calling `GET /rest/api/2/issue/{key}?expand=renderedFields` with a 30 s
+  timeout. Auth per J1 (`Auth::from_config`: email set → basic, else bearer;
+  missing token is an error). HTML → text via `html2text` (no emphasis
+  markers, table borders or link URLs). Parent from `fields.parent.key`, with
+  the new optional `jira.epic_link_field` as fallback (J9). `FetchError` keeps
+  401 (`Unauthorized`), 403/404 (`Unavailable`), 429 (`RateLimited` with
+  `Retry-After` seconds) and other statuses, invalid keys, transport and
+  parse failures apart for 3.2 (pure `status_error` mapping). Keys are
+  checked to be `[A-Za-z0-9_-]+` before they go into the URL path.
+  **Deviation (J3):** no real Jira token is available to the agent, so the
+  five fixtures in `tests/fixtures/jira/` (story, bug, sub-task with parent,
+  epic child via an epic-link custom field, null description) are *synthetic*,
+  modelled on the REST v2 `renderedFields` shape. The product owner must
+  replace them with scrubbed real captures and run the `#[ignore]`
+  `jira::tests::fetches_real_ticket` (audit §3.1). Not wired into
+  `annatar index` yet (3.2/R9). 12 jira tests + 1 config test (1 ignored);
+  93 tests total.
 
 - **R8 Real-repo run.** Indexed `argus` (Greenland, single-module Java
   backend, 217 Java files, 1375 commits; mounted at `/Repos/argus`), which
@@ -457,12 +478,14 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Product owner:** answer the Phase 3 decisions J1–J9 in
-  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md) §5, and run the token
-  end-to-end test (§3.1) when 3.1 lands. Also: decide open #19 (`--path`
-  narrows the whole index).
-- **Agent:** Phase 3.1 Fetch and parse (needs J1, J2, J9); R9 (staged
-  pipeline, needs J4, and the natural home for open #19) before 3.2.
+- **Product owner:** run the token end-to-end test
+  (`cargo test -- --ignored fetches_real_ticket --nocapture`, audit §3.1),
+  replace the synthetic fixtures in `tests/fixtures/jira/` with scrubbed real
+  captures (open #20), and report the auth mode and parent/epic field shape.
+  Confirm or override the PM defaults for J1, J2, J9 (D-w–D-y), answer J4–J8,
+  and decide open #19 (`--path` narrows the whole index).
+- **Agent:** R9 staged pipeline (needs J4; natural home for open #19), then
+  3.2 Ticket cache.
 
 ## Step log
 
@@ -497,6 +520,7 @@ the decisions taken, and the tradeoffs behind them.
 | R6 Small cleanups | done | `TicketSpan` struct (no production `expect`); `Config.ticket_regex: Regex` via `deserialize_with`, compiled once; `--path` prunes the walk to the prefix path, ancestor `.gitignore` kept; 2 walk tests; decision D-v; 80 tests |
 | R7 Doc drift | done | `project.md` storage/fqn/MCP signatures/broken export fixed; `AGENTS.md` clippy `--all-targets`; README usage + git requirement; findings 8/10/16 recorded as notes; docs only; 80 tests |
 | R8 Real-repo run | done | `argus` (release, rustc 1.99.0): 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (~7.8×), 15.6 ms/symbol, **92.5 % ticket coverage**, 0 degraded; cold run is git-bound (44 % CPU), release ≈ debug; R2/R3 verified live, history spot-checked against git; closes open #18; finding 5 measured (4 % merge-only keys → no action), finding 8 withdrawn; new open #19 (`--path` narrows the index). Toolchain installed: fmt/clippy/`cargo test` (80+1) green for the first time |
+| 3.1 Fetch and parse | done | `jira` module: `Ticket`, pure `parse_issue`, async `JiraClient::fetch` (REST v2, `expand=renderedFields`, 30 s timeout), `Auth` (J1), `FetchError` + `status_error`, `html2text`; `jira.epic_link_field` (J9); `reqwest` 0.13 (`json` + `rustls`); **synthetic** fixtures (J3 deviation, open #20); `#[ignore]` `fetches_real_ticket`; decisions D-w–D-z; 93 tests |
 
 ## Decisions and tradeoffs
 
@@ -567,12 +591,16 @@ the decisions taken, and the tradeoffs behind them.
 | D-t (R3, J0) | The history span starts at the Javadoc (`Symbol.history_start_line`), so a doc-only commit and its ticket belong to the symbol. `start_line` is unchanged for display. The cache table is renamed `history_cache_v2` and the old `history_cache` is dropped on open | Keep the declaration-only span and pin it with a test; bump a version column inside `history_cache` | The content hash already treats the Javadoc as part of the symbol, and doc commits often carry the "why". The key (fqn + hash + file sha) does not change when the span does, so old rows would be silently wrong: dropping the table is the ground-rule answer, and a new name makes the one-off `DROP TABLE IF EXISTS` idempotent |
 | D-u (R4) | `git log` runs with `--no-color --no-ext-diff --no-show-signature`, `-L` with `-s`; history-cache writes are batched in one cache-connection transaction per file | Enforce a minimum git version for `-s` with `-L`; one cache transaction per run | The flags make output independent of the developer's git config and stop git from producing hunks nobody reads; keeping the hunk-tolerant parser avoids a version check. Per file (not per run) bounds what a crash loses to one file's results while still removing the per-symbol fsync |
 | D-v (R6) | `Config.ticket_regex` is a compiled `Regex` (custom `deserialize_with`); `--path` prunes directories off the prefix path inside the walker's `filter_entry` instead of starting the walk at `repo/prefix` | Keep a `String` plus a cached `Option<Regex>`; start `WalkBuilder` at `repo/prefix` | One compile and one error path, reported by the TOML parser with line/column. The default pattern uses `Regex::new(DEFAULT_TICKET_REGEX).expect(..)`: a constant, covered by the config defaults test, unlike the data-dependent `expect` removed from `ticket_span`. Starting the walk at the prefix with `parents(false)` would silently skip the repo-root `.gitignore`; pruning in `filter_entry` keeps the walk equivalent while still never visiting the rest of the repo |
+| D-w (3.1, J1) | Jira auth: `ANNATAR_JIRA_EMAIL` set (non-empty) → basic `email:token` (Cloud API token); otherwise the token is sent as a bearer PAT (Server/DC). A missing or empty `ANNATAR_JIRA_TOKEN` fails `JiraClient::new`. PM default, adopted audit recommendation; product owner may override. | Cloud only; a separate `auth` config key | Both schemes are a few lines and the existing optional `email` already tells them apart; resolves open #1 |
+| D-x (3.1, J2) | `reqwest` 0.13 with `default-features = false`, features `json` + `rustls` (0.13 renamed the old `rustls-tls` feature; it uses aws-lc-rs and the platform certificate verifier), and `html2text` (`plain_no_decorate`, no table borders, no link footnotes) for `renderedFields` HTML. PM default, adopted audit recommendation; product owner may override. | `ureq`/blocking; hand-written HTML stripper; ADF parser via REST v3 | Async fits the tokio runtime and 3.2's bounded concurrency; `html2text` keeps lists, tables and code blocks readable. Accepts the TLS compile cost decision 13 avoided for libSQL. Plain output avoids `**`/URL noise in LLM prompts |
+| D-y (3.1, J9) | `parent_key` = `fields.parent.key`; only when absent, the optional `jira.epic_link_field` custom field (a string key, or an object with `key`). Unset = ignored. PM default, adopted audit recommendation; product owner may override. | Discover the epic-link field via `/rest/api/2/field`; parent only | Cloud covers it via `parent`; Server/DC opts in without code changes |
+| D-z (3.1, J3) | **Deviation:** fixtures under `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape, `jira.example.com`), not real captures; the real-token run is the `#[ignore]` `jira::tests::fetches_real_ticket` (base URL from `ANNATAR_JIRA_URL` or `annatar.toml`, key from `ANNATAR_JIRA_TEST_KEY`; prints only auth mode, key, type, parent and lengths). Also: REST v2 (works on Cloud and Server/DC), `Ticket.key` is the key Jira returns, description `None` when null or blank after conversion, keys outside `[A-Za-z0-9_-]` are rejected before any request | Block 3.1 on a token | No token is available to the agent; parsing is pure, so swapping in real captures only changes test data. Tracked as open #20 |
 
 ## Open questions
 
 | # | Question | Raised at | Status |
 | --- | --- | --- | --- |
-| 1 | Jira auth scheme: Cloud uses email + API token (basic auth), Server/DC often uses a personal access token (bearer). Assume Cloud for now? | 0.1 | open |
+| 1 | Jira auth scheme: Cloud uses email + API token (basic auth), Server/DC often uses a personal access token (bearer). Assume Cloud for now? | 0.1 | resolved (3.1, D-w) — email set → basic, else bearer PAT; PM default, product owner may override |
 | 2 | Config discovery: search parent directories, or add `ANNATAR_CONFIG`? Currently only cwd/`--config`. | 0.1 | open, defer |
 | 3 | Should `jira` / `ollama` sections become optional per command (e.g. `show` may not need Jira)? | 0.1 | resolved — both sections are now `Option`; commands require them when wired |
 | 4 | `--path` is currently a `String`; make it a `PathBuf` once the walker lands (1.1)? | 0.1 | resolved — now `PathBuf` |
@@ -591,3 +619,4 @@ the decisions taken, and the tradeoffs behind them.
 | 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end (R8). **R8 measured it:** cold 14.97 s for 960 symbols on `argus` (release), which does not hurt, so parallelism stays deferred — but note the cold run sits at 44 % CPU, waiting on sequential `git log -L` subprocesses, so bounded parallelism (not faster Rust) is the only lever that would move it if a larger repo does start to hurt. The proposed cheaper lever — replacing a top-level type's `-L` with `git log -- <file>` (audit 2, finding 8) — is **withdrawn**: measured over 30 types it matches in only 9 cases and drops ~47 % of the commits (history simplification hides TREESAME-through-merge commits that `-L` reports), so it would lose history rather than save time |
 | 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | **resolved** (R8) — `argus` indexed end to end: 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (release), 92.5 % ticket coverage. Single-module, so #13 is still untested by a real repo |
 | 19 | A `--path` run rebuilds `index.db` wholesale, so it leaves an index holding only that prefix, and a missing prefix empties it (`show` then fails repo-wide). Should `--path` merge into the existing index, refuse to replace it, or is narrowing intended and merely undocumented? | R8 | open — found by the R8 run; decide with R9/J4 (the staged pipeline owns the build until commit), or document the flag as destructive |
+| 20 | The 3.1 Jira fixtures are synthetic (no token available to the agent). Replace them with scrubbed real `renderedFields` captures (story, bug, sub-task, epic child, empty description) and confirm the auth mode and parent/epic field shape (J3, audit §3.1). | 3.1 | open — **product owner** |

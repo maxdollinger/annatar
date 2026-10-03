@@ -1,6 +1,7 @@
 pub mod config;
 pub mod history;
 pub mod indexer;
+pub mod jira;
 pub mod schema;
 pub mod show;
 pub mod store;

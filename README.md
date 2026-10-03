@@ -17,7 +17,7 @@ For this proof of concept, Annatar targets:
 
 Annatar needs `git` on `PATH`, and the configured `repo` must be a git work tree for history and ticket keys. Otherwise only the structure is indexed, with one warning.
 
-Configure `annatar.toml` (the default file; `--config <FILE>` points elsewhere). Relative paths resolve against the config file's directory. Secrets come only from the environment (`ANNATAR_JIRA_TOKEN`, `ANNATAR_JIRA_EMAIL`).
+Configure `annatar.toml` (the default file; `--config <FILE>` points elsewhere). Relative paths resolve against the config file's directory. Secrets come only from the environment: `ANNATAR_JIRA_TOKEN` (Cloud API token or Server/DC personal access token) and, for Cloud only, `ANNATAR_JIRA_EMAIL` (basic auth when set, bearer otherwise).
 
 ```sh
 cargo build --release                     # binary in target/release/annatar

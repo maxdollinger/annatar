@@ -90,6 +90,7 @@ If it isn't, add bounded parallelism (results written by one writer) or a histor
 *Goal:* for any ticket key, a `Ticket` with key, issue type, summary, plain-text description and parent/epic key.
 Use `reqwest` with the target's auth. Request `expand=renderedFields` and strip the HTML to text, which avoids writing an Atlassian Document Format parser.
 *Done when:* parsing is tested against saved JSON fixtures; an `#[ignore]` test fetches a real ticket.
+*Deviation:* no real Jira token was available, so the fixtures in `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape). The product owner replaces them with scrubbed real captures and runs `jira::tests::fetches_real_ticket` (audit J3, `state.md` D-z, open #20).
 
 **3.2 Ticket cache**
 *Goal:* every distinct key in `symbol_tickets` is in `cache.db`, either with content or marked unavailable.

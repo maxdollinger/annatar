@@ -1,0 +1,37 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "id": "20412",
+  "self": "https://jira.example.com/rest/api/2/issue/20412",
+  "key": "GRLD-412",
+  "fields": {
+    "issuetype": {
+      "self": "https://jira.example.com/rest/api/2/issuetype/10002",
+      "id": "10002",
+      "description": "A task that needs to be done.",
+      "iconUrl": "https://jira.example.com/images/icons/issuetypes/task.svg",
+      "name": "Task",
+      "subtask": false,
+      "hierarchyLevel": 0
+    },
+    "summary": "Bump Spring Boot to 3.2.5",
+    "description": null,
+    "status": {
+      "self": "https://jira.example.com/rest/api/2/status/10002",
+      "name": "Done",
+      "id": "10002",
+      "statusCategory": { "id": 3, "key": "done", "name": "Done" }
+    },
+    "customfield_10014": null,
+    "created": "2024-07-08T13:20:00.000+0200",
+    "updated": "2024-07-08T14:02:00.000+0200"
+  },
+  "renderedFields": {
+    "issuetype": null,
+    "summary": null,
+    "description": null,
+    "status": null,
+    "customfield_10014": null,
+    "created": "08/Jul/24 1:20 PM",
+    "updated": "08/Jul/24 2:02 PM"
+  }
+}
