@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use regex::Regex;
+use serde::{Deserialize, Deserializer};
 
 /// Default regex used to find Jira ticket keys in commit messages.
 pub const DEFAULT_TICKET_REGEX: &str = r"\bGRLD-\d+\b";
@@ -22,9 +23,13 @@ pub struct Config {
     pub repo: PathBuf,
     /// Directory holding the libSQL files `index.db` and `cache.db`.
     pub data_dir: PathBuf,
-    /// Regex used to extract ticket keys from history.
-    #[serde(default = "default_ticket_regex")]
-    pub ticket_regex: String,
+    /// Regex used to extract ticket keys from history, compiled once while the
+    /// config is parsed so a bad pattern fails before any work starts.
+    #[serde(
+        default = "default_ticket_regex",
+        deserialize_with = "deserialize_regex"
+    )]
+    pub ticket_regex: Regex,
     /// Jira connection. Optional for now; a command that talks to Jira will
     /// require it once Phase 3 lands.
     #[serde(default)]
@@ -74,9 +79,7 @@ impl Config {
     /// Parse a configuration from TOML text. Pure: never touches the
     /// environment, so tests are deterministic.
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Config = toml::from_str(text).context("parsing configuration TOML")?;
-        config.validate()?;
-        Ok(config)
+        toml::from_str(text).context("parsing configuration TOML")
     }
 
     /// Read, parse and validate a configuration file, then resolve relative
@@ -106,16 +109,16 @@ impl Config {
             }
         }
     }
-
-    fn validate(&self) -> Result<()> {
-        regex::Regex::new(&self.ticket_regex)
-            .with_context(|| format!("invalid ticket_regex {:?}", self.ticket_regex))?;
-        Ok(())
-    }
 }
 
-fn default_ticket_regex() -> String {
-    DEFAULT_TICKET_REGEX.to_string()
+fn default_ticket_regex() -> Regex {
+    Regex::new(DEFAULT_TICKET_REGEX).expect("the default ticket regex is valid")
+}
+
+fn deserialize_regex<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Regex, D::Error> {
+    let pattern = String::deserialize(deserializer)?;
+    Regex::new(&pattern)
+        .map_err(|err| serde::de::Error::custom(format!("invalid ticket_regex {pattern:?}: {err}")))
 }
 
 fn default_ollama_url() -> String {
@@ -180,7 +183,7 @@ embedding_model = "nomic-embed-text"
         let text = minimal_without(&[r#"ticket_regex = """#, "url = \"\""]);
         let config = Config::parse(&text).expect("config should parse");
 
-        assert_eq!(config.ticket_regex, DEFAULT_TICKET_REGEX);
+        assert_eq!(config.ticket_regex.as_str(), DEFAULT_TICKET_REGEX);
         assert_eq!(
             config.ollama.expect("section present").url,
             DEFAULT_OLLAMA_URL
@@ -197,7 +200,7 @@ data_dir = "data"
 
         assert!(config.jira.is_none(), "jira should default to None");
         assert!(config.ollama.is_none(), "ollama should default to None");
-        assert_eq!(config.ticket_regex, DEFAULT_TICKET_REGEX);
+        assert_eq!(config.ticket_regex.as_str(), DEFAULT_TICKET_REGEX);
     }
 
     #[test]
@@ -217,8 +220,8 @@ data_dir = "data"
         let err = Config::parse(&text).expect_err("invalid regex should fail");
 
         assert!(
-            err.to_string().contains("ticket_regex"),
-            "error should mention ticket_regex, got: {err}"
+            format!("{err:#}").contains("invalid ticket_regex \"(\""),
+            "error should name the bad pattern, got: {err:#}"
         );
     }
 

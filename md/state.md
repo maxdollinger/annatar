@@ -11,11 +11,27 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
-| Step | R4 Deterministic, cheaper git output; batched cache writes — **done** |
+| Step | R6 Small cleanups: `TicketSpan`, regex compiled once, pruned `--path` walk — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R6 Small cleanups.** (12) `ticket_span` returns `Vec<TicketSpan { key,
+  first_date, last_date }>` built with a key → index map, replacing the
+  `(String, String, String)` tuple and the production `expect`. (14)
+  `Config.ticket_regex` is now a compiled `regex::Regex`, deserialized with a
+  `deserialize_with` that reports `invalid ticket_regex "<pattern>": …`
+  inside the TOML error (now with line/column); `Config::validate` and
+  `main`'s second compile are gone, `main` passes `&config.ticket_regex`. (9)
+  `--path` now prunes the walk itself: `walk::on_prefix_path` keeps only the
+  prefix, its subtree and its ancestors, so the rest of a large repo is never
+  visited. The walk still starts at `repo` (not `repo/prefix`) so ancestor
+  `.gitignore` files keep applying, and a missing or outside prefix still
+  yields an empty list (existing contract kept). 2 new walk tests (ancestor
+  `.gitignore` under a prefix; pure pruning decisions); the invalid-regex
+  config test now checks the pattern is named. Findings 9, 12, 14. Decision
+  D-v. 80 lib + 1 integration tests green.
 
 - **R4 Deterministic, cheaper git output; batched cache writes.** Every
   production `git log` now passes `--no-color --no-ext-diff
@@ -349,11 +365,11 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2 audit remediation **R6**: `TicketSpan` struct instead of the
-  `(String, String, String)` tuple (removes the production `expect`), the
-  compiled ticket regex kept on `Config`, and `--path` starting the walk at
-  `repo/prefix`. Then R7 (doc drift) per
-  [`audit_phase_2_plan.md`](./audit_phase_2_plan.md).
+- Phase 2 audit remediation **R7**: doc drift — `project.md` (two libSQL
+  files, `get_symbol(fqn)`, `search_intent(query, kind?, role?, path?)`, the
+  broken line-59 export), `AGENTS.md` clippy gate `--all-targets`, README usage
+  and git requirement. That completes R0–R7; R8 (real-repo run) and the
+  Phase 3 decisions J1–J9 need the product owner.
 
 ## Step log
 
@@ -385,6 +401,7 @@ the decisions taken, and the tradeoffs behind them.
 | R2 Dirty working tree | done | `history::dirty_files` (`git diff HEAD --name-only --relative`), once per run; dirty files get history but bypass the cache; one summary warning; closes open #14; decision D-r; 3 tests; 74 tests |
 | R3 Javadoc-inclusive history span | done | `Symbol.history_start_line` (Javadoc start or `start_line`) feeds `-L`; `history_cache` → `history_cache_v2`, old table dropped; 3 tests; decision D-t (J0); 77 tests |
 | R4 Deterministic git, batched cache writes | done | `LOG_FLAGS` (`--no-color --no-ext-diff --no-show-signature`) + `-s` on `-L`; one cache transaction per file; cold ~2.78 s vs ~3.55 s (debug); 1 config-independence test; 78 tests |
+| R6 Small cleanups | done | `TicketSpan` struct (no production `expect`); `Config.ticket_regex: Regex` via `deserialize_with`, compiled once; `--path` prunes the walk to the prefix path, ancestor `.gitignore` kept; 2 walk tests; decision D-v; 80 tests |
 
 ## Decisions and tradeoffs
 
@@ -454,6 +471,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-r (R2) | Detect files with uncommitted changes once per run (`git diff HEAD --name-only -z --relative --no-renames`); give them `-L` history but never read or write the cache for them; one summary warning. A failed check treats every file as dirty | Skip history for dirty files; map working-copy lines onto `HEAD` via `git diff`; ignore it (status quo) | Skipping would blank history in exactly the `--path` dev loop; line mapping is a lot of machinery for a POC. Not caching is the minimal fix for the real harm (a wrong result persisted under `HEAD`'s sha and reused). `git diff --relative` instead of `git status --porcelain` because its paths are relative to `repo`, not the work-tree root, so a `repo` below the root still matches the walker |
 | D-t (R3, J0) | The history span starts at the Javadoc (`Symbol.history_start_line`), so a doc-only commit and its ticket belong to the symbol. `start_line` is unchanged for display. The cache table is renamed `history_cache_v2` and the old `history_cache` is dropped on open | Keep the declaration-only span and pin it with a test; bump a version column inside `history_cache` | The content hash already treats the Javadoc as part of the symbol, and doc commits often carry the "why". The key (fqn + hash + file sha) does not change when the span does, so old rows would be silently wrong: dropping the table is the ground-rule answer, and a new name makes the one-off `DROP TABLE IF EXISTS` idempotent |
 | D-u (R4) | `git log` runs with `--no-color --no-ext-diff --no-show-signature`, `-L` with `-s`; history-cache writes are batched in one cache-connection transaction per file | Enforce a minimum git version for `-s` with `-L`; one cache transaction per run | The flags make output independent of the developer's git config and stop git from producing hunks nobody reads; keeping the hunk-tolerant parser avoids a version check. Per file (not per run) bounds what a crash loses to one file's results while still removing the per-symbol fsync |
+| D-v (R6) | `Config.ticket_regex` is a compiled `Regex` (custom `deserialize_with`); `--path` prunes directories off the prefix path inside the walker's `filter_entry` instead of starting the walk at `repo/prefix` | Keep a `String` plus a cached `Option<Regex>`; start `WalkBuilder` at `repo/prefix` | One compile and one error path, reported by the TOML parser with line/column. The default pattern uses `Regex::new(DEFAULT_TICKET_REGEX).expect(..)`: a constant, covered by the config defaults test, unlike the data-dependent `expect` removed from `ticket_span`. Starting the walk at the prefix with `parents(false)` would silently skip the repo-root `.gitignore`; pruning in `filter_entry` keeps the walk equivalent while still never visiting the rest of the repo |
 
 ## Open questions
 

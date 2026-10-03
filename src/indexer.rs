@@ -433,51 +433,61 @@ async fn attach_history(
         stats.commits += inserted as usize;
     }
 
-    for (key, first_date, last_date) in ticket_span(commits, ticket_regex) {
+    for span in ticket_span(commits, ticket_regex) {
         let inserted = conn
             .execute(
                 "INSERT OR IGNORE INTO symbol_tickets
                     (symbol_id, ticket_key, first_date, last_date)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![symbol_id, key.as_str(), first_date, last_date],
+                params![
+                    symbol_id,
+                    span.key.as_str(),
+                    span.first_date,
+                    span.last_date
+                ],
             )
             .await
-            .with_context(|| format!("writing ticket {key} for symbol {symbol_id}"))?;
+            .with_context(|| format!("writing ticket {} for symbol {symbol_id}", span.key))?;
         stats.tickets += inserted as usize;
     }
     Ok(())
 }
 
+/// One ticket key and the dates of the oldest and most recent commit that
+/// mention it.
+struct TicketSpan {
+    key: String,
+    first_date: String,
+    last_date: String,
+}
+
 /// The distinct ticket keys mentioned across `commits` (newest first), each
-/// with its oldest (`first_date`) and most recent (`last_date`) date.
-fn ticket_span(commits: &[Commit], ticket_regex: &Regex) -> Vec<(String, String, String)> {
-    let mut order: Vec<String> = Vec::new();
-    let mut dates: HashMap<String, (String, String)> = HashMap::new();
+/// with its oldest (`first_date`) and most recent (`last_date`) date, in the
+/// order they were first seen.
+fn ticket_span(commits: &[Commit], ticket_regex: &Regex) -> Vec<TicketSpan> {
+    let mut spans: Vec<TicketSpan> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for commit in commits {
         let mut text = commit.subject.clone();
         text.push('\n');
         text.push_str(&commit.body);
         for key in history::ticket_keys(ticket_regex, &text) {
-            match dates.get_mut(&key) {
+            match index.get(&key) {
                 // Seen before, so this commit is older: move the first date back.
-                Some((first, _last)) => *first = commit.date.clone(),
+                Some(&at) => spans[at].first_date = commit.date.clone(),
                 // First sighting is the newest commit, so it sets both ends.
                 None => {
-                    order.push(key.clone());
-                    dates.insert(key, (commit.date.clone(), commit.date.clone()));
+                    index.insert(key.clone(), spans.len());
+                    spans.push(TicketSpan {
+                        key,
+                        first_date: commit.date.clone(),
+                        last_date: commit.date.clone(),
+                    });
                 }
             }
         }
     }
-    order
-        .into_iter()
-        .map(|key| {
-            let (first, last) = dates
-                .remove(&key)
-                .expect("key was recorded on first sighting");
-            (key, first, last)
-        })
-        .collect()
+    spans
 }
 
 /// A content hash over the Javadoc and the symbol's source. Including the
