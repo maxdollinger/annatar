@@ -11,11 +11,28 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 2 — History and ticket keys (complete with deviations, see open #18); Phase 2 audit remediation in progress |
-| Step | R6 Small cleanups: `TicketSpan`, regex compiled once, pruned `--path` walk — **done** |
+| Step | R7 Doc drift — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **R7 Doc drift.** (21) `project.md` no longer contradicts the ground
+  rules: storage is two libSQL files (`index.db` portable and atomically
+  rebuilt, `cache.db` persistent and never shipped) with libSQL's native
+  vector index instead of "one SQLite file with sqlite-vec"; symbols are
+  identified by fqn (`get_symbol(fqn)`, `trace_usage(fqn, depth)`);
+  `search_intent(query, kind?, role?, path?)` is a superset of the plan's
+  6.1; the broken `&#91;embedded content…\]` export became a five-step list. (22)
+  `AGENTS.md` step 4 now gates on `cargo clippy --all-targets -- -D
+  warnings`, which also lints tests and the benchmark (already clean). (23)
+  README gained a Usage section: build, `annatar index [--path]`,
+  `annatar show <fqn>`, config location, secrets from the environment, and
+  the `git` work-tree requirement. Deferred findings recorded: (8) a type's
+  `-L` span is its whole body — noted in `plan.md` 4.4 and open #17; (10)
+  `show` loads every symbol/commit/ticket row — noted on open #15 for 6.1;
+  (16) `history_cache_v2` is never pruned — `plan.md` Later list. Docs only;
+  80 lib + 1 integration tests green. **Remediation R0–R7 complete.**
 
 - **R6 Small cleanups.** (12) `ticket_span` returns `Vec<TicketSpan { key,
   first_date, last_date }>` built with a key → index map, replacing the
@@ -365,11 +382,13 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- Phase 2 audit remediation **R7**: doc drift — `project.md` (two libSQL
-  files, `get_symbol(fqn)`, `search_intent(query, kind?, role?, path?)`, the
-  broken line-59 export), `AGENTS.md` clippy gate `--all-targets`, README usage
-  and git requirement. That completes R0–R7; R8 (real-repo run) and the
-  Phase 3 decisions J1–J9 need the product owner.
+- **Product owner:** R8 — index a real GRLD repo after R1–R7 (release
+  build, cold + warm), record files, symbols, cold/warm time, ms/symbol and
+  ticket coverage (open #18, informs #13 and #17); answer the Phase 3
+  decisions J1–J9 in [`audit_phase_2_plan.md`](./audit_phase_2_plan.md) §5
+  and run the token end-to-end test (§3.1) when 3.1 lands.
+- **Agent:** Phase 3.1 Fetch and parse (needs J1, J2, J9); R9 (staged
+  pipeline, needs J4) before 3.2.
 
 ## Step log
 
@@ -402,6 +421,7 @@ the decisions taken, and the tradeoffs behind them.
 | R3 Javadoc-inclusive history span | done | `Symbol.history_start_line` (Javadoc start or `start_line`) feeds `-L`; `history_cache` → `history_cache_v2`, old table dropped; 3 tests; decision D-t (J0); 77 tests |
 | R4 Deterministic git, batched cache writes | done | `LOG_FLAGS` (`--no-color --no-ext-diff --no-show-signature`) + `-s` on `-L`; one cache transaction per file; cold ~2.78 s vs ~3.55 s (debug); 1 config-independence test; 78 tests |
 | R6 Small cleanups | done | `TicketSpan` struct (no production `expect`); `Config.ticket_regex: Regex` via `deserialize_with`, compiled once; `--path` prunes the walk to the prefix path, ancestor `.gitignore` kept; 2 walk tests; decision D-v; 80 tests |
+| R7 Doc drift | done | `project.md` storage/fqn/MCP signatures/broken export fixed; `AGENTS.md` clippy `--all-targets`; README usage + git requirement; findings 8/10/16 recorded as notes; docs only; 80 tests |
 
 ## Decisions and tradeoffs
 
@@ -491,7 +511,7 @@ the decisions taken, and the tradeoffs behind them.
 | 12 | `symbols` has no uniqueness constraint tying fqn to a file; two source roots defining the same fqn keep the first and drop the second. | 1.5 | open, defer — duplicate fqn is a compile error for a real repo |
 | 13 | Test-code detection only matches a repo-root `src/test`; multi-module repos put tests at `<module>/src/test`. | 1.5 review | open, defer — multi-module handling is a "Later" item; note if the Phase 2 target is multi-module |
 | 14 | Phase 2.1 assumes `repo` is a git work tree and the file paths it stores match git's root. A dirty or renamed tree may not match `HEAD` line numbers. | 1.5 review | resolved by R2 — dirty files get history but never touch the cache; one warning per run (decision D-r) |
-| 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it |
+| 15 | `show::render` recurses with plain function calls, so a pathologically deep symbol nesting could overflow the stack. Guard the depth, or move rendering to an explicit stack? | H8/13 | open, defer — POC-scale nesting is shallow; revisit if a real repo triggers it. Before 6.1, also replace the load-everything `render` (all `symbols`, `symbol_commits`, `symbol_tickets` rows per call) with a subtree query (audit 2, finding 10) |
 | 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | resolved by R5 — `src/test_support.rs`, shared with `tests/benchmark.rs` via `#[path]` (decision D-s) |
-| 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end. |
+| 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end (R8). Cheaper lever: a top-level type's `-L` span is its whole body (the most expensive call, ~file history), so `git log -- <file>` could replace it (audit 2, finding 8) |
 | 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | open — Phase 2 is marked *complete with deviations* (R0); closed by audit item R8 (real-repo run: symbols, cold/warm time, ticket coverage) before Phase 3.2; may force a decision on #13 |

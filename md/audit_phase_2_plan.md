@@ -351,3 +351,4 @@ Never paste the token into chat, `annatar.toml` or a fixture. Scrub
 | R3 | fix(history): include the Javadoc in a symbol's history span | J0 taken as recommended; cache renamed rather than versioned in-row; mutation-checked the doc-only test |
 | R4 | perf(history): suppress diff output and batch cache writes | Benchmark A/B via `git stash`, 3 runs each: cold 2.74/2.87/2.73 s vs 3.64/3.69/3.31 s |
 | R6 | refactor: ticket spans, compiled ticket regex, pruned --path walk | Kept the "missing prefix → empty list" contract instead of the plan's "error naming the path" (behaviour change not needed for the finding); pruning via `filter_entry` instead of starting at `repo/prefix` to keep ancestor `.gitignore` semantics |
+| R7 | docs: fix phase 2 doc drift | Also recorded the §6 deferrals (8 → plan 4.4 + open #17, 10 → open #15, 16 → plan Later) |

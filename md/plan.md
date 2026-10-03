@@ -114,7 +114,7 @@ Input, built by a pure, tested function: signature, Javadoc, parent class name a
 
 **4.4 Type what/why, bottom-up**
 *Goal:* every type has a `what` and `why` built from its own context and its members' `what` lines.
-Process the deepest nested types first, so an outer class can include its nested types' `what` lines. Cap the input for large classes (e.g. public members first, then a fixed maximum). Because the input includes members' output, a changed method automatically misses the cache for its class.
+Process the deepest nested types first, so an outer class can include its nested types' `what` lines. Cap the input for large classes (e.g. public members first, then a fixed maximum). A type's history span is its whole body, so its tickets are effectively the file's tickets: cap those too. Because the input includes members' output, a changed method automatically misses the cache for its class.
 *Done when:* `show` prints what/why for types, including a large class and a nested class.
 
 **4.5 Quality review and golden set**
@@ -164,4 +164,5 @@ Pick 3–5 real tasks where you know the relevant code. Decide up front how to m
 - **Analysis:** hotspots from churn and bug tickets, temporal coupling.
 - **Spring configuration:** `application.yml`, `@Value`, `@ConfigurationProperties`.
 - **Human search page** for non-technical roles.
+- **Cache growth:** prune `history_cache_v2` rows (and later cache tables) for deleted or renamed symbols; today they stay forever.
 - **CI pipeline** with fmt, clippy and tests (add whenever it starts to hurt not having it).
