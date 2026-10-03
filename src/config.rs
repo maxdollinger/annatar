@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Default regex used to find Jira ticket keys in commit messages.
@@ -20,8 +20,8 @@ pub const ENV_JIRA_EMAIL: &str = "ANNATAR_JIRA_EMAIL";
 pub struct Config {
     /// Root of the repository to index.
     pub repo: PathBuf,
-    /// Path to the libSQL database file.
-    pub database: PathBuf,
+    /// Directory holding the libSQL files `index.db` and `cache.db`.
+    pub data_dir: PathBuf,
     /// Regex used to extract ticket keys from history.
     #[serde(default = "default_ticket_regex")]
     pub ticket_regex: String,
@@ -62,8 +62,6 @@ pub struct OllamaConfig {
     pub chat_model: String,
     /// Embedding model used for semantic search.
     pub embedding_model: String,
-    /// Dimension of the embedding vectors, must match the model.
-    pub embedding_dim: usize,
 }
 
 impl Config {
@@ -100,9 +98,6 @@ impl Config {
     fn validate(&self) -> Result<()> {
         regex::Regex::new(&self.ticket_regex)
             .with_context(|| format!("invalid ticket_regex {:?}", self.ticket_regex))?;
-        if self.ollama.embedding_dim == 0 {
-            bail!("ollama.embedding_dim must be greater than zero");
-        }
         Ok(())
     }
 }
@@ -121,7 +116,7 @@ mod tests {
 
     const MINIMAL: &str = r#"
 repo = "/tmp/repo"
-database = "annatar.db"
+data_dir = "data"
 ticket_regex = ""
 
 [jira]
@@ -131,7 +126,6 @@ base_url = "https://example.atlassian.net"
 url = ""
 chat_model = "qwen2.5-coder"
 embedding_model = "nomic-embed-text"
-embedding_dim = 768
 "#;
 
     fn minimal_without(lines: &[&str]) -> String {
@@ -195,6 +189,6 @@ embedding_dim = 768
 
         let config = Config::load(&path).expect("config should load");
         assert_eq!(config.repo, PathBuf::from("/tmp/repo"));
-        assert_eq!(config.ollama.embedding_dim, 768);
+        assert_eq!(config.data_dir, PathBuf::from("data"));
     }
 }

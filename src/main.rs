@@ -55,7 +55,7 @@ fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
     tracing::debug!(
         repo = %config.repo.display(),
-        database = %config.database.display(),
+        data_dir = %config.data_dir.display(),
         path = cli.path.as_deref().unwrap_or("<all>"),
         "loaded configuration"
     );
