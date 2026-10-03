@@ -38,12 +38,15 @@ pub fn java_files(repo: &Path, path_prefix: Option<&Path>) -> Result<Vec<PathBuf
     };
 
     let root = repo.to_path_buf();
+    let walk_prefix = prefix.clone();
     let mut walker = WalkBuilder::new(repo);
     walker
         .standard_filters(true)
         .parents(false)
         .require_git(false)
-        .filter_entry(move |entry| !is_skipped_dir(&root, entry));
+        .filter_entry(move |entry| {
+            !is_skipped_dir(&root, entry) && descend(&root, walk_prefix.as_deref(), entry)
+        });
 
     let mut files = Vec::new();
     for result in walker.build() {
@@ -114,6 +117,34 @@ fn is_skipped_dir(repo: &Path, entry: &DirEntry) -> bool {
         return false;
     }
     !components.any(|component| component.as_os_str() == "java")
+}
+
+/// Whether the walk should descend into `entry` under a `--path` prefix.
+///
+/// Files are always kept (the caller filters them); a directory only when
+/// [`on_prefix_path`] says so.
+fn descend(repo: &Path, prefix: Option<&Path>, entry: &DirEntry) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    if !entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+    {
+        return true;
+    }
+    entry
+        .path()
+        .strip_prefix(repo)
+        .map_or(true, |relative| on_prefix_path(relative, prefix))
+}
+
+/// Whether the repo-relative directory `relative` is the prefix, inside it, or
+/// one of its ancestors. Everything else is pruned, so the rest of the
+/// repository is never visited. Ancestors are still walked rather than starting
+/// at `repo/prefix`, because that is how the walker reads their `.gitignore`.
+fn on_prefix_path(relative: &Path, prefix: &Path) -> bool {
+    relative.starts_with(prefix) || prefix.starts_with(relative)
 }
 
 /// Reduce `prefix` to a path relative to `repo`. Absolute prefixes that fall
@@ -280,6 +311,47 @@ mod tests {
                 "src/main/java/com/acme/other/Other.java",
             ])
         );
+    }
+
+    #[test]
+    fn path_prefix_keeps_ancestor_gitignores() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "src/main/java/com/acme/App.java");
+        write_file(root, "src/main/java/com/acme/scratch/Ignored.java");
+        write_file(root, "src/main/java/com/other/Other.java");
+        std::fs::write(root.join(".gitignore"), "scratch/\n").unwrap();
+
+        assert_eq!(
+            java_files(root, Some(Path::new("src/main/java/com/acme"))).unwrap(),
+            paths(&["src/main/java/com/acme/App.java"]),
+            "the root .gitignore still applies under the prefix"
+        );
+    }
+
+    #[test]
+    fn path_prefix_prunes_directories_off_its_path() {
+        let prefix = Path::new("src/main/java/com/acme");
+        for kept in [
+            "",
+            "src",
+            "src/main/java/com",
+            "src/main/java/com/acme",
+            "src/main/java/com/acme/user",
+        ] {
+            assert!(on_prefix_path(Path::new(kept), prefix), "{kept:?} is kept");
+        }
+        for pruned in [
+            "docs",
+            "src/main/resources",
+            "src/main/java/com/other",
+            "src/main/java/com/acmexyz",
+        ] {
+            assert!(
+                !on_prefix_path(Path::new(pruned), prefix),
+                "{pruned:?} is pruned"
+            );
+        }
     }
 
     #[test]

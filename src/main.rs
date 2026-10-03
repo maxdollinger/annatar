@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
@@ -65,12 +65,14 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Command::Index => {
-            let ticket_regex = regex::Regex::new(&config.ticket_regex)
-                .with_context(|| format!("invalid ticket_regex {:?}", config.ticket_regex))?;
             let store = Store::open(&config.data_dir).await?;
-            let stats =
-                indexer::build_index(&store, &config.repo, cli.path.as_deref(), &ticket_regex)
-                    .await?;
+            let stats = indexer::build_index(
+                &store,
+                &config.repo,
+                cli.path.as_deref(),
+                &config.ticket_regex,
+            )
+            .await?;
             println!(
                 "indexed {} files, {} symbols, {} commits, {} tickets, {} history hits, {} history misses, {} history skipped, {} empty, {} parse errors, {} unreadable",
                 stats.files,
