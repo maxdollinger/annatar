@@ -489,7 +489,7 @@ Status of each item as it lands. One commit per item (Conventional Commits);
 | H5 | done | `ec3493b` | 49 | `parse_annotations` returns `Result` with the fqn; `text()` warns (kind/span) and returns empty; corrupt-annotations `show` test |
 | H6 | done | `8e463d9` | 50 | one `build_symbol` factory; annotations walked once; dead `record_body`/`program` arms removed; 1 record-body test |
 | H7 | done | `ff18d6d` | 51 | one transaction wraps all symbol writes, committed before `build.commit()`; dropped tx rolls back; local tx in `build_index` |
-| H9 | done | `e13e846` | 52 | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample under source root → `generated/`; 1 new walker test |
+| H9 | done | `e13e846` | 52 | prune `SKIP_DIRS` names only outside a `java` source root; `com.acme.build` survives, root/module build output still pruned; fixture moved generated sample out of `src/main/java` to `generated/`; 1 new walker test |
 | H8 | done | `3eef617` | 52 | decision 41 wording fixed + deep-nesting open #15; `minimal_without` presence/removal asserts; store test inserts via `params!`; `relative_path` → `replace('\\', "/")`; `Config::load` clones instead of `mem::take` |
 
 All 18 findings are closed; `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`

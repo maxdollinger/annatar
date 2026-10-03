@@ -42,7 +42,7 @@ Each later phase adds its own tables. Index tables are created on the temp file;
 
 **1.1 File walker**
 *Goal:* the list of production Java files to index, relative to the repo root.
-Use the `ignore` crate, respecting `.gitignore`, skipping `build/`, `target/`, generated sources and `src/test/`. Apply `--path`.
+Use the `ignore` crate, respecting `.gitignore`, skipping `build/`, `target/`, `generated/`/`generated-sources/` (when not under a source root) and `src/test/`. Apply `--path`.
 *Done when:* a temp-directory test returns exactly the expected files.
 
 **1.2 Parse types**
@@ -62,7 +62,7 @@ Roles from annotations: `controller`, `service`, `repository` (including Spring 
 
 **1.5 Write symbols and `show`**
 *Goal:* all symbols of a real repo in `index.db`, inspectable by fqn.
-`symbols` table: id, parent_id, kind, role, fqn (unique), file, start/end line, signature, javadoc, annotations, content hash (e.g. `blake3` of the symbol's source). `annatar show <fqn>` prints a symbol and its children.
+`symbols` table: id, parent_id, kind, role, fqn (unique), file, start/end line, signature, javadoc, annotations, content hash (blake3 over the symbol's Javadoc + source). `annatar show <fqn>` prints a symbol and its children.
 *Done when:* a real repo indexes and `show` works on it.
 
 ## Phase 2 — History and ticket keys
