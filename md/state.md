@@ -11,11 +11,19 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 1 — Symbols |
-| Step | 1.1 File walker — **done** |
+| Step | 1.2 Parse types — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
 ### Done
+
+- **1.2 Parse types.** `symbols::parse_types(path, source)` returns a `TypeDef`
+  per class, interface, enum, record and `@interface`, including nested types:
+  package, simple name, dotted fqn, kind, 1-based line span, byte span and
+  parent fqn. `tree-sitter` 0.25 + `tree-sitter-java` 0.23; a file that does not
+  parse is logged and skipped (`Ok(empty)`). Recursion is scoped to type
+  containers so method-local and anonymous classes are excluded. 6 tests; 21
+  total, green; clippy clean.
 
 - **1.1 File walker.** `walk::java_files(repo, path_prefix)` returns the
   production `.java` files under `repo` as repo-relative, sorted paths. Uses
@@ -52,8 +60,8 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- 1.2 Parse types: `tree-sitter` + `tree-sitter-java`, classes/interfaces/
-  enums/records incl. nesting, spans and parent; log and skip parse errors.
+- 1.3 Parse methods and constructors: unique fqn `pkg.Type#method(Params)`,
+  spans and parent type; ignore anonymous/local classes.
 
 ## Step log
 
@@ -62,6 +70,7 @@ the decisions taken, and the tradeoffs behind them.
 | 0.1 CLI, config, logging | done | `--help` works; 5 config tests green; realigned to refined plan (`data_dir`, no `embedding_dim`) |
 | 0.2 Database files | done | two-file `Store`, temp file + atomic rename; 4 tests |
 | 1.1 File walker | done | `walk::java_files`; `ignore` crate; 6 tests (15 total) |
+| 1.2 Parse types | done | `symbols::parse_types`; tree-sitter 0.25 + tree-sitter-java 0.23; 6 tests (21 total) |
 
 ## Decisions and tradeoffs
 
@@ -94,6 +103,8 @@ the decisions taken, and the tradeoffs behind them.
 | 25 | Generated sources detected by directory name (`generated`, `generated-sources`), pruned anywhere | Parse Maven/Gradle build files | Language/build-system agnostic, cheap, and testable; revisit if a repo names its tree differently |
 | 26 | `--path` is a literal path prefix (`Path::starts_with`), not a glob | Glob/pattern matching | The plan calls it a prefix; prefix semantics cover both a directory and a single file with no pattern engine |
 | 27 | Walker sets `require_git(false)` and `parents(false)` | Require a git repo / honour ancestor ignores | Temp-dir tests need no `git init` and stay deterministic; `parents(false)` also stops a parent `.gitignore` outside the repo from affecting a run |
+| 28 | `tree-sitter` 0.25 + `tree-sitter-java` 0.23 (ABI-matched pair) | Other version pairs | A real parse test proves the pair loads; later bumps must keep the grammar crate compatible |
+| 29 | Type recursion is scoped to type-container nodes (`program`, `*_body`, `enum_body_declarations`), never executable scopes | Filter `class_declaration` by inspecting its `parent.kind()` | `tree-sitter-java` has no `local_class_declaration`; local and anonymous classes are also `class_declaration`, so only descending type containers correctly excludes them |
 
 ## Open questions
 
