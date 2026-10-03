@@ -23,7 +23,8 @@ plan, not by ad-hoc requests.
    need network, Jira or Ollama. Tests that do are marked `#[ignore]`.
 4. **Verify** before committing:
    - `cargo fmt`
-   - `cargo clippy -- -D warnings`
+   - `cargo clippy --all-targets -- -D warnings` (lints tests and the
+     benchmark too)
    - `cargo test`
    All must be clean/green. If a command fails, fix it — don't skip it.
 5. **Update [`md/state.md`](./md/state.md)** after the implementation:

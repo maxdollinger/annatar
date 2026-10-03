@@ -13,6 +13,19 @@ For this proof of concept, Annatar targets:
 - **Ticket system:** Jira
 - **LLM inference and embeddings:** Ollama, for local inference
 
+## Usage
+
+Annatar needs `git` on `PATH`, and the configured `repo` must be a git work tree for history and ticket keys. Otherwise only the structure is indexed, with one warning.
+
+Configure `annatar.toml` (the default file; `--config <FILE>` points elsewhere). Relative paths resolve against the config file's directory. Secrets come only from the environment (`ANNATAR_JIRA_TOKEN`, `ANNATAR_JIRA_EMAIL`).
+
+```sh
+cargo build --release                     # binary in target/release/annatar
+annatar index                             # rebuild .annatar/index.db
+annatar index --path src/main/java/com/acme   # only part of the repo
+annatar show com.acme.user.UserRepository     # a symbol, its children, commits and tickets
+```
+
 ## Goals
 
 - **Faster onboarding** for new engineers

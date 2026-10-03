@@ -56,7 +56,11 @@ One index serves all five goals; each draws on a different part of it.
 
 Five steps turn a repository into an intent index. Every step is incremental: a content hash per symbol means a change regenerates only the affected symbols and their parents.
 
-&#91;embedded content: indexing pipeline · 5 steps, 3 audiences\]
+1. **Structure:** tree-sitter extracts every class, method and function with its signature, doc comment and file:line.
+2. **History:** `git log -L` per symbol yields the commits that shaped it and the ticket keys they mention.
+3. **Tickets:** each referenced ticket is fetched once and summarised.
+4. **What/why:** an LLM writes a one-line *what* and a *why* per symbol from its signature, docs and ticket summaries, bottom-up from members to types.
+5. **Embeddings:** the what/why text is embedded for search.
 
 Embeddings are made from the what/why text, not from code, so similarity search matches intent: "where do we handle user persistence" finds `UserRepository`. Structure and history need no LLM; the LLM is used only for ticket summaries and the what/why records.
 
@@ -66,18 +70,23 @@ The MCP server is the primary interface. Every result carries a file:line, so an
 
 | MCP tool | Returns |
 | --- | --- |
-| `search_intent(query, kind?, path?)` | Ranked symbols with name, kind, file:line, what and why; no code |
-| `get_symbol(id)` | Full what/why, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
+| `search_intent(query, kind?, role?, path?)` | Ranked symbols with name, kind, file:line, what and why; no code |
+| `get_symbol(fqn)` | Full what/why, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
 | `get_module(path)` | Module summary and its main symbols; the entry point for an unfamiliar area |
-| `trace_usage(id, depth)` | Transitive callers, so an agent or engineer sees what a change can break |
+| `trace_usage(fqn, depth)` | Transitive callers, so an agent or engineer sees what a change can break |
 
 For people, a thin search page over the same index covers non-technical roles who don't use an agent. It shows the same records as the MCP tools, in plain language and without code.
 
 ## Architecture and deployment
 
-The index is built centrally and served locally. Everything lives in one SQLite file, which makes the index a portable artifact.
+The index is built centrally and served locally. Symbols are identified by their fully qualified name everywhere outside a single build, since row IDs change on every rebuild.
 
-**Storage:** a single SQLite database with sqlite-vec.
+**Storage:** two libSQL files, with libSQL's native vector index (`F32_BLOB` + `libsql_vector_idx`).
+
+- `index.db` is the portable artifact: rebuilt from scratch on every run into a temp file and atomically renamed into place, so a reader never sees a half-built index.
+- `cache.db` persists only expensive, content-keyed results (history per symbol, tickets, LLM outputs, embeddings) across rebuilds and is never shipped.
+
+Tables in `index.db`:
 
 - `symbols`: name, kind, file, line, what, why, content hash
 - `edges`: src, dst, kind (call, import, implements)
