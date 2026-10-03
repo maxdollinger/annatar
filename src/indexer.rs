@@ -155,7 +155,8 @@ pub async fn build_index(
     Ok(stats)
 }
 
-/// One file the structure stage wrote at least one parsed symbol for.
+/// One file the structure stage parsed, with the rows it wrote (none if every
+/// fqn was a duplicate).
 struct IndexedFile {
     path: PathBuf,
     symbols: Vec<IndexedSymbol>,
@@ -1567,7 +1568,7 @@ public class UserService {
     }
 
     #[tokio::test]
-    async fn stages_never_commit_so_an_aborted_build_keeps_the_previous_index() {
+    async fn aborted_build_after_all_stages_keeps_previous_index_and_no_temp_file() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         write(
