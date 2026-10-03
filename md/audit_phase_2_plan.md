@@ -345,3 +345,4 @@ Never paste the token into chat, `annatar.toml` or a fixture. Scrub
 | Item | Commit | Notes |
 | --- | --- | --- |
 | R0 | docs: add phase 2 audit and remediation plan | Formatter damage discarded (`git checkout md/state.md`; the only content in that diff was the damage plus the D-p draft question); Phase 2 marked complete with deviations; `plan.md` 2.2/2.3 deviation notes; open #18 points at R8 |
+| R5 | test: share scratch-git helpers, exact benchmark counts | `#[path]` include instead of a second copy in `tests/common/` (D-s); benchmark re-run on linux/debug: cold 3.41 s, warm 0.39 s, changed 0.72 s |
