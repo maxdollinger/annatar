@@ -11,7 +11,7 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 0 — Skeleton |
-| Step | 0.1 CLI, config, logging — **done** |
+| Step | 0.2 Database files — **done** |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.97.0, edition 2024 |
 
@@ -26,18 +26,25 @@ the decisions taken, and the tradeoffs behind them.
   Realigned to the refined plan on 2026-10-03: single `database` path became
   `data_dir` (the two-file `index.db` + `cache.db` layout), and `embedding_dim`
   was removed from config (5.1 reads it from the first embedding response).
+- **0.2 Database files.** `store::Store` opens `<data_dir>/cache.db` once and
+  builds `<data_dir>/index.db` in a temporary file (`tempfile`, same
+  directory) that is atomically renamed on `finish_index`. An aborted run
+  drops the temp file and leaves the previous index untouched; a new
+  `begin_index` discards an unfinished one. 4 store tests cover replace,
+  abort, cache survival and no-build finish. 9 tests total, green.
 
 ### Next
 
-- 0.2 Database files: `Store` opening `cache.db`, building `index.db` in a
-  temp file and atomically renaming on finish.
+- 1.1 File walker: `ignore` crate, `.gitignore`, skip `build/`/`target/`/
+  generated/`src/test/`, apply `--path`.
 
 ## Step log
 
 | Step | Status | Notes |
 | --- | --- | --- |
 | 0.1 CLI, config, logging | done | `--help` works; 5 config tests green; realigned to refined plan (`data_dir`, no `embedding_dim`) |
-| 0.2 Database files | next | two-file layout |
+| 0.2 Database files | done | two-file `Store`, temp file + atomic rename; 4 tests |
+| 1.1 File walker | next | — |
 
 ## Decisions and tradeoffs
 
@@ -55,6 +62,12 @@ the decisions taken, and the tradeoffs behind them.
 | 10 | `JiraConfig` has a hand-written redacting `Debug` (`token` shown as `***`) | Derive `Debug` | Prevents a secret leaking into logs the first time someone debugs the config |
 | 11 | Config exposes `data_dir`, not a database file path (refined plan) | A single `database` path, or `index_db` + `cache_db` paths | Ground rules define two files with different lifecycles; 0.2's `Store` derives both names from one directory, so config stays one key |
 | 12 | `embedding_dim` dropped from config (refined plan) | Keep it and validate | 5.1 takes the dimension from the first embedding response, so config would only be a second source of truth that can disagree |
+| 13 | libSQL via the `libsql` crate with `default-features = false, features = ["core"]` | Default features (remote, replication, sync, tls) | Only local files are needed; avoids tonic/hyper/rustls and keeps compile times down. Vector functions still live in `libsql-sys` |
+| 14 | Index temp file via `tempfile` in `data_dir`, committed with `NamedTempFile::persist` (rename) | Hand-rolled temp name + `fs::rename` | `persist` is atomic on Unix and deletes the temp file on drop, so an aborted run cleans itself up. Same directory guarantees the same filesystem |
+| 15 | Rely on libSQL local leaving a single file (default `journal_mode=delete`) | WAL for the index, checkpoint + sidecar handling | Verified empirically: closed local db leaves only `index.db`. If the index ever moves to WAL, `finish_index` must checkpoint before rename |
+| 16 | `Store` is async; `tokio` is the runtime | Synchronous wrapper | The `libsql` API is async. `open`/`begin_index` are async, `finish_index` is sync (drop + rename). Tests use `#[tokio::test]` |
+| 17 | `Store` owns no schema in 0.2; it exposes `cache()` and the `begin_index()` connection | Bundle table creation into 0.2 | Each phase adds its own tables (plan). Keeps this step to the file lifecycle and lets schema land with the data it stores |
+| 18 | Drop order: connection fields before their `Database`; `_cache_db` field anchors the cache connection | Rely on `Connection` alone | Explicit and safe: the connection is closed before the database handle; the anchor field is underscore-prefixed to stay intentionally unread |
 
 ## Open questions
 
@@ -64,3 +77,7 @@ the decisions taken, and the tradeoffs behind them.
 | 2 | Config discovery: search parent directories, or add `ANNATAR_CONFIG`? Currently only cwd/`--config`. | 0.1 | open, defer |
 | 3 | Should `jira` / `ollama` sections become optional per command (e.g. `show` may not need Jira)? | 0.1 | open |
 | 4 | `--path` is currently a `String`; make it a `PathBuf` once the walker lands (1.1)? | 0.1 | open |
+| 5 | Should `cache.db` use WAL for concurrent reader access (MCP server)? The index stays rollback-journal so rename is single-file. | 0.2 | open, defer |
+| 6 | `Store` exposes no read connection to the committed `index.db` yet. Needed by `show` (1.5) and the MCP server reopening on replace (6.1). | 0.2 | open |
+| 7 | Is `data_dir` resolved relative to the cwd or to the config file's directory? Currently cwd. | 0.2 | open |
+| 8 | Index schema: a central schema module, or per-phase DDL run against `begin_index`? | 0.2 | open |
