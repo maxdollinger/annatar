@@ -26,7 +26,9 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use libsql::{Connection, params};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 /// Start of a format record (ASCII record separator).
 const RECORD_START: char = '\u{1e}';
@@ -40,7 +42,7 @@ const RECORD_END: char = '\u{1d}';
 const GIT_FORMAT: &str = "%x1e%H%x1f%aI%x1f%s%x1f%b%x1d";
 
 /// One commit that changed a line span.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     /// Full commit hash (`git log`'s `%H`).
     pub sha: String,
@@ -68,6 +70,120 @@ pub fn is_repository(repo: &Path) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// The full sha of the most recent commit that touched `file`, or `None` when
+/// no commit has (an untracked file).
+///
+/// One `git log -1` per file is the cheap half of the history cache's key: a
+/// `None` means there is nothing to key on, so the caller skips the cache and
+/// falls back to per-symbol history. A non-zero git exit is an error, never a
+/// silent `None`.
+pub fn file_last_commit(repo: &Path, file: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%H")
+        .arg("--")
+        .arg(file)
+        .output()
+        .with_context(|| format!("running git log -1 for {}", file.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git log -1 for {} failed: {}",
+            file.display(),
+            stderr.trim()
+        );
+    }
+
+    let sha = String::from_utf8_lossy(&output.stdout);
+    let sha = sha.trim();
+    if sha.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sha.to_string()))
+    }
+}
+
+/// The persistent history cache in `cache.db`.
+///
+/// A symbol's commits are keyed by its fqn plus the content hash and the last
+/// commit sha of its file, so a repeat run over unchanged sources reuses the
+/// stored commits without shelling out to `git log -L`. A miss or an outdated
+/// row is refilled by the caller. Writes go to the cache connection, never to
+/// the index build, so an aborted index cannot roll them back.
+pub struct HistoryCache<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> HistoryCache<'a> {
+    /// Wrap a cache connection (typically [`crate::store::Store::cache`]).
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    /// The cached commits for `fqn`, if the stored key still matches.
+    pub async fn get(
+        &self,
+        fqn: &str,
+        content_hash: &str,
+        file_last_commit: &str,
+    ) -> Result<Option<Vec<Commit>>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT content_hash, file_last_commit, commits
+                 FROM history_cache WHERE fqn = ?1",
+                params![fqn],
+            )
+            .await
+            .context("reading history cache")?;
+        let Some(row) = rows.next().await.context("reading history cache row")? else {
+            return Ok(None);
+        };
+        let stored_hash = row
+            .get::<String>(0)
+            .context("reading history_cache.content_hash")?;
+        let stored_commit = row
+            .get::<String>(1)
+            .context("reading history_cache.file_last_commit")?;
+        if stored_hash != content_hash || stored_commit != file_last_commit {
+            return Ok(None);
+        }
+        let stored = row
+            .get::<String>(2)
+            .context("reading history_cache.commits")?;
+        let commits = serde_json::from_str(&stored).context("decoding cached commits")?;
+        Ok(Some(commits))
+    }
+
+    /// Store `commits` for `fqn`, replacing any previous row for that fqn.
+    pub async fn put(
+        &self,
+        fqn: &str,
+        content_hash: &str,
+        file_last_commit: &str,
+        commits: &[Commit],
+    ) -> Result<()> {
+        let stored = serde_json::to_string(commits).context("encoding cached commits")?;
+        self.conn
+            .execute(
+                "INSERT INTO history_cache (fqn, content_hash, file_last_commit, commits)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(fqn) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     file_last_commit = excluded.file_last_commit,
+                     commits = excluded.commits",
+                params![fqn, content_hash, file_last_commit, stored],
+            )
+            .await
+            .with_context(|| format!("writing history cache for {fqn}"))?;
+        Ok(())
+    }
 }
 
 /// The distinct ticket keys `regex` finds in `text`, in first-seen order.

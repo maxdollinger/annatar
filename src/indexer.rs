@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use libsql::{Connection, params};
 use regex::Regex;
 
-use crate::history::{self, Commit};
+use crate::history::{self, Commit, HistoryCache};
 use crate::store::Store;
 use crate::symbols::{JavaParser, Symbol};
 use crate::walk;
@@ -36,6 +36,10 @@ pub struct IndexStats {
     pub commits: usize,
     /// Ticket-key rows written to `symbol_tickets`.
     pub tickets: usize,
+    /// Symbols whose history came from `history_cache` without a git call.
+    pub history_hits: usize,
+    /// Symbols whose history needed a `git log -L` (cache miss or no cache).
+    pub history_misses: usize,
     /// Files that parsed cleanly but produced no symbols (`package-info.java`).
     pub empty: usize,
     /// Files tree-sitter could not parse, or for which it produced no tree.
@@ -49,6 +53,13 @@ pub struct IndexStats {
 /// `path_prefix`, when given, limits the run to a part of the repository.
 /// `ticket_regex` extracts Jira keys from commit subjects and bodies; it is
 /// compiled by the caller so a bad pattern fails before the run starts.
+///
+/// History is cached in `cache.db` keyed by fqn plus the symbol's content hash
+/// and its file's last commit sha, so a repeat run over unchanged sources
+/// reuses stored commits without a `git log -L`. A cache write goes to the
+/// persistent cache connection, not the build transaction, so an aborted index
+/// cannot roll it back; the temporary `index.db` still holds the only copy of
+/// the symbol rows.
 ///
 /// When `repo` is not a git work tree the run degrades to a structure-only
 /// index: one warning, no history tables, no error. When it is a repo, a
@@ -74,11 +85,14 @@ pub async fn build_index(
     }
     let files = walk::java_files(repo, path_prefix)?;
     let build = store.begin_index().await?;
+    let cache = HistoryCache::new(store.cache());
     let mut stats = IndexStats {
         files: 0,
         symbols: 0,
         commits: 0,
         tickets: 0,
+        history_hits: 0,
+        history_misses: 0,
         empty: 0,
         parse_errors: 0,
         unreadable: 0,
@@ -116,9 +130,31 @@ pub async fn build_index(
             continue;
         }
         stats.files += 1;
+
+        // One `git log -1` per file keys the whole file's cache entries. An
+        // untracked file yields `None`, so its symbols keep the old
+        // warn-and-continue path and are never cached.
+        let file_last_commit = if is_repo {
+            match history::file_last_commit(repo, relative) {
+                Ok(sha) => sha,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %relative.display(),
+                        error = %err,
+                        "skipping history for file"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         for symbol in &parsed.symbols {
+            let content_hash = content_hash(symbol, &source)
+                .with_context(|| format!("hashing symbol {}", symbol.fqn))?;
             let Some(symbol_id) =
-                write_symbol(&transaction, relative, &source, symbol, &mut ids).await?
+                write_symbol(&transaction, relative, symbol, &content_hash, &mut ids).await?
             else {
                 continue;
             };
@@ -126,17 +162,58 @@ pub async fn build_index(
             if !is_repo {
                 continue;
             }
-            match history::history_for_span(repo, relative, symbol.start_line, symbol.end_line) {
-                Ok(commits) => {
+            let Some(last_commit) = file_last_commit.as_deref() else {
+                match history::history_for_span(repo, relative, symbol.start_line, symbol.end_line)
+                {
+                    Ok(commits) => {
+                        attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats)
+                            .await?;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %relative.display(),
+                            error = %err,
+                            "skipping history for symbol"
+                        );
+                    }
+                }
+                continue;
+            };
+            match cache.get(&symbol.fqn, &content_hash, last_commit).await? {
+                Some(commits) => {
+                    stats.history_hits += 1;
                     attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats)
                         .await?;
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        error = %err,
-                        "skipping history for symbol"
-                    );
+                None => {
+                    stats.history_misses += 1;
+                    match history::history_for_span(
+                        repo,
+                        relative,
+                        symbol.start_line,
+                        symbol.end_line,
+                    ) {
+                        Ok(commits) => {
+                            cache
+                                .put(&symbol.fqn, &content_hash, last_commit, &commits)
+                                .await?;
+                            attach_history(
+                                &transaction,
+                                symbol_id,
+                                &commits,
+                                ticket_regex,
+                                &mut stats,
+                            )
+                            .await?;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %relative.display(),
+                                error = %err,
+                                "skipping history for symbol"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -152,6 +229,8 @@ pub async fn build_index(
         symbols = stats.symbols,
         commits = stats.commits,
         tickets = stats.tickets,
+        history_hits = stats.history_hits,
+        history_misses = stats.history_misses,
         empty = stats.empty,
         parse_errors = stats.parse_errors,
         unreadable = stats.unreadable,
@@ -169,15 +248,13 @@ pub async fn build_index(
 async fn write_symbol(
     conn: &Connection,
     file: &Path,
-    source: &str,
     symbol: &Symbol,
+    content_hash: &str,
     ids: &mut HashMap<String, i64>,
 ) -> Result<Option<i64>> {
     let parent_id = symbol.parent.as_ref().and_then(|parent| ids.get(parent));
     let annotations = serde_json::to_string(&symbol.annotations)
         .context("serializing symbol annotations as JSON")?;
-    let content_hash =
-        content_hash(symbol, source).with_context(|| format!("hashing symbol {}", symbol.fqn))?;
 
     let inserted = conn
         .execute(
@@ -583,6 +660,8 @@ public class UserService {
                 symbols: 0,
                 commits: 0,
                 tickets: 0,
+                history_hits: 0,
+                history_misses: 0,
                 empty: 0,
                 parse_errors: 0,
                 unreadable: 0,
@@ -718,8 +797,14 @@ public class UserService {
     /// A Java file whose method body changes with `value`, so each rewrite
     /// touches the same lines and `git log -L` sees every commit.
     fn java(value: i64) -> String {
+        java_class("Service", value)
+    }
+
+    /// The same shape as [`java`] under a chosen class name, so a test can
+    /// prove one file's change does not invalidate another file's cache.
+    fn java_class(name: &str, value: i64) -> String {
         format!(
-            "package com.acme;\n\npublic class Service {{\n    public int value() {{\n        return {value};\n    }}\n}}\n"
+            "package com.acme;\n\npublic class {name} {{\n    public int value() {{\n        return {value};\n    }}\n}}\n"
         )
     }
 
@@ -864,6 +949,64 @@ public class UserService {
         );
     }
 
+    async fn cache_count(data: &Path, table: &str) -> i64 {
+        let store = Store::open(data).await.unwrap();
+        let mut rows = store
+            .cache()
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    async fn commit_rows(data: &Path) -> Vec<(String, String, String, String)> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query(
+                "SELECT s.fqn, c.sha, c.date, c.subject
+                 FROM symbol_commits c JOIN symbols s ON s.id = c.symbol_id
+                 ORDER BY s.fqn, c.sha",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+                row.get::<String>(3).unwrap(),
+            ));
+        }
+        out
+    }
+
+    async fn ticket_rows(data: &Path) -> Vec<(String, String, String, String)> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query(
+                "SELECT s.fqn, t.ticket_key, t.first_date, t.last_date
+                 FROM symbol_tickets t JOIN symbols s ON s.id = t.symbol_id
+                 ORDER BY s.fqn, t.ticket_key",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+                row.get::<String>(3).unwrap(),
+            ));
+        }
+        out
+    }
+
     #[tokio::test]
     async fn non_git_repo_indexes_structure_without_history() {
         let repo = tempfile::tempdir().unwrap();
@@ -878,6 +1021,11 @@ public class UserService {
         );
         assert_eq!(stats.commits, 0);
         assert_eq!(stats.tickets, 0);
+        assert_eq!(
+            stats.history_hits, 0,
+            "a non-git run never consults the cache"
+        );
+        assert_eq!(stats.history_misses, 0);
 
         let reader = IndexReader::open(data.path()).await.unwrap();
         let conn = reader.connection();
@@ -889,6 +1037,148 @@ public class UserService {
             )
             .await,
             0
+        );
+        assert_eq!(
+            cache_count(data.path(), "history_cache").await,
+            0,
+            "the history cache stays untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_index_hits_the_history_cache_with_identical_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        commit(
+            repo.path(),
+            "GRLD-1 add service",
+            "2024-01-01T00:00:00+01:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let cold = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(cold.history_hits, 0, "a fresh cache cannot hit");
+        assert_eq!(cold.history_misses, 2, "both symbols are looked up");
+
+        let commits_before = commit_rows(data.path()).await;
+        let tickets_before = ticket_rows(data.path()).await;
+
+        let warm = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            warm.history_hits, 2,
+            "every symbol is served from the cache"
+        );
+        assert_eq!(warm.history_misses, 0);
+
+        assert_eq!(
+            commit_rows(data.path()).await,
+            commits_before,
+            "a cached run stores the same commit rows"
+        );
+        assert_eq!(
+            ticket_rows(data.path()).await,
+            tickets_before,
+            "a cached run stores the same ticket rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_change_invalidates_only_the_changed_file() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/A.java",
+            &java_class("ServiceA", 1),
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            &java_class("ServiceB", 1),
+        );
+        commit(repo.path(), "GRLD-1 add both", "2024-01-01T00:00:00+00:00");
+        let data = tempfile::tempdir().unwrap();
+
+        index_git_repo(repo.path(), data.path()).await;
+
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            &java_class("ServiceB", 2),
+        );
+        commit(repo.path(), "GRLD-2 change B", "2024-02-02T00:00:00+00:00");
+
+        let warm = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(warm.history_hits, 2, "A's class and method are unchanged");
+        assert_eq!(warm.history_misses, 2, "B's class and method changed");
+    }
+
+    #[tokio::test]
+    async fn new_commit_invalidates_by_file_last_commit_even_when_content_reverts() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/A.java",
+            &java_class("ServiceA", 1),
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            &java_class("ServiceB", 1),
+        );
+        commit(repo.path(), "GRLD-1 add both", "2024-01-01T00:00:00+00:00");
+        let data = tempfile::tempdir().unwrap();
+
+        index_git_repo(repo.path(), data.path()).await;
+
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            &java_class("ServiceB", 2),
+        );
+        commit(repo.path(), "GRLD-2 change B", "2024-02-02T00:00:00+00:00");
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            &java_class("ServiceB", 1),
+        );
+        commit(repo.path(), "GRLD-3 revert B", "2024-03-03T00:00:00+00:00");
+
+        let warm = index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(warm.history_hits, 2, "A is untouched");
+        assert_eq!(
+            warm.history_misses, 2,
+            "B's content hash matches but its last commit moved, so it misses"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_cache_lives_in_cache_db_and_survives_a_rebuild() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(1));
+        commit(
+            repo.path(),
+            "GRLD-1 add service",
+            "2024-01-01T00:00:00+00:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            cache_count(data.path(), "history_cache").await,
+            2,
+            "both symbols are cached in cache.db"
+        );
+
+        std::fs::remove_file(data.path().join(crate::store::INDEX_DB)).unwrap();
+        index_git_repo(repo.path(), data.path()).await;
+        assert_eq!(
+            cache_count(data.path(), "history_cache").await,
+            2,
+            "the cache is not rebuilt from scratch"
         );
     }
 }

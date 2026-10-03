@@ -57,7 +57,16 @@ pub const INDEX_TABLES: &[&str] = &[
 
 /// `CREATE TABLE IF NOT EXISTS` statements for the persistent `cache.db`.
 pub const CACHE_TABLES: &[&str] = &[
-    // 2.3 history cache; 3.2 `tickets`; 4.1 LLM cache and embedding cache.
+    // 2.3 `history_cache`: one current row per fqn, keyed by fqn plus the
+    // symbol's content hash and the file's last commit sha; `commits` is a JSON
+    // array of [`crate::history::Commit`].
+    "CREATE TABLE IF NOT EXISTS history_cache (
+        fqn TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        file_last_commit TEXT NOT NULL,
+        commits TEXT NOT NULL
+    )",
+    // 3.2 `tickets`; 4.1 LLM cache and embedding cache.
 ];
 
 /// Create every index table on a fresh build connection. Called by
