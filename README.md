@@ -26,6 +26,8 @@ annatar index --path src/main/java/com/acme   # only part of the repo
 annatar show com.acme.user.UserRepository     # a symbol, its children, commits and tickets
 ```
 
+`--path <PREFIX>` is for fast iteration on part of the repo, not for refreshing a slice: a `--path` run still replaces the whole `index.db`, which then holds only that prefix (empty if the prefix matches nothing). The run logs a warning saying so; run `annatar index` without `--path` to get the full index back.
+
 ## Goals
 
 - **Faster onboarding** for new engineers

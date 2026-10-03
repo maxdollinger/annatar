@@ -1,10 +1,20 @@
 //! Build `index.db` from a repository's Java sources.
 //!
-//! [`build_index`] walks the production files, parses each one with a single
-//! reusable [`crate::symbols::JavaParser`] and writes every symbol to the
-//! `symbols` table of a fresh index build. The whole run happens on
-//! [`crate::store::IndexBuild`]'s temporary file and only becomes `index.db`
-//! when it commits; an error drops the build and leaves the previous index
+//! [`build_index`] is the one orchestrator of an index run. It owns the
+//! [`crate::store::IndexBuild`] and the single write transaction on it from
+//! start to finish, and runs the stages in order on that transaction:
+//!
+//! 1. **structure** (`index_structure`) walks the production files, parses
+//!    each one with a single reusable [`crate::symbols::JavaParser`] and writes
+//!    every symbol to `symbols`;
+//! 2. **history** (`index_history`) attaches each written symbol's commits
+//!    and ticket keys (`symbol_commits`, `symbol_tickets`); skipped when the
+//!    repository is not a git work tree.
+//!
+//! Later stages (tickets, summaries) slot in after history the same way. A
+//! stage never commits: the transaction commits and the temporary file is
+//! atomically renamed over `index.db` exactly once, after the last stage. Any
+//! stage error drops the transaction and the build, leaving the previous index
 //! untouched.
 //!
 //! Symbols are keyed by their fully qualified name, which is unique and stable
@@ -17,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use libsql::{Connection, params};
+use libsql::{Connection, Transaction, params};
 use regex::Regex;
 
 use crate::history::{self, Commit, HistoryCache};
@@ -54,9 +64,12 @@ pub struct IndexStats {
 
 /// Index every production Java file under `repo` into a fresh `index.db`.
 ///
-/// `path_prefix`, when given, limits the run to a part of the repository.
-/// `ticket_regex` extracts Jira keys from commit subjects and bodies; it is
-/// compiled by the caller so a bad pattern fails before the run starts.
+/// `path_prefix`, when given, limits the run to a part of the repository. The
+/// new index then holds only that part and still replaces the whole
+/// `index.db` (one warning says so); `--path` is for fast prompt iteration, not
+/// for refreshing a slice of a full index. `ticket_regex` extracts Jira keys
+/// from commit subjects and bodies; it is compiled by the caller so a bad
+/// pattern fails before the run starts.
 ///
 /// History is cached in `cache.db` keyed by fqn plus the symbol's content hash
 /// and its file's last commit sha, so a repeat run over unchanged sources
@@ -91,23 +104,86 @@ pub async fn build_index(
         );
     }
     let files = walk::java_files(repo, path_prefix)?;
-    let dirty = if is_repo {
-        dirty_files(repo, &files)
-    } else {
-        HashSet::new()
-    };
-    let build = store.begin_index().await?;
-    let mut stats = IndexStats::default();
-    let mut parser = JavaParser::new()?;
-    let mut ids: HashMap<String, i64> = HashMap::new();
+    if let Some(prefix) = path_prefix {
+        tracing::warn!(
+            prefix = %prefix.display(),
+            files = files.len(),
+            index = %store.index_path().display(),
+            "--path run: the index will be replaced by one holding only this prefix"
+        );
+    }
 
+    let build = store.begin_index().await?;
     let transaction = build
         .connection()
         .transaction()
         .await
         .context("starting index transaction")?;
+    let mut stats = IndexStats::default();
 
-    for relative in &files {
+    let indexed = index_structure(&transaction, repo, &files, &mut stats).await?;
+    if is_repo {
+        index_history(
+            &transaction,
+            store.cache(),
+            repo,
+            &indexed,
+            ticket_regex,
+            &mut stats,
+        )
+        .await?;
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("committing index transaction")?;
+    build.commit()?;
+    tracing::info!(
+        files = stats.files,
+        symbols = stats.symbols,
+        commits = stats.commits,
+        tickets = stats.tickets,
+        history_hits = stats.history_hits,
+        history_misses = stats.history_misses,
+        history_skipped = stats.history_skipped,
+        empty = stats.empty,
+        parse_errors = stats.parse_errors,
+        unreadable = stats.unreadable,
+        "indexed repository"
+    );
+    Ok(stats)
+}
+
+/// One file the structure stage wrote at least one parsed symbol for.
+struct IndexedFile {
+    path: PathBuf,
+    symbols: Vec<IndexedSymbol>,
+}
+
+/// One symbol row the structure stage wrote, with what later stages key on.
+struct IndexedSymbol {
+    id: i64,
+    symbol: Symbol,
+    content_hash: String,
+}
+
+/// Structure stage: parse `files` and write every symbol to `symbols`.
+///
+/// Returns each file that produced symbols, with the rows it wrote (a
+/// duplicate fqn writes no row and is left out), in walk order. Fills
+/// `files`, `symbols`, `empty`, `parse_errors` and `unreadable`.
+async fn index_structure(
+    transaction: &Transaction,
+    repo: &Path,
+    files: &[PathBuf],
+    stats: &mut IndexStats,
+) -> Result<Vec<IndexedFile>> {
+    let mut parser = JavaParser::new()?;
+    let mut ids: HashMap<String, i64> = HashMap::new();
+    let mut indexed = Vec::new();
+
+    for relative in files {
         let source = match std::fs::read_to_string(repo.join(relative)) {
             Ok(source) => source,
             Err(err) => {
@@ -132,30 +208,72 @@ pub async fn build_index(
         }
         stats.files += 1;
 
+        let mut symbols = Vec::with_capacity(parsed.symbols.len());
+        for symbol in parsed.symbols {
+            let content_hash = content_hash(&symbol, &source)
+                .with_context(|| format!("hashing symbol {}", symbol.fqn))?;
+            let Some(id) =
+                write_symbol(transaction, relative, &symbol, &content_hash, &mut ids).await?
+            else {
+                continue;
+            };
+            stats.symbols += 1;
+            symbols.push(IndexedSymbol {
+                id,
+                symbol,
+                content_hash,
+            });
+        }
+        indexed.push(IndexedFile {
+            path: relative.clone(),
+            symbols,
+        });
+    }
+    Ok(indexed)
+}
+
+/// History stage: attach commits and ticket keys to every symbol the
+/// structure stage wrote. Only called on a git work tree.
+///
+/// Fills `commits`, `tickets` and the three history buckets, so that
+/// `history_hits + history_misses + history_skipped == symbols`. History
+/// faults degrade per file or symbol (see [`build_index`]); only an index
+/// write error aborts the stage.
+async fn index_history(
+    transaction: &Transaction,
+    cache_conn: &Connection,
+    repo: &Path,
+    files: &[IndexedFile],
+    ticket_regex: &Regex,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let paths: Vec<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+    let dirty = dirty_files(repo, &paths);
+
+    for file in files {
+        let relative = file.path.as_path();
         // One `git log -1` per file keys the whole file's cache entries. A file
         // no commit touches has no history to look up, so it is skipped once
         // here rather than failing one `git log -L` per symbol.
-        let file_last_commit = if is_repo {
-            match history::file_last_commit(repo, relative) {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        "no commit touches this file; indexing it without history"
-                    );
-                    None
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        error = %err,
-                        "skipping history for file"
-                    );
-                    None
-                }
+        let file_last_commit = match history::file_last_commit(repo, relative) {
+            Ok(Some(sha)) => sha,
+            Ok(None) => {
+                tracing::warn!(
+                    path = %relative.display(),
+                    "no commit touches this file; indexing it without history"
+                );
+                stats.history_skipped += file.symbols.len();
+                continue;
             }
-        } else {
-            None
+            Err(err) => {
+                tracing::warn!(
+                    path = %relative.display(),
+                    error = %err,
+                    "skipping history for file"
+                );
+                stats.history_skipped += file.symbols.len();
+                continue;
+            }
         };
 
         let cacheable = !dirty.contains(relative);
@@ -163,8 +281,8 @@ pub async fn build_index(
         // so a cold run commits once per file rather than once per symbol. It
         // stays separate from the index transaction, so an aborted index never
         // rolls back history that was already computed.
-        let cache_transaction = if file_last_commit.is_some() && cacheable {
-            match store.cache().transaction().await {
+        let cache_transaction = if cacheable {
+            match cache_conn.transaction().await {
                 Ok(cache_transaction) => Some(cache_transaction),
                 Err(err) => {
                     tracing::warn!(
@@ -177,30 +295,15 @@ pub async fn build_index(
         } else {
             None
         };
-        let cache = HistoryCache::new(cache_transaction.as_deref().unwrap_or(store.cache()));
-        for symbol in &parsed.symbols {
-            let content_hash = content_hash(symbol, &source)
-                .with_context(|| format!("hashing symbol {}", symbol.fqn))?;
-            let Some(symbol_id) =
-                write_symbol(&transaction, relative, symbol, &content_hash, &mut ids).await?
-            else {
-                continue;
-            };
-            stats.symbols += 1;
-            if !is_repo {
-                continue;
-            }
-            let Some(last_commit) = file_last_commit.as_deref() else {
-                stats.history_skipped += 1;
-                continue;
-            };
+        let cache = HistoryCache::new(cache_transaction.as_deref().unwrap_or(cache_conn));
+        for indexed in &file.symbols {
             let commits = match symbol_history(
                 &cache,
                 repo,
                 relative,
-                symbol,
-                &content_hash,
-                last_commit,
+                &indexed.symbol,
+                &indexed.content_hash,
+                &file_last_commit,
                 cacheable,
             )
             .await
@@ -218,7 +321,7 @@ pub async fn build_index(
                     continue;
                 }
             };
-            attach_history(&transaction, symbol_id, &commits, ticket_regex, &mut stats).await?;
+            attach_history(transaction, indexed.id, &commits, ticket_regex, stats).await?;
         }
         if let Some(cache_transaction) = cache_transaction
             && let Err(err) = cache_transaction.commit().await
@@ -230,26 +333,7 @@ pub async fn build_index(
             );
         }
     }
-
-    transaction
-        .commit()
-        .await
-        .context("committing index transaction")?;
-    build.commit()?;
-    tracing::info!(
-        files = stats.files,
-        symbols = stats.symbols,
-        commits = stats.commits,
-        tickets = stats.tickets,
-        history_hits = stats.history_hits,
-        history_misses = stats.history_misses,
-        history_skipped = stats.history_skipped,
-        empty = stats.empty,
-        parse_errors = stats.parse_errors,
-        unreadable = stats.unreadable,
-        "indexed repository"
-    );
-    Ok(stats)
+    Ok(())
 }
 
 /// The indexed files with uncommitted changes, logged once per run.
@@ -1465,6 +1549,131 @@ public class UserService {
             cache_count(data.path(), "history_cache_v2").await,
             2,
             "the cache is not rebuilt from scratch"
+        );
+    }
+
+    async fn fqns(data: &Path) -> Vec<String> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query("SELECT fqn FROM symbols ORDER BY fqn", ())
+            .await
+            .unwrap();
+        let mut fqns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            fqns.push(row.get::<String>(0).unwrap());
+        }
+        fqns
+    }
+
+    #[tokio::test]
+    async fn stages_never_commit_so_an_aborted_build_keeps_the_previous_index() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Old.java",
+            &java_class("Old", 1),
+        );
+        commit(repo.path(), "GRLD-1 add old", "2024-01-01T00:00:00+00:00");
+        let data = tempfile::tempdir().unwrap();
+        index_git_repo(repo.path(), data.path()).await;
+
+        std::fs::remove_file(repo.path().join("src/main/java/com/acme/Old.java")).unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/New.java",
+            &java_class("New", 2),
+        );
+        commit(
+            repo.path(),
+            "GRLD-2 replace old",
+            "2024-02-01T00:00:00+00:00",
+        );
+
+        let store = Store::open(data.path()).await.unwrap();
+        let files = walk::java_files(repo.path(), None).unwrap();
+        let build = store.begin_index().await.unwrap();
+        let transaction = build.connection().transaction().await.unwrap();
+        let mut stats = IndexStats::default();
+        let indexed = index_structure(&transaction, repo.path(), &files, &mut stats)
+            .await
+            .unwrap();
+        index_history(
+            &transaction,
+            store.cache(),
+            repo.path(),
+            &indexed,
+            &ticket_regex(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.symbols, 2, "both stages ran on the new sources");
+        assert_eq!(stats.history_misses, 2);
+        assert!(stats.tickets > 0, "the history stage wrote ticket rows");
+
+        // A later stage failing makes the orchestrator return early, dropping
+        // the transaction and then the build, never committing either.
+        drop(transaction);
+        drop(build);
+
+        assert_eq!(
+            fqns(data.path()).await,
+            vec!["com.acme.Old", "com.acme.Old#value()"],
+            "an aborted build must leave the previous index.db untouched"
+        );
+        let leftovers = std::fs::read_dir(data.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".index-")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "the aborted build's temp file is removed");
+    }
+
+    #[tokio::test]
+    async fn path_run_replaces_the_index_with_only_that_prefix() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/a/A.java",
+            "package com.acme.a;\nclass A {}\n",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/b/B.java",
+            "package com.acme.b;\nclass B {}\n",
+        );
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).await.unwrap();
+
+        build_index(&store, repo.path(), None, &ticket_regex())
+            .await
+            .unwrap();
+        assert_eq!(
+            fqns(data.path()).await,
+            vec!["com.acme.a.A", "com.acme.b.B"]
+        );
+
+        let stats = build_index(
+            &store,
+            repo.path(),
+            Some(Path::new("src/main/java/com/acme/a")),
+            &ticket_regex(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.symbols, 1);
+        assert_eq!(
+            fqns(data.path()).await,
+            vec!["com.acme.a.A"],
+            "--path narrows the whole index by design (open #19)"
         );
     }
 }

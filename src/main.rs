@@ -11,7 +11,8 @@ use annatar::{indexer, show};
 #[derive(Debug, Parser)]
 #[command(name = "annatar", version, about)]
 struct Cli {
-    /// Limit the run to paths under this prefix.
+    /// Limit the run to paths under this prefix, for fast iteration. `index`
+    /// still replaces the whole index.db, which then holds only this prefix.
     #[arg(long, global = true, value_name = "PREFIX")]
     path: Option<PathBuf>,
 

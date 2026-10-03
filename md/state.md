@@ -10,12 +10,31 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 3 — Jira (in progress); Phase 2 and its audit remediation R0–R8 complete |
-| Step | 3.1 Fetch and parse — **done** (synthetic fixtures; real-token run pending, J3) |
+| Phase | 3 — Jira (in progress); Phase 2 and its audit remediation R0–R9 complete |
+| Step | R9 Staged pipeline — **done** (prerequisite for 3.2); 3.1 done with synthetic fixtures (real-token run pending, J3) |
 | Last updated | 2026-10-03 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **R9 Staged pipeline.** `build_index` is now the one orchestrator: it owns
+  the `IndexBuild` and a single write transaction on it, runs the stages
+  `index_structure(&Transaction, repo, files, &mut stats) ->
+  Vec<IndexedFile>` then (git repos only) `index_history(&Transaction,
+  cache, repo, &[IndexedFile], ticket_regex, &mut stats)`, and commits the
+  transaction and renames the temp file exactly once, after the last stage. No
+  stage commits; any stage error returns early, dropping the transaction
+  (rollback) and the build (temp file deleted), so the previous `index.db` is
+  untouched. `IndexedFile`/`IndexedSymbol` carry the row id, `Symbol` and
+  content hash from structure to history. The dirty-file check moved into the
+  history stage. Behaviour-preserving: `IndexStats` and the R1 invariant are
+  unchanged, and a live re-run on `argus` reproduced R8 exactly (960 symbols,
+  2920 commits, 1821 tickets; cold 960 misses, warm 960 hits). Open #19
+  decided (D-ab): a `--path` run keeps narrowing the whole index, now with one
+  warning (prefix, file count, index path), documented in the README and
+  `--path` help. New tests: stages run on a build and then aborted leave the
+  previous index and no temp file; a `--path` run replaces the index with
+  only that prefix. 103 tests pass (2 ignored).
 
 - **3.1 review fixes.** Body read errors are `FetchError::Transport`
   (`bytes()` then `serde_json::from_slice` → `Parse`). A 403 with
@@ -501,11 +520,15 @@ the decisions taken, and the tradeoffs behind them.
   (`cargo test -- --ignored fetches_real_ticket --nocapture`, audit §3.1),
   replace the synthetic fixtures in `tests/fixtures/jira/` with scrubbed real
   captures (open #20), and report the auth mode and parent/epic field shape.
-  Confirm or override the PM defaults for J1, J2, J9 (D-w–D-y), answer J4–J8,
-  and decide open #19 (`--path` narrows the whole index).
-- **Agent:** R9 staged pipeline (needs J4; natural home for open #19), then
-  3.2 Ticket cache. 3.2 must key the cache by the *requested* key, not
-  `Ticket.key` (D-z).
+  Confirm or override the PM defaults for J1, J2, J4, J9 (D-w–D-y, D-aa) and
+  the open #19 decision (D-ab), and answer J5–J8.
+- **Agent:** 3.2 Ticket cache (needs J5–J8). The ticket stage is a third
+  stage `index_tickets(&Transaction, …)` called by `build_index` after
+  `index_history` and before the commit: it reads the distinct keys from
+  `symbol_tickets` on the build transaction (uncommitted rows are visible
+  there), fetches missing ones into `cache.db`, and copies the reader fields
+  into the index `tickets` table (J8). 3.2 must key the cache by the
+  *requested* key, not `Ticket.key` (D-z).
 
 ## Step log
 
@@ -542,6 +565,7 @@ the decisions taken, and the tradeoffs behind them.
 | R8 Real-repo run | done | `argus` (release, rustc 1.99.0): 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (~7.8×), 15.6 ms/symbol, **92.5 % ticket coverage**, 0 degraded; cold run is git-bound (44 % CPU), release ≈ debug; R2/R3 verified live, history spot-checked against git; closes open #18; finding 5 measured (4 % merge-only keys → no action), finding 8 withdrawn; new open #19 (`--path` narrows the index). Toolchain installed: fmt/clippy/`cargo test` (80+1) green for the first time |
 | 3.1 Fetch and parse | done | `jira` module: `Ticket`, pure `parse_issue`, async `JiraClient::fetch` (REST v2, `expand=renderedFields`, 30 s timeout), `Auth` (J1), `FetchError` + `status_error`, `html2text`; `jira.epic_link_field` (J9); `reqwest` 0.13 (`json` + `rustls`); **synthetic** fixtures (J3 deviation, open #20); `#[ignore]` `fetches_real_ticket`; decisions D-w–D-z; 93 tests |
 | 3.1 review fixes | done | body read errors → `Transport`; 403 + `X-Authentication-Denied-Reason` → `Unauthorized` (J6); testable `JiraClient::request`; no unicode strikeout, blank-line runs collapsed; `base_url` validated and trimmed; 401 message per auth mode; more parse/HTML tests; D-x/D-z notes; 101 tests |
+| R9 Staged pipeline | done | `build_index` orchestrates `index_structure` → `index_history` on one `&Transaction`, single commit + rename at the end; stage abort keeps the previous index (test); open #19 decided: `--path` narrows by design, one warning + README/help (D-aa, D-ab); `argus` re-run identical to R8; 103 tests |
 
 ## Decisions and tradeoffs
 
@@ -616,6 +640,8 @@ the decisions taken, and the tradeoffs behind them.
 | D-x (3.1, J2) | `reqwest` 0.13 with `default-features = false`, features `json` + `rustls` (0.13 renamed the old `rustls-tls` feature; it uses aws-lc-rs and the platform certificate verifier), and `html2text` (`plain_no_decorate`, no table borders, no link footnotes) for `renderedFields` HTML. PM default, adopted audit recommendation; product owner may override. | `ureq`/blocking; hand-written HTML stripper; ADF parser via REST v3 | Async fits the tokio runtime and 3.2's bounded concurrency; `html2text` keeps lists, tables and code blocks readable. Accepts the TLS compile cost decision 13 avoided for libSQL. A lighter alternative exists: reqwest `rustls-no-provider` plus `rustls` with the `ring` provider avoids the `aws-lc-sys` build; not adopted for now. `default-features = false` also drops reqwest's `system-proxy` (OS proxy settings); `HTTPS_PROXY`/`HTTP_PROXY` from the environment are still honoured. Plain output avoids `**`/URL noise in LLM prompts |
 | D-y (3.1, J9) | `parent_key` = `fields.parent.key`; only when absent, the optional `jira.epic_link_field` custom field (a string key, or an object with `key`). Unset = ignored. PM default, adopted audit recommendation; product owner may override. | Discover the epic-link field via `/rest/api/2/field`; parent only | Cloud covers it via `parent`; Server/DC opts in without code changes |
 | D-z (3.1, J3) | **Deviation:** fixtures under `tests/fixtures/jira/` are synthetic (REST v2 `renderedFields` shape, `jira.example.com`), not real captures; the real-token run is the `#[ignore]` `jira::tests::fetches_real_ticket` (base URL from `ANNATAR_JIRA_URL` or `annatar.toml`, key from `ANNATAR_JIRA_TEST_KEY`; prints only auth mode, key, type, parent and lengths). Also: REST v2 (works on Cloud and Server/DC), `Ticket.key` is the key Jira returns — a moved issue returns its *new* key, so 3.2 must key the cache by the *requested* key (and `fetches_real_ticket` only logs a mismatch), description `None` when null or blank after conversion, keys outside `[A-Za-z0-9_-]` are rejected before any request | Block 3.1 on a token | No token is available to the agent; parsing is pure, so swapping in real captures only changes test data. Tracked as open #20 |
+| D-aa (R9, J4) | One orchestrator (`build_index`) owns the `IndexBuild` and one write transaction; stages are separate functions taking `&libsql::Transaction` (structure → history now, tickets in 3.2, summaries later), and the transaction commit + atomic rename happen once after the last stage. Stages take `&Transaction` rather than `&Connection`: the type says "you are inside the build's transaction" so a stage cannot be called on the committed index or the cache by mistake, while `Transaction: Deref<Target = Connection>` keeps the existing helpers (`write_symbol`, `attach_history`) unchanged. Structure hands history an in-memory `Vec<IndexedFile>` (row id, `Symbol`, content hash) instead of re-reading `symbols`. PM default, adopted audit recommendation; product owner may override. | Later stages write into the committed `index.db` (breaks temp file + atomic rename); an `IndexBuild::transaction()` guard type; stages re-query `symbols` | Keeps the ground rule and D-g's single-transaction batching; one long write transaction on a private temp file blocks nobody. Structure-then-history instead of interleaved per symbol changes only log order, not results (R8 numbers reproduced). Holding the `Symbol`s for the run is a few MB at most |
+| D-ab (R9, open #19) | A `--path` run keeps replacing the whole `index.db` with an index of only that prefix (empty if it matches nothing). It now logs one warning (prefix, file count, index path), and the README and the `--path` help say so. No merging. PM default, adopted audit recommendation; product owner may override. | Merge the prefix into the existing index; refuse to replace a full index | `--path` exists for fast prompt iteration (plan ground rules); merging needs stable ids/upserts, which is "Incremental indexing" in Later. Making the narrowing explicit removes the surprise at no cost |
 
 ## Open questions
 
@@ -639,5 +665,5 @@ the decisions taken, and the tradeoffs behind them.
 | 16 | The scratch-git test helpers are now duplicated across the `history`, `indexer`, `show` and `benchmark` test modules (four copies of `git`/`git_ok`/`init_repo`/`commit`). Extract a shared `#[cfg(test)]` support module. | 2.2 review | resolved by R5 — `src/test_support.rs`, shared with `tests/benchmark.rs` via `#[path]` (decision D-s) |
 | 17 | The history cache makes *repeat* runs fast (1.2 s), but the first cold run over a huge real repo is still minutes (per-symbol `git log -L`). Add bounded parallelism (results through one writer) if cold-run time starts to hurt, or rely on the project's central-build model. | 2.3 | open, defer — the plan offered parallelism *or* the cache; the cache was chosen (daily iteration is the stated goal). Revisit when a real repo is indexed end to end (R8). **R8 measured it:** cold 14.97 s for 960 symbols on `argus` (release), which does not hurt, so parallelism stays deferred — but note the cold run sits at 44 % CPU, waiting on sequential `git log -L` subprocesses, so bounded parallelism (not faster Rust) is the only lever that would move it if a larger repo does start to hurt. The proposed cheaper lever — replacing a top-level type's `-L` with `git log -- <file>` (audit 2, finding 8) — is **withdrawn**: measured over 30 types it matches in only 9 cases and drops ~47 % of the commits (history simplification hides TREESAME-through-merge commits that `-L` reports), so it would lose history rather than save time |
 | 18 | Phase 2.3 measured a synthetic repo by product-owner decision; no real GRLD repo has been indexed end to end (multi-module `grld-core` would also hit the test-pruning gap of open #13). | 2.3 | **resolved** (R8) — `argus` indexed end to end: 217 files, 960 symbols, cold 14.97 s / warm 1.92 s (release), 92.5 % ticket coverage. Single-module, so #13 is still untested by a real repo |
-| 19 | A `--path` run rebuilds `index.db` wholesale, so it leaves an index holding only that prefix, and a missing prefix empties it (`show` then fails repo-wide). Should `--path` merge into the existing index, refuse to replace it, or is narrowing intended and merely undocumented? | R8 | open — found by the R8 run; decide with R9/J4 (the staged pipeline owns the build until commit), or document the flag as destructive |
+| 19 | A `--path` run rebuilds `index.db` wholesale, so it leaves an index holding only that prefix, and a missing prefix empties it (`show` then fails repo-wide). Should `--path` merge into the existing index, refuse to replace it, or is narrowing intended and merely undocumented? | R8 | **resolved (R9, D-ab)** — narrowing is intended: `--path` is for fast prompt iteration; the run warns once that it replaces `index.db` with a partial index, and README + `--path` help document it. No merging (would need incremental indexing, Later) |
 | 20 | The 3.1 Jira fixtures are synthetic (no token available to the agent). Replace them with scrubbed real `renderedFields` captures (story, bug, sub-task, epic child, empty description) and confirm the auth mode and parent/epic field shape (J3, audit §3.1). | 3.1 | open — **product owner** |
