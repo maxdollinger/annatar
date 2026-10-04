@@ -152,7 +152,7 @@ No edge, counted as unresolved:
 - Spring Data derived queries;
 - test code: test sources are not indexed, so test callers never show (#45, deferred to the Later test-code item, D-dv).
 
-**Entry points.** Methods the framework calls have no caller in the code: `@Scheduled`, `@RequestMapping` and `@GetMapping`/`@PostMapping`/…, `@EventListener`, `@ExceptionHandler`, `@PostConstruct`/`@PreDestroy`, `@Bean` methods, `public static void main`. `trace` stops there and labels them with the annotation (already stored in `symbols.annotations`).
+**Entry points.** Methods the framework calls have no caller in the code: `@Scheduled`, `@RequestMapping` and `@GetMapping`/`@PostMapping`/…, `@EventListener`, `@ExceptionHandler`, `@PostConstruct`/`@PreDestroy`, `@Bean` methods, `public static void main`. `trace` labels them with the annotation (already stored in `symbols.annotations`) and stops there, unless code calls them too (an inter-bean `@Bean` call; D-ec).
 
 ## Modules
 
@@ -176,7 +176,7 @@ CREATE INDEX edges_dst_id ON edges(dst_id);
 CREATE INDEX edges_src_id ON edges(src_id);
 ```
 
-One row per call site, so `show` can print every line. Roll-ups (a type's `used by`) and transitive callers are queries: plain joins and a recursive CTE, as `project.md` plans.
+One row per call site, so `show` can print every line. Roll-ups (a type's `used by`) and transitive callers are queries: plain joins and recursive CTEs, as `project.md` plans; `trace` walks the transitive callers one such query per symbol (D-dx).
 
 **Pipeline.** A structure-side stage after the symbols are written (`index_edges`, module `src/usages.rs`). It walks the syntax trees the structure stage parsed, kept in memory until then and dropped after it (D-db); 7 ms on `argus`'s 162 files. `IndexStats` and the `index` summary add edges per kind and unresolved type names and call sites (the most frequent unresolved names at `-v`); the benchmark reports the stage's time.
 
@@ -204,16 +204,16 @@ One row per call site, so `show` can print every line. Roll-ups (a type's `used 
 
 Users grouped by their file with the lines of the mentions; the kind named when it is not `call`; `ambiguous` marked; entry points marked `[entry: @Scheduled]`; each list capped with `… N more` (`-k`, default 20). **`via`** (D-dr): a method that overrides others is used by the callers of each method it overrides, up the `overrides` chain — they call `I#m` and reach the override at run time —, listed `via` the full fqn of `I#m` (what an agent copies into `show` / `trace`, D-dw); a type's roll-up includes its members' `via` callers. A method's incoming `overrides` edges are listed too (`… overrides :44`: the methods overriding it); a type's roll-up leaves out the `overrides` edges into its members, which repeat the subtype's `extends` / `implements` line (6.5 review). **`uses`** of a type rolls up its members' and nested types' outgoing edges without the ones to symbols inside it and without its members' `overrides`, the mirror of `used by` (D-ds); its lines are in the shown symbol's file, not in the file heading them, which the title says (`uses (lines in this symbol's file)`, D-dt); a `new T(..)` with a declared constructor shows only the constructor. An empty `used by` reads `none in main sources` (#45). The queries (`src/usage_query.rs`) are SQL joins over `parent_id` and `overrides`, shared with `trace`, as is the entry-point test (`usage_query::entry_point`).
 
-`annatar trace '…SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage)'`:
+`annatar trace '…SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage)'` (6.6, `argus`, paths shortened):
 
 ```
-…SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage)
-  …SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) :76
+…SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage) [method] …/messageConsumer/SecurityDataAddEventConsumer.java:23-28
+  …SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) …/SecurityDataEventDispatcher.java:76
     …SecurityDataEventDispatcher#receiveAndDispatchMessages() :67
       …SecurityDataEventDispatcher#processMessages() :59 [entry: @Scheduled]
 ```
 
-Default depth 4 (at most 10); each symbol once (a repeat prints `(see above)`), so cycles and diamonds end; leaves are entry points or `[no callers in main sources]`; through `overrides` with `via`; a type traces its members.
+Default depth 6 (at most 10; D-ea, #52 closed); each symbol expanded once, at its shallowest level, the first such line depth first (a later copy prints `(see above)`, an earlier and deeper one `(see below)`, D-eb), so cycles and diamonds end and the depth never hides a caller reachable higher up; leaves are `[no callers in main sources]` and the depth (`[N callers beyond depth D]`); entry points are marked `[entry: @Scheduled]` and end the branch unless code calls them too (D-ec); through `overrides` with `via`. One line per caller, its links joined by `; ` (kind unless `call`, `ambiguous`, `via`, lines), the caller's file only when it is not the file of the symbol it calls (D-dz); at most `-k` callers per symbol (default 10). A type traces its members: the root type's callers are rolled up as in `show`; below the root a type mentioning the symbol above (a field, a header) is a leaf, `[type, not followed]` — its own users only hold the field, the members using it show up as callers themselves —, while a type whose initializer calls or instantiates it is `[initializer]`, followed through the code constructing it (D-dy). The walk is in Rust over `usage_query::callers` (one query per symbol reached, a breadth-first pass for the levels, a depth-first one to print; the recursive CTEs of `used_by` without the roll-up and with the kind filter), not one recursive CTE over the whole tree (D-dx).
 
 ## Steps
 

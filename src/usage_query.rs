@@ -8,9 +8,11 @@
 //! out of its members and nested types, without the edges that end inside
 //! it. In a type's roll-up the `overrides` edges of its members are left
 //! out: the `extends` / `implements` of the type says the same. Both are
-//! plain SQL joins over `parent_id` and `overrides`, read by `show` and
-//! reusable by `trace`. [`entry_point`] names the annotations the framework
-//! calls a method through.
+//! plain SQL joins over `parent_id` and `overrides`, read by `show`.
+//! [`callers`] is the variant `trace` walks: only `call`, `instantiate` and
+//! `reference` edges, a type rolled up only when asked; [`constructions`]
+//! the code constructing a type. [`entry_point`]
+//! names the annotations the framework calls a method through.
 
 use anyhow::{Context, Result};
 use libsql::{Connection, params};
@@ -22,6 +24,9 @@ pub struct Usage {
     pub id: i64,
     pub fqn: String,
     pub file: String,
+    /// The other symbol's kind (`class`, `method`, ..).
+    pub symbol_kind: String,
+    /// The edge kind.
     pub kind: String,
     /// The line of the mention, in the user's file.
     pub line: i64,
@@ -39,14 +44,49 @@ const INSIDE: &str = "inside(id) AS (
     UNION SELECT symbols.id FROM symbols JOIN inside ON symbols.parent_id = inside.id
 )";
 
+/// The row of the symbol `id` alone, for the queries without a roll-up.
+const SELF: &str = "inside(id) AS (SELECT ?1)";
+
+/// The row of the type `id` and its constructors.
+const CONSTRUCTORS: &str = "inside(id) AS (
+    SELECT ?1
+    UNION SELECT id FROM symbols WHERE parent_id = ?1 AND kind = 'constructor'
+)";
+
+/// The edge kinds `trace` follows to a symbol's callers.
+const CALLER_KINDS: &str = "AND edges.kind IN ('call', 'instantiate', 'reference')";
+
+/// The edge kinds that construct a type.
+const CONSTRUCTION_KINDS: &str = "AND edges.kind IN ('call', 'instantiate')";
+
 /// The users of the symbol `id`: incoming edges of it and of its members
 /// and nested types whose source is outside it (`overrides` only into the
 /// symbol itself), then the non-`overrides` edges into every method they
 /// override (transitively, outside it), with `via` set; ordered by file,
 /// line and fqn.
 pub async fn used_by(conn: &Connection, id: i64) -> Result<Vec<Usage>> {
+    users(conn, id, INSIDE, "").await
+}
+
+/// The callers of the symbol `id` as `trace` follows them: the `call`,
+/// `instantiate` and `reference` edges of [`used_by`] (with `via`), for a
+/// type rolled up over its members and nested types only when `roll_up` is
+/// set, otherwise into the symbol itself.
+pub async fn callers(conn: &Connection, id: i64, roll_up: bool) -> Result<Vec<Usage>> {
+    users(conn, id, if roll_up { INSIDE } else { SELF }, CALLER_KINDS).await
+}
+
+/// The code constructing the type `id`: the `instantiate` edges into it
+/// and the `call` / `instantiate` edges into its constructors from outside
+/// them, for `trace` to follow a type whose initializers call the symbol
+/// above.
+pub async fn constructions(conn: &Connection, id: i64) -> Result<Vec<Usage>> {
+    users(conn, id, CONSTRUCTORS, CONSTRUCTION_KINDS).await
+}
+
+async fn users(conn: &Connection, id: i64, inside: &str, kinds: &str) -> Result<Vec<Usage>> {
     let sql = format!(
-        "WITH RECURSIVE {INSIDE},
+        "WITH RECURSIVE {inside},
          overridden(id) AS (
              SELECT dst_id FROM edges WHERE kind = 'overrides' AND src_id IN inside
              UNION SELECT edges.dst_id FROM edges JOIN overridden ON edges.src_id = overridden.id
@@ -65,6 +105,7 @@ pub async fn used_by(conn: &Connection, id: i64) -> Result<Vec<Usage>> {
          LEFT JOIN symbols AS via ON via.id = targets.via
          WHERE edges.src_id NOT IN inside
            AND (edges.kind <> 'overrides' OR (targets.via IS NULL AND edges.dst_id = ?1))
+           {kinds}
          ORDER BY src.file, edges.line, src.fqn, edges.kind, via.fqn, edges.ambiguous, dst.fqn"
     );
     read(conn, &sql, id)
@@ -116,6 +157,7 @@ async fn read(conn: &Connection, sql: &str, id: i64) -> Result<Vec<Usage>> {
             entry: entry_point(&kind, &fqn, &signature, &annotations),
             fqn,
             file: row.get(2)?,
+            symbol_kind: kind,
             kind: row.get(6)?,
             line: row.get(7)?,
             ambiguous: ambiguous != 0,
@@ -484,6 +526,40 @@ mod tests {
                 "a.Lib#<init>() instantiate :11",
                 "a.Lib reference :13",
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn callers_follow_only_usage_kinds_and_roll_a_type_up_only_when_asked() {
+        let (_data, reader) = sample().await;
+        let conn = reader.connection();
+
+        let callers_of = |fqn: &'static str, roll_up| async move {
+            lines(&callers(conn, id(conn, fqn).await, roll_up).await.unwrap())
+        };
+
+        assert_eq!(
+            callers_of("a.B#m()", false).await,
+            strings(&[
+                "a.D#run() call :8 via a.I#m() [@Scheduled]",
+                "a.E#viaB() call :20",
+            ])
+        );
+        assert_eq!(
+            callers_of("a.C", false).await,
+            strings(&["a.D reference :2"])
+        );
+        assert!(callers_of("a.B", false).await.is_empty());
+        assert_eq!(
+            callers_of("a.B", true).await,
+            strings(&[
+                "a.D#run() call :8 via a.I#m() [@Scheduled]",
+                "a.E#viaB() call :20",
+            ])
+        );
+        assert_eq!(
+            callers_of("a.C", true).await,
+            lines(&used_by(conn, id(conn, "a.C").await).await.unwrap())
         );
     }
 

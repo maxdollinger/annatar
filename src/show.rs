@@ -836,6 +836,7 @@ com.acme.flow.AddConsumer#consume(Message) [method]
             id,
             fqn: fqn.to_string(),
             file: "src/A.java".to_string(),
+            symbol_kind: if fqn.contains('#') { "method" } else { "class" }.to_string(),
             kind: kind.to_string(),
             line,
             ambiguous,

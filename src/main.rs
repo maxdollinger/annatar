@@ -15,7 +15,7 @@ use annatar::summaries::Summarizer;
 use annatar::symbols::{Role, SymbolKind};
 use annatar::tickets::TicketFetch;
 use annatar::usage_eval::{self, UsageSet};
-use annatar::{eval, indexer, show};
+use annatar::{eval, indexer, show, trace};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
 #[derive(Debug, Parser)]
@@ -67,6 +67,26 @@ enum Command {
         /// Entries listed per usage list (default 20, at most 100); the
         /// rest are counted as `… N more`.
         #[arg(short = 'k', long, value_name = "N", default_value_t = show::DEFAULT_LIMIT, value_parser = parse_show_limit)]
+        limit: usize,
+    },
+    /// Print the transitive callers of a symbol as an indented tree: per
+    /// line a caller as `fqn [kind] [via I#m] file:lines` (the file left out
+    /// when it is the file of the symbol it calls), its own callers below
+    /// it. Follows `call`, `instantiate` and `reference` edges and the
+    /// callers of the methods a method overrides (`via`); a type is traced
+    /// through its members' and nested types' callers. Each symbol is
+    /// expanded once, where it is shallowest (`(see above)` / `(see
+    /// below)`); entry points are marked (`[entry: @A]`); a branch ends at a
+    /// symbol without callers or the depth.
+    Trace {
+        /// Fully qualified name, e.g. `com.acme.user.UserRepository#find(Long)`.
+        fqn: String,
+        /// Caller levels below the symbol (default 6, at most 10).
+        #[arg(long, value_name = "N", default_value_t = trace::DEFAULT_DEPTH, value_parser = parse_depth)]
+        depth: usize,
+        /// Callers listed per symbol (default 10, at most 100); the rest are
+        /// counted as `… N more`.
+        #[arg(short = 'k', long, value_name = "N", default_value_t = trace::DEFAULT_LIMIT, value_parser = parse_show_limit)]
         limit: usize,
     },
     /// Search symbol descriptions by meaning and print the files of the
@@ -131,6 +151,13 @@ fn search_limits() -> String {
 
 fn parse_show_limit(text: &str) -> Result<usize, String> {
     parse_limit_from(text, 1)
+}
+
+fn parse_depth(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(depth) if (1..=trace::MAX_DEPTH).contains(&depth) => Ok(depth),
+        _ => Err(format!("expected a number from 1 to {}", trace::MAX_DEPTH)),
+    }
 }
 
 fn parse_eval_limit(text: &str) -> Result<usize, String> {
@@ -314,6 +341,13 @@ async fn run(cli: &Cli) -> Result<()> {
             print!(
                 "{}",
                 show::render_limited(reader.connection(), fqn, *limit).await?
+            );
+        }
+        Command::Trace { fqn, depth, limit } => {
+            let reader = IndexReader::open(&config.data_dir).await?;
+            print!(
+                "{}",
+                trace::render(reader.connection(), fqn, *depth, *limit).await?
             );
         }
         Command::Search {
