@@ -10,12 +10,93 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 5 — Search and agent trial (Phase 4 LLM summaries complete pending the product owner's confirmation of the 4.5 review and the 4.6 descriptions; Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
-| Step | 5.3 review fixes — **done** (hermetic CLI tests, `eval -k` ≥ 5, D-cg / D-ch / open #39 corrected); 5.3 Evaluate — **done** (`annatar eval <golden.toml>`; `argus`, 24 questions, default index: primary fqn top-1 4 / top-5 14, any expected fqn top-1 10 / top-5 17 (types 10: 1/4 and 5/7; members 14: 3/10 and 5/10); `parent_description = true` measured, default kept (D-cg); the right file is in the top 5 for 18 of 24; question 2 answered: a good "where to look", not a one-shot answer); next 5.4 Agent trial |
+| Phase | 5 — Search and agent trial — **complete; the POC is complete**: question 1 answered by 4.5/4.6, question 2 by 5.3 (D-ch), question 3 by 5.4 (D-cl). What remains are the product owner's confirmations (Next). (Phase 4 LLM summaries complete pending the product owner's confirmation of the 4.5 review and the 4.6 descriptions; Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
+| Step | 5.4 Agent trial — **done** (4 `argus` tasks × 2 arms × 5 runs, Claude Code headless on `claude-sonnet-5`; with `annatar`: −47 % total tokens, −40 % tool calls, −32 % cost, −39 % wall time on average, lower on every task; correctness 36 vs 35 of 40 points: ticket reasons only with `annatar` (T2 5/5 vs 0/5), but 4 of 5 `annatar` runs skipped the message dispatcher on the flow trace (T4); question 3 answered: yes on this repository, with caveats (D-cl)); 5.3 Evaluate and its review fixes — done |
 | Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **5.4 Agent trial.** One commit (`docs(trial)`): the harness
+  `scripts/agent_trial/run.py` and these notes; no Rust change, no
+  reindex. *Protocol (D-cj, fixed before the main runs):* Claude Code
+  2.1.289 headless (`claude -p … --output-format stream-json`) on
+  `claude-sonnet-5`, effort medium, cwd `/Repos/argus` (a read-only mount;
+  `git status` checked after every run), tools Bash/Read/Grep/Glob only,
+  no MCP, no settings files, no skills, no session persistence,
+  auto-memory off (its directory checked empty after every run), ≤ 60
+  turns, ≤ $3 per run. Both arms get the same prompt (a preamble: "new to
+  this repository … do not modify files … answer with classes, methods,
+  file paths"; then the task). The *with* arm also gets a neutral appended
+  system prompt (what `annatar search` / `annatar show` print, "the best
+  match is not always first … check the code"; no "always use it") and an
+  `annatar` wrapper on `PATH` (`--config` of the real index, 5.3 default,
+  unchanged); the *without* arm gets neither. Four read-only tasks on
+  `argus`, written from the code (not from descriptions, not checked
+  against search, not from the golden set) with an answer key before any
+  run: **T1** oldest sessions of users on many devices stop working →
+  per-user token cap (`DatabaseCacheUserTokenStrategy`, 500, oldest by
+  creation deleted on each login; question words ≠ code words); **T2**
+  users thrown out after login when the contract cannot be processed →
+  which code, which HTTP statuses, why (`SubscriptionDataService` →
+  `AuthDataService#getAuthData` → `removeAllTokens`; the reason, a
+  dashboard/login redirect loop, is only in the Jira ticket); **T3** which
+  users skip the "is this JWT still an active session" check, where, why
+  (`UserTokenService#isTokenValid` admin bypass, used by the
+  prevalidation endpoint; reason in tickets, partly inferable from code);
+  **T4** trace what happens when the subscription service announces a
+  booked feature until other services see it (queue dispatcher → feature
+  consumer → contract cache refresh → DynamoDB update event). 5 runs per
+  task and arm (40), rep-major, arm order alternating. Metrics from the
+  stream: total tokens = input + cache read + cache creation + output
+  (each also kept), `total_cost_usd`, tool calls by tool (Bash commands
+  parsed for `annatar search` / `show`), turns, `duration_ms`.
+  Correctness 0/1/2 per answer key (2 = every must-fact, 1 = right place
+  but a must-fact missing or wrong, 0 = wrong place), graded by a separate
+  agent from the 40 final answers shuffled, the word `annatar` redacted
+  (one answer named it), without access to the run mapping; spot-checked
+  (T4 misses confirmed). Pilot (T1 once per arm) excluded.
+  *Results (mean ± sd over 5 runs; tokens in thousands):*
+
+  | task | arm | total tokens | cost $ | tool calls | `annatar` search / show | turns | wall s | score (0–2) |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | T1 session cap | with | 53 ± 2 | 0.051 | 4.0 | 2.0 / 0 | 5.0 | 11 | 2.0 |
+  | | without | 140 ± 68 | 0.080 | 8.2 | – | 9.2 | 23 | 2.0 |
+  | T2 contract error | with | 112 ± 13 | 0.089 | 6.0 | 2.6 / 1.6 | 7.0 | 19 | 2.0 (reason 5/5) |
+  | | without | 216 ± 99 | 0.132 | 11.6 | – | 12.6 | 35 | 1.0 (reason 0/5) |
+  | T3 admin bypass | with | 79 ± 16 | 0.058 | 5.0 | 1.8 / 1.0 | 6.0 | 14 | 2.0 (reason 5/5) |
+  | | without | 217 ± 49 | 0.125 | 12.8 | – | 13.8 | 33 | 2.0 (reason 5/5, inferred) |
+  | T4 feature flow | with | 220 ± 44 | 0.161 | 17.0 | 3.0 / 0.8 | 18.0 | 37 | 1.2 (dispatcher missed 4/5) |
+  | | without | 310 ± 58 | 0.190 | 20.6 | – | 21.6 | 42 | 2.0 |
+  | **all** | with | 116 ± 69 | 0.090 | 8.0 | 2.35 / 0.85 | 9.0 | 20 | 1.80 (36/40) |
+  | | without | 221 ± 90 | 0.132 | 13.3 | – | 14.3 | 33 | 1.75 (35/40) |
+
+  With `annatar` vs without, per task: total tokens −62 / −48 / −63 /
+  −29 %, cost −36 / −32 / −53 / −15 %, tool calls −51 / −48 / −61 /
+  −17 %, wall time −52 / −47 / −58 / −12 %; overall −47 % tokens, −32 %
+  cost, −40 % tool calls, −37 % turns, −39 % wall time. The token ranges
+  of the two arms do not overlap for T1 and T3 and overlap for T2 and T4
+  (exact rank test on 5 vs 5, ties broken arbitrarily: tokens p ≈ 0.008 /
+  0.03 / 0.008 / 0.06; tool calls p ≤ 0.03 on all four). Token split
+  (means, with vs without): cache read 102k vs 202k, cache creation 12.6k
+  vs 15.5k, output 1.9k vs 2.9k, uncached input 11 vs 21; tool calls by
+  tool: Bash 4.3 (with the `annatar` calls) vs 4.6, Read 3.4 vs 5.8, Grep
+  0.2 vs 2.9, Glob 0.2 vs 0.15. Every *with* run used `annatar` (1–4
+  searches, often two in one Bash call; `show` in 12 of 20, always on T2
+  and T3, where the ticket reasons are). Correctness: T1 and T3 full
+  marks in both arms (the *without* arm inferred T3's reason from the
+  code); T2's reason (redirect loop) came only with `annatar` — the
+  *without* arm found the ticket key in `git log` but guessed a generic
+  "fail safe"; on T4 four *with* answers started at the feature consumer
+  that search returned and left out the queue dispatcher that delivers the
+  message (two also named a wrong reader), while all five *without*
+  answers traced it from the queue. *Spend:* $4.43 for the 40 runs ($1.80
+  with, $2.63 without), $0.52 pilot (of which $0.29 an accidental Opus
+  pair, D-cj), ≈ $0.07 setup checks: ≈ $5.0 in total; the grader ran in
+  this session. Raw streams, `runs.csv`, the blind answers, the mapping
+  and the grades are in `.annatar-local/agent-trial/` (private).
+  *Verdict:* D-cl. New open #41 (trial size), #42 (search shortcuts a
+  call chain).
 
 - **5.3 review fixes.** One commit. *Hermetic CLI tests (finding 1):*
   the `tests/cli.rs` eval test passed only because the caller's
@@ -1830,16 +1911,14 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Agent:** 5.4 Agent trial: 3–5 real `argus` tasks with known relevant
-  code, each run with and without `annatar search` / `annatar show`
-  (README), tokens and tool calls measured as decided up front. 5.3 says
-  how to use search: read the top 5 as a neighbourhood (a class and its
-  main method often tie, D-ch) and expect plain domain words that the
-  descriptions do not use to miss. `annatar eval` reruns the benchmark
-  after any change to descriptions or embeddings.
+- **Product owner:** the POC is complete (questions 1–3 answered: 4.5/4.6,
+  D-ch, D-cl). Decide whether to go on to **Later** (`plan.md`), and with
+  which levers first: #40 (retrieval), #42 (callers / `trace` so a search
+  hit does not shortcut a call chain), #41 (repeat the agent trial on a
+  larger repository with tasks written by someone else; the harness is
+  `scripts/agent_trial/run.py`).
 - **Product owner:** 5.3 open #39 (raise `describe.body_chars` so the two
-  longest members are described from their whole source; ≈ 4 chat calls)
-  and #40 (retrieval levers after the POC).
+  longest members are described from their whole source; ≈ 4 chat calls).
 - **Product owner:** the 4.6 trade-off is settled (D-bq: a member without
   a reason is fine when its class has one). Still open: the 4.5 review
   verdicts and golden questions (open #34), the borrowed reasons on
@@ -1904,6 +1983,7 @@ the decisions taken, and the tradeoffs behind them.
 | 4.6 review fixes and PO feedback | done | PO: "as short as possible without losing information", own reasons kept (borrowed ones and name guesses still excluded; accessor/constructor clause kept as "only when the history explains this very member or its field"); collective terms instead of enumerations; description-specific meta-phrase list (8 review sentences pass); `ollama.max_tokens` 1024 safety cap, `length` reply invalid, not in the cache key; per-stage peak prompt/completion tokens in the stats; "Merged " subjects dropped too; tests (commit order, type commit subjects); `argus` 19 min 21 s, 654 calls, 0 invalid/retries, rerun 0 calls; members with a reason 34 → 62, median 105 → 126 chars, max 489 → 334; spot check 6 C / 4 V / 4 B / 1 W of 15; 264 tests |
 | 4.6 Symbol descriptions (PO redesign) | done | one `description` (members `Description`, types `TypeDescription`) replaces `what`/`why`, `symbols.description` column; commit subjects always in the prompt (`History { tickets, commits }`); "as short as possible", no length limit; validation: blank, control chars, ticket key, openers, source phrases (no "the commit"); `show` prints `- description:`; `argus` 15 min 29 s, 541 chat calls, 0 invalid/retries, rerun 0 calls; median 105 (members) / 147 (types) chars, 99 % one sentence; spot check 15 C / 5 V / 0 W of 20; D-bm–D-bp; 262 tests |
 | 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
+| 5.4 Agent trial | done | `scripts/agent_trial/run.py` (headless Claude Code, stream-json metrics, blind answers); `claude-sonnet-5`, 4 `argus` tasks × with/without × 5 runs; with `annatar` −47 % tokens, −40 % tool calls, −32 % cost ($0.090 vs $0.132 per run), −39 % wall time; score 36 vs 35 / 40 (ticket reason T2 5/5 vs 0/5; T4 dispatcher missed 4/5 with); ≈ $5.0 spent; D-cj–D-cl, open #41/#42 |
 | 5.3 review fixes | done | `tests/cli.rs` helper clears proxy variables and sets `NO_PROXY=127.0.0.1,localhost` (eval test passed only through the caller's `NO_PROXY`); `eval -k` 5–100 (top-5 in the summary); D-cg states both sides (variant better on 5 of 6 totals, types regress, within noise at n = 24, default kept); sample-size caveat in D-ch / Done / plan.md; open #39 dedented lengths; 306 tests; no reindex (D-cf, D-cg, D-ch amended; D-ci) |
 | 5.3 Evaluate | done | `eval` module + `annatar eval [-k N] <golden.toml>` (check_index first, unfiltered `search::search` per question, primary / any rank, top-1/top-5/MRR for all, types, members); 305 tests (+9, incl. a CLI run against a localhost embedding server); `argus` 24 questions default: primary 4/14 of 24 (top-1/top-5), any 10/17; `parent_description = true`: primary 7/13, any 11/17, types worse (0 chat calls, 8 embedding calls) → default kept; misses: parent/member ties 7, DTOs 3, vocabulary 5, truncated source / missing behaviour 3, wrong reason 1, lookalike 1; D-cf–D-ch, open #39, #40 |
 | 5.2 review fixes | done | `relative_prefix` applies `..` lexically (escape → `None`); `search::path_filter`: repo root / `.` → no filter, escape → error (index: `a/../a` now works, `../x` still empty, open #38); README/D-cb/D-cc/D-cd: `--path` for search, nested-type role rule, field-3 fqn and location after the tokens, warnings may precede `error:`; tests: path normalisation, top_k vs exact scan, CLI data dir unchanged (model-mismatch path, hermetic), `--path` escapes; 296 tests; `argus` checked without reindex (D-cb, D-cc, D-cd amended; D-ce) |
@@ -2045,6 +2125,9 @@ the decisions taken, and the tradeoffs behind them.
 | D-cg (5.3) | Keep `[embedding] parent_description = false` as the default | Switch it on (state.md Next / D-br asked 5.3 to decide) | Measured on `argus` (24 questions, D-ch table in Done). **Amended (5.3 review fixes, orchestrator's call):** overall the variant is better on 5 of 6 metrics — primary top-1 4 → 7, primary MRR 0.358 → 0.409, any top-1 10 → 11, any MRR 0.536 → 0.576, right file first / in the top 5 12/18 → 14/19 — and worse only on primary top-5 (14 → 13; any top-5 17 → 17). Members gain (primary top-1 3 → 6, any top-1 5 → 8); types regress (any top-1 5 → 3, any MRR 0.573 → 0.468: members that carry their class's description crowd out the class itself). Per question the primary moves up for 6 and down for 9 overall, but within the top 10 for 5 up and 4 down. The default stays off not because the variant is worse — on the totals it is slightly better — but because the difference is within noise at n = 24 (one question is ≈ 4 pp; 95 % CI ≈ ±18 pp, D-ch) and the regression on types is systematic, not noise-sized in its mechanism; AGENTS.md: keep the default unless a change is clearly better. The variant stays available via config for repos or agents that ask mostly for methods; 5.4 uses the default. Cost of the switch is only embedding calls (8 calls, 8 s, 0 chat calls on `argus`) |
 | D-ch (5.3) | **Question 2 verdict:** search by meaning finds the right neighbourhood but rarely the exact symbol first: on 24 identifier-free questions an acceptable symbol is in the top 5 for 17 (71 %) and the right file for 18 (75 %); the intended symbol is first for 4 (17 %), any acceptable one for 10 (42 %). These are n = 24 questions on one repository by one author: one question is ≈ 4 pp and a 95 % confidence interval is roughly ±18 pp (71 % ≈ 51–86 %, 17 % ≈ 7–36 %), so they show the order of magnitude, not a precise rate (5.3 review fixes). Good enough as "where to look" for an agent that reads the top 5 and `show`s them; not a one-shot answer. The golden set is not edited and no prompt is tuned to improve the numbers | Edit questions or add alternates that the misses suggest; tune prompts; count the 5.2 own queries (9/9 first) | Editing the set after seeing the ranks would measure the set, not the index; prompt changes would invalidate the LLM cache (≈ 20 min of chat calls) and are not this step's scope. The 5.2 queries were written by the agent with the descriptions in view, so they overstate quality; the golden set's writing rule (D-bl) is what makes this the honest number. Misses are mostly structural (a class and its main method tie, DTOs restate the behaviour, plain domain words absent from descriptions), plus two members described from a truncated source (open #39) and one wrong reason (open #30); the levers are listed in open #40 |
 | D-ci (5.3 review fixes) | CLI tests clear the proxy variables and set `NO_PROXY=127.0.0.1,localhost` in the `annatar()` helper; the production Ollama client keeps honouring the environment's proxy settings, loopback included | Bypass the proxy for loopback URLs in `OllamaBackend` | The defect was test hermeticity, not product behaviour: a real Ollama on localhost works whenever `NO_PROXY` is set as usual, and the container reaches the host's Ollama through `host.docker.internal`, which is already in `NO_PROXY`. Overriding the user's proxy configuration in the client would be a surprising product change outside this fix's scope |
+| D-cj (5.4) | Agent trial protocol: Claude Code 2.1.289 headless on `claude-sonnet-5` (effort medium) in both arms; tools Bash/Read/Grep/Glob; no MCP, settings files, skills, session persistence or auto-memory (checked); the repository is a read-only mount and `git status` is compared after every run; 4 tasks with an answer key written before any run, 5 runs per task and arm, arm order alternating; the *with* arm differs only by a neutral appended system prompt and the `annatar` wrapper on `PATH`; metrics from the stream (`usage`, `total_cost_usd`, tool_use blocks, `num_turns`, `duration_ms`); correctness 0/1/2 graded by a separate agent from shuffled answers with `annatar` redacted | `claude-sonnet-5-5` as the orchestrator proposed; Opus; 2 runs per arm; a placebo prompt for the *without* arm; grading by the implementer | `claude-sonnet-5-5` does not exist: the CLI silently ran `claude-opus-5-5` (seen in `modelUsage` of the first pilot), so the harness now aborts when `modelUsage` names another model; Sonnet keeps the 40 runs at ≈ $4.4. Five runs because a pilot cost ≈ $0.11 and agent runs are noisy (T1 *without* 82k–221k tokens). The appended prompt describes output and limits ("check the code") but does not push the tool, so its use is the agent's choice; a placebo prompt would add tokens without information. A separate grader keeps the arms blind (one answer named the tool, redacted); `--permission-mode dontAsk` was overridden by the session's bypass mode in the child, so read-only rests on the mount and the tool set, verified per run |
+| D-ck (5.4) | Commit the harness as `scripts/agent_trial/run.py` (Python stdlib; `run`, `summary`, `blind`), generic: the task texts, answer key, raw streams, blind answers, mapping and grades stay in `.annatar-local/agent-trial/` (they name employer code); no unit tests for the script and no Rust change | Keep the script in the scratchpad; a Rust benchmark | A measurement tool, not product code: committed so the trial can be repeated on another repository (open #41) with a private task file; it was exercised end to end by the 40 runs and the pilot. `cargo fmt`, `clippy` and `test` still run green for the step |
+| D-cl (5.4) | **Question 3 verdict:** yes on this repository — with `annatar` the agent spent about half the tokens (116k vs 221k, −47 %), 40 % fewer tool calls, 32 % less money and 39 % less time, lower on every task, and was as correct (36 vs 35 of 40 points). The gain is largest where the question's words are not the code's (T1, −62 % tokens) and on "why" questions (T3 −63 %); ticket reasons that are not in the code come only from `annatar` (T2 5/5 vs 0/5). The risk: a search hit lets the agent skip the plumbing in front of it — on the flow trace (T4) 4 of 5 *with* answers missed the queue dispatcher that the *without* arm always found. Caveats: n = 5 runs × 4 tasks, one small repository (162 main files, ≈ 7k lines, where grep is cheap — a larger one likely widens the gap, unmeasured), one model, tasks and key by the author who built the index, an LLM grader; total tokens are ≈ 90 % cache reads, so cost (−32 %) is the fairer money measure | Call it unproven until a larger trial | The direction is consistent on every task and metric and the tool-call reduction is significant per task (p ≤ 0.03, 5 vs 5); the size of the effect and its transfer to larger repositories and other people's tasks are open #41; the T4 failure mode is open #42 |
 
 ## Open questions
 
@@ -2090,3 +2173,5 @@ the decisions taken, and the tradeoffs behind them.
 | 38 | `index --path` outside the repository (absolute, or `../x` since D-ce) still walks nothing and replaces `index.db` with an empty one (one warning, D-ab), while `search --path` errors. Make `index` refuse an outside prefix too? | 5.2 review | open — a behaviour change to `index` beyond the review's scope; small (`java_files` would return an error instead of an empty list), decide with open #19 |
 | 39 | `describe.body_chars` (1500) cuts the source of the 2 longest of 479 `argus` members (`AuthDataService#getAuthData(UUID)` ≈ 1964 chars, `RoleRelationsUpdatedMessageConsumer#perform(…)` ≈ 1751, measured on the dedented source the cap applies to; 2046 / 1825 raw, corrected in the 5.3 review fixes), and in both the behaviour a golden question asks about (the logout in the error branch, the role-cache refresh) is after the cut, so their descriptions omit it and they rank 45th and 7th. Raise the default (e.g. 2500) or make the cut keep the tail? | 5.3 | open — product owner: changing it re-describes only those 2 members and their 2 enclosing types (≈ 4 chat calls; prompts of the other members are unchanged), but it changes a default and a prompt input, which this step must not do (D-ch); the prompt tokens grow only for long members |
 | 40 | Retrieval levers after the POC (5.3 misses, D-ch): group a type with its members in `search` output (a class and its main method tie within 0.01–0.03 in 7 of 20 misses); down-weight or tag data carriers (request TOs, response DTOs) that restate the behaviour they carry (3); a lexical or synonym channel for domain words absent from descriptions (5: "second factor" vs security method, "login cookie" vs JWT); fewer shared initiative reasons on sibling classes (open #30). Pursue any? | 5.3 | open — none is needed for 5.4; revisit with the 5.4 agent-trial results |
+| 41 | The agent trial (D-cl) is small: 4 tasks × 5 runs per arm on one ≈ 7k-line repository, one model (`claude-sonnet-5`), tasks and answer key by the author who built the index, graded by an LLM. Repeat on a larger repository (where grep is costlier) with tasks written by someone else (product owner, team) and a second model before generalising the −47 % tokens / equal correctness? `scripts/agent_trial/run.py` takes any private task file | 5.4 | open — product owner (after the POC) |
+| 42 | Search can shortcut a call chain: on the flow-trace task (T4) 4 of 5 agents with `annatar` started at the consumer search returned and left out the queue dispatcher that calls it (all 5 without it traced from the queue). Levers: callers in `show` or the `trace` command of `project.md`; a hint in the agent prompt to check who calls a hit; group a type with its members (#40) | 5.4 | open — after the POC (with #40) |
