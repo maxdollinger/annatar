@@ -11,8 +11,9 @@
 //! 3. **changed** — about a tenth of the files rewritten in one new commit, so
 //!    only those files' symbols miss.
 //!
-//! Each class holds a field of the next one, so the edges stage (6.2) has
-//! one type usage per class to resolve; its time is printed per run.
+//! Each class holds a field of the next one and each method calls its
+//! namesake on it, so the edges stage (6.2, 6.3) has one type usage and
+//! [`METHODS`] calls per class to resolve; its time is printed per run.
 //!
 //! No network and no `--release`: the timings are from a debug build and
 //! overstate release run time. They are printed, never asserted; only the
@@ -57,7 +58,7 @@ fn class_source(class: usize, version: usize) -> String {
         format!("package com.bench;\n\npublic class C{class} {{\n    private C{next} next;\n");
     for method in 0..METHODS {
         out.push_str(&format!(
-            "    /** method {method} */\n    public int m{method}() {{\n        return {};\n    }}\n",
+            "    /** method {method} */\n    public int m{method}() {{\n        return next.m{method}() + {};\n    }}\n",
             version * 100 + method
         ));
     }
@@ -173,9 +174,9 @@ async fn synthetic_index_benchmark() {
     assert_eq!(cold.symbols, symbols, "every generated symbol is indexed");
     for stats in [cold, warm, changed] {
         assert_eq!(
-            (stats.edges_reference, stats.edges()),
-            (FILES, FILES),
-            "one field reference per class"
+            (stats.edges_reference, stats.edges_call, stats.edges()),
+            (FILES, FILES * METHODS, FILES * (METHODS + 1)),
+            "one field reference and a call per method per class"
         );
     }
     for stats in [cold, warm, changed] {

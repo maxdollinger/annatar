@@ -189,12 +189,12 @@ Per file: package, single-type, wildcard and static imports. Per type: superclas
 
 **6.3 Member resolution**
 *Goal:* `call` and `instantiate` edges to methods and constructors.
-Receiver typing, chains, implicit members (Lombok, records, enums), method references (`this::dispatch`, `T::m`, `T::new`), static imports, `super.m()`, overload choice with `ambiguous` as described above; needs 6.1's return and field types.
+Receiver typing, chains, implicit members (Lombok, records, enums), method references (`this::dispatch`, `T::m`, `T::new`), static imports, `super.m()`, overload choice with `ambiguous` as described above; needs 6.1's return and field types. The `index` summary counts call sites resolved to a member / implicit / ambiguous / unresolved (top unresolved calls at `-v`).
 *Done when:* fixture tests cover each case, including a chain through a getter, a chain cut by an external type, an untyped lambda parameter (no edge), overloads by count and by argument type, and an ambiguous pair; a test on `argus`-shaped fixtures resolves `Dispatcher#dispatch → Config#getAddEventConsumer() → AddEventConsumer#consume(..)`.
 
 **6.4 Overrides and measured quality**
 *Goal:* `overrides` edges and numbers for how complete and how precise the edges are.
-`overrides`: a method to the method with the same name and parameter count (then simple parameter types) in a superclass or interface in the index, through generic interfaces (`MessageConsumer<T>#consume(T)`). The `index` summary reports resolved / unresolved / ambiguous call sites. A usage golden set outside git (`.annatar-local/usages-argus.toml`, like `golden-argus.toml`, D-bl): about 15 `argus` symbols (types, public and private methods, an interface method, a Lombok getter, a consumer) with their true direct users, taken from an IDE's *Find usages* on main sources; checked against the index first so a renamed symbol fails loudly (as `golden::check_index`).
+`overrides`: a method to the method with the same name and parameter count (then simple parameter types) in a superclass or interface in the index, through generic interfaces (`MessageConsumer<T>#consume(T)`). The `index` summary reports resolved / unresolved / ambiguous call sites (since 6.3). A usage golden set outside git (`.annatar-local/usages-argus.toml`, like `golden-argus.toml`, D-bl): about 15 `argus` symbols (types, public and private methods, an interface method, a Lombok getter, a consumer) with their true direct users, taken from an IDE's *Find usages* on main sources; checked against the index first so a renamed symbol fails loudly (as `golden::check_index`).
 *Done when:* precision and recall of direct users per symbol and overall, and the share of resolved call sites, are in the PR; every miss is classified (lambda, external chain, generics, other).
 
 **6.5 `show`: `used by` and `uses`**

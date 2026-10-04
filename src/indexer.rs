@@ -7,7 +7,7 @@
 //! 1. **structure** (`index_structure`) walks the production files, parses
 //!    each one with a single reusable [`crate::symbols::JavaParser`] and writes
 //!    every symbol to `symbols`; then **edges** (`index_edges`) resolves the
-//!    type usages between the written symbols over the same parsed trees
+//!    type and member usages between the written symbols over the same parsed trees
 //!    ([`crate::usages`]) and writes them to `edges`;
 //! 2. **history** (`index_history`) attaches each written symbol's commits
 //!    and ticket keys (`symbol_commits`, `symbol_tickets`); skipped when the
@@ -215,11 +215,27 @@ pub struct IndexStats {
     pub edges_instantiate: usize,
     /// `reference` rows written to `edges`.
     pub edges_reference: usize,
+    /// `call` rows written to `edges`.
+    pub edges_call: usize,
     /// Mentions of type names that resolve to no indexed type (JDK,
     /// libraries, names outside a `--path` prefix); no edge.
     pub unresolved_types: usize,
     /// Distinct names among `unresolved_types`.
     pub unresolved_type_names: usize,
+    /// Call sites (method and constructor calls, method references) that
+    /// resolve to one indexed method or constructor (a `call` edge, none
+    /// for recursion).
+    pub calls_resolved: usize,
+    /// Call sites to a member the compiler or Lombok generates (accessors,
+    /// builders, enum and record members, undeclared constructors): only a
+    /// `reference` to its type.
+    pub calls_implicit: usize,
+    /// Call sites that match more than one overload (an ambiguous edge to
+    /// each).
+    pub calls_ambiguous: usize,
+    /// Call sites that resolve to nothing indexed (library receivers,
+    /// unknown types); no edge.
+    pub calls_unresolved: usize,
     /// Wall time of the edges stage.
     pub edges_time: Duration,
 }
@@ -227,7 +243,11 @@ pub struct IndexStats {
 impl IndexStats {
     /// Rows written to `edges`, all kinds.
     pub fn edges(&self) -> usize {
-        self.edges_extends + self.edges_implements + self.edges_instantiate + self.edges_reference
+        self.edges_extends
+            + self.edges_implements
+            + self.edges_instantiate
+            + self.edges_reference
+            + self.edges_call
     }
 }
 
@@ -425,6 +445,11 @@ pub async fn build_index(
         edges_implements = stats.edges_implements,
         edges_instantiate = stats.edges_instantiate,
         edges_reference = stats.edges_reference,
+        edges_call = stats.edges_call,
+        calls_resolved = stats.calls_resolved,
+        calls_implicit = stats.calls_implicit,
+        calls_ambiguous = stats.calls_ambiguous,
+        calls_unresolved = stats.calls_unresolved,
         unresolved_types = stats.unresolved_types,
         unresolved_type_names = stats.unresolved_type_names,
         edges_ms = stats.edges_time.as_millis() as u64,
@@ -533,7 +558,7 @@ async fn index_structure(
 /// Unresolved type names logged at `-v`, most frequent first.
 const TOP_UNRESOLVED: usize = 20;
 
-/// Edges stage: resolve the type usages between the symbols the structure
+/// Edges stage: resolve the type and member usages between the symbols the structure
 /// stage wrote and write them to `edges`, one row per distinct (source,
 /// target, kind, line). Only symbols of this run are targets, so a `--path`
 /// run keeps the edges inside its prefix. Fills the `edges_*` and
@@ -566,8 +591,15 @@ async fn index_edges(
     for edge in &found.edges {
         let inserted = transaction
             .execute(
-                "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, line) VALUES (?1, ?2, ?3, ?4)",
-                params![edge.src, edge.dst, edge.kind.as_str(), edge.line as i64],
+                "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, line, ambiguous)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.src,
+                    edge.dst,
+                    edge.kind.as_str(),
+                    edge.line as i64,
+                    i64::from(edge.ambiguous)
+                ],
             )
             .await
             .context("writing an edge")?;
@@ -579,22 +611,20 @@ async fn index_edges(
             EdgeKind::Implements => stats.edges_implements += 1,
             EdgeKind::Instantiate => stats.edges_instantiate += 1,
             EdgeKind::Reference => stats.edges_reference += 1,
+            EdgeKind::Call => stats.edges_call += 1,
         }
     }
     stats.unresolved_types = found.unresolved.values().sum();
     stats.unresolved_type_names = found.unresolved.len();
-    let mut names: Vec<(&String, &usize)> = found.unresolved.iter().collect();
-    names.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    if !names.is_empty() {
-        tracing::info!(
-            names = names
-                .iter()
-                .take(TOP_UNRESOLVED)
-                .map(|(name, count)| format!("{name} {count}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            "most frequent unresolved type names"
-        );
+    stats.calls_resolved = found.calls.resolved;
+    stats.calls_implicit = found.calls.implicit;
+    stats.calls_ambiguous = found.calls.ambiguous;
+    stats.calls_unresolved = found.calls.unresolved;
+    if let Some(names) = most_frequent(&found.unresolved) {
+        tracing::info!(names, "most frequent unresolved type names");
+    }
+    if let Some(calls) = most_frequent(&found.unresolved_calls) {
+        tracing::info!(calls, "most frequent unresolved calls");
     }
     drop(files);
     for file in indexed.iter_mut() {
@@ -605,6 +635,20 @@ async fn index_edges(
     }
     stats.edges_time = start.elapsed();
     Ok(())
+}
+
+/// The [`TOP_UNRESOLVED`] most frequent of `counts` as `name count, ...`.
+fn most_frequent(counts: &HashMap<String, usize>) -> Option<String> {
+    let mut names: Vec<(&String, &usize)> = counts.iter().collect();
+    names.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    (!names.is_empty()).then(|| {
+        names
+            .iter()
+            .take(TOP_UNRESOLVED)
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 /// History stage: attach commits and ticket keys to every symbol the
@@ -2349,7 +2393,8 @@ public class UserService {
         assert_eq!(count(conn).await, 1);
     }
 
-    /// Every `edges` row as `src fqn -kind-> dst fqn :line`, sorted.
+    /// Every `edges` row as `src fqn -kind-> dst fqn :line` (`ambiguous`
+    /// appended when so), sorted.
     async fn edge_rows(data: &Path) -> Vec<String> {
         let reader = IndexReader::open(data).await.unwrap();
         let mut rows = reader
@@ -2364,13 +2409,17 @@ public class UserService {
             .unwrap();
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
-            assert_eq!(row.get::<i64>(4).unwrap(), 0, "no ambiguous type edge");
             out.push(format!(
-                "{} -{}-> {} :{}",
+                "{} -{}-> {} :{}{}",
                 row.get::<String>(0).unwrap(),
                 row.get::<String>(1).unwrap(),
                 row.get::<String>(2).unwrap(),
-                row.get::<i64>(3).unwrap()
+                row.get::<i64>(3).unwrap(),
+                if row.get::<i64>(4).unwrap() == 1 {
+                    " ambiguous"
+                } else {
+                    ""
+                }
             ));
         }
         out.sort();
@@ -2425,6 +2474,66 @@ class Service extends Base implements Api {
             (stats.unresolved_types, stats.unresolved_type_names),
             (2, 2),
             "Map and String"
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_are_written_with_their_ambiguity_and_call_sites_counted() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Api.java",
+            "\
+package com.acme;
+class Api {
+    void one(String s) {}
+    void pick(Api a) {}
+    void pick(String s) {}
+}
+",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/User.java",
+            "\
+package com.acme;
+class User {
+    void run(Api api, Object x) {
+        api.one(\"a\"); api.one(\"b\");
+        api.pick(null);
+        x.toString();
+        new User();
+    }
+}
+",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = build(repo.path(), data.path()).await.unwrap();
+        let rows = edge_rows(data.path()).await;
+        let calls: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.contains("-call->"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "com.acme.User#run(Api,Object) -call-> com.acme.Api#one(String) :4",
+                "com.acme.User#run(Api,Object) -call-> com.acme.Api#pick(Api) :5 ambiguous",
+                "com.acme.User#run(Api,Object) -call-> com.acme.Api#pick(String) :5 ambiguous",
+            ]
+        );
+        assert_eq!(stats.edges_call, 3, "the two calls on line 4 are one row");
+        assert_eq!(
+            (
+                stats.calls_resolved,
+                stats.calls_implicit,
+                stats.calls_ambiguous,
+                stats.calls_unresolved
+            ),
+            (2, 1, 1, 1),
+            "x.toString() is outside the index, User's constructor implicit"
         );
     }
 
