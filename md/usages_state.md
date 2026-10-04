@@ -18,13 +18,40 @@ unique across both files.
 
 | | |
 | --- | --- |
-| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.3 done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
-| Step | 6.3 Member resolution — **done** (reviewed, findings fixed); next: `refactor(usages)` module split, then 6.4 |
-| Last updated | 2026-10-04 (6.3) |
+| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.3 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
+| Step | 6.3a `refactor(usages)` module split — **done** (no behaviour change); next: 6.4 Overrides and measured quality |
+| Last updated | 2026-10-04 (6.3a) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
 
+- **6.3a `refactor(usages)`: module split** (review L6 of 6.3; no
+  behaviour change). `src/usages.rs` (4310 lines) becomes the module root
+  plus `src/usages/`, laid out like `src/symbols.rs` +
+  `src/symbols/facts.rs` (D-dl): `usages.rs` (module docs, API `EdgeKind`,
+  `Edge`, `SourceFile`, `Usages`, `CallSites`, `resolve`, and the shared
+  test helpers), `resolver.rs` (`TypeEntry`, `Scope`, `FieldFilter`,
+  `Lookup`, `Ty`, `Resolver` with the type table, name lookup, `lineage`
+  / `supers`, fields, `declared`), `members.rs` (`Method`, `Fit`, the
+  `Resolver` methods for methods, constructors, static imports, implicit
+  members, `choose` / `score`, and `fits` / `overrides` / the JDK
+  tables), `walk.rs` (`Region`, `Unnamed`, `FileWalk`: the tree walk,
+  scopes, locals, type mentions, `record` / `emit` / `push`, node
+  helpers) and `expr.rs` (`Receiver` and the `FileWalk` methods that type
+  expressions: calls, receivers, method references, field access, names).
+  Code moved verbatim: items and fields used across the files are
+  `pub(super)` (only those), imports split per file, rustfmt reflowed the
+  longer signatures; every string literal (all fixtures) is unchanged.
+  The 39 tests moved to the module they exercise (2 + 6 helpers stay in
+  `usages.rs`, 10 in `resolver`, 10 in `members`, 8 in `walk`, 9 in
+  `expr`); same 356 lib tests (373 listed in all), all green; fmt and
+  clippy `--all-targets -D warnings` clean. **`argus`** (`index
+  --offline` on a scratch copy of `data-real`): the same 1142 edges
+  (identical by fqn and by row ids, `symbols` identical), call sites
+  1386 = 423 / 167 / 0 / 796, 11 ms, 0 chat calls, `cache.db` md5
+  unchanged. Review: approved, 3 doc nits fixed (test count, test
+  share, wording of the code change in D-dl); the undocumented `edges`
+  test helper is pre-existing, left as moved.
 - **6.3 Member resolution.** `call` edges to methods and constructors and
   `instantiate` edges to the constructor `new T(..)` / `T::new` chooses,
   in `src/usages.rs` on the same walk as 6.2. `EdgeKind::Call`,
@@ -292,18 +319,11 @@ unique across both files.
 
 ### Next
 
-- **`refactor(usages)`: split `src/usages.rs`** (≈ 4300 lines, ≈ 2600
-  logic) before 6.4 adds `overrides`, as its own commit with no behaviour
-  change (review L6): `src/usages/mod.rs` (API: `Edge`, `EdgeKind`,
-  `Usages`, `CallSites`, `resolve`), `resolver.rs` (type table, name
-  lookup, `lineage`, fields), `members.rs` (methods, implicit members,
-  overloads: `choose`/`score`/`fits`/`overrides`/JDK table), `walk.rs`
-  (`FileWalk`), tests with their module; `argus` edges identical.
 - **6.4 Overrides and measured quality** (`plan.md` Phase 6): `overrides`
   edges (a method → the method with the same name and parameter count,
   then simple parameter types, in an indexed superclass or interface,
   through generic interfaces); `Resolver::methods` already drops a method
-  overridden nearer with that rule (`overrides()` in `src/usages.rs`, a
+  overridden nearer with that rule (`overrides()` in `src/usages/members.rs`, a
   type variable of the farther one matching any type) — reuse it. The
   call-site counts are in the `index` summary since 6.3 (the plan put them
   in 6.4); 6.4 adds the usage golden set and precision / recall, and
@@ -322,8 +342,8 @@ unique across both files.
 | 6.1 Parser facts for resolution | done | `ParsedFile` gains `package`, `imports`, `types` (`TypeFacts`: super types, fields, Lombok, methods with return/parameter types and varargs, enum constants, record components); `src/symbols/facts.rs`; symbols unchanged (`argus` reindex identical); D-cy–D-da; review: 9 findings, 5 fixed (record varargs component, compact constructor params, annotated superclass, 2 doc nits), 4 recorded as limitations/notes (outer generic args, Lombok arguments, tree for 6.2, arity from `params`) |
 | 6.2 Type resolution and `edges` | done | `edges` table; `src/usages.rs` resolver (nested/inherited → single import → same package → wildcard, qualified names, static-import constants, variable shadowing); `index_edges` after structure on the kept trees; stats, `edges:` output line, `-v` top unresolved names, `--path` warning, benchmark time; `argus`: 569 edges, 2048 unresolved mentions (214 names, all external), 7 ms, 0 chat calls; D-db–D-df; review: 8 findings — fixed: header/annotations resolve around the type, static-field `case` labels (+2 T4 dispatcher rows), anonymous/local class super-type scope, `outer.new Inner()` skipped, static-import qualifier, 2 doc breakages, output label, nits (`EdgeKind::ALL`, facts dropped after the stage); recorded: library super types' nested types, outer type of a qualified name (D-dc), enum switch caveat (D-df) |
 | 6.3 Member resolution | done | `call` edges and `instantiate` to constructors; typed expressions and block-scoped typed locals (D-dd replaced, D-dg); receivers, chains through declared return types, unqualified lookup inside-out then static imports, `super`/`this` calls, method references, implicit Lombok/record/enum/constructor members (D-dh), overloads with `ambiguous` (D-di), stops (D-dj); call-site counts and `-v` top unresolved calls; benchmark calls; `argus`: 392 `call` + 31 constructor `instantiate`, 586 / 0 / 800 call sites, T4 row :76 present, 0 chat calls; open #48; review: 14 findings — fixed: indexed argument vs final JDK parameter (H1), single candidate type-checked (H2), unqualified `Object`/`Enum` methods stop at the innermost class (H3), same-type overloads (M1), Java's arity phases and exact ranking only on known types (M2), one `lineage` walk superclass-first (M3), `implicit` call-site count (M4), pattern-variable and anonymous-field scoping (L1, L2), annotation elements (L4), builder edge cases (L5), `dims` helper; recorded: bounded type variables (L3 → #48), module split (L6 → Next); D-dk; `argus` after: 1142 edges (+4 annotation-element references), call sites 423 / 167 implicit / 0 / 796 |
-| `refactor(usages)` module split | next | review L6, before 6.4 |
-| 6.4 Overrides and measured quality | planned | |
+| 6.3a refactor(usages) split | done | review L6 of 6.3, no behaviour change: `src/usages.rs` (API, `resolve`, test helpers) + `src/usages/` `resolver.rs`, `members.rs`, `walk.rs`, `expr.rs` (D-dl); code moved verbatim, cross-file items `pub(super)`, tests moved with their code (39 tests, same names; 356 lib tests); `argus`: edges identical (1142, by fqn and by id), 0 chat calls; review: approved, 3 doc nits fixed |
+| 6.4 Overrides and measured quality | next | |
 | 6.5 `show`: `used by` / `uses` | planned | |
 | 6.6 `annatar trace` | planned | |
 | 6.7 Agent trial (T4) on usages | planned | |
@@ -363,6 +383,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-di (6.3; narrowed in the review, D-dk) | Overload choice, beyond count: an argument fits a parameter when the types are equal (exact), an indexed subtype, number for number or box, `boolean`/`Boolean`, a primitive for `Number`/`Comparable`/`Serializable`, `null` for a non-primitive, or either side unknown or a library type (it may be a super type); a `String`, box or `UUID` parameter (final JDK types) takes nothing else — no indexed type either —, a primitive no reference. Java's phases: the candidates of fixed arity (a varargs method taking an array) every argument fits; only when there is none, the varargs ones (at least n − 1 arguments). Of several, the most exact matches win, and only when every argument's type is known (an unknown or builder argument leaves all, ambiguous). Every candidate is type-checked, a single one too; none fitting is no edge (the method is one the index lacks: `Object`'s, a library superclass's). Argument types also come from a small table of JDK results (`toString()`, `hashCode()`, `equals(..)`, `String` factories, `Collections`/`List`/`Set`/`Map`/`Arrays` factories). A method overridden nearer is not a candidate (same name, parameter count and simple types, a type variable of the farther method or type matching any type). A method reference has no arity: every method of the name is a candidate. A chain continues after an ambiguous call only when the candidates' return types agree | Count only, the rest ambiguous; resolve the JDK's types fully | On `argus` the table and the override rule took ambiguous call sites from 31 to 0, every remaining pick checked by hand. "Most exact" stands in for Java's *most specific*: with every argument known, Java's pick has at least as many exact matches as any other applicable candidate, so a tie is left ambiguous rather than guessed; with an unknown argument the other arguments' matches prove nothing (D-cw). The fit itself over-approximates for library types (a library argument may fit a library parameter), so a pick can still rest on a fit Java would reject — none found on `argus` (review: 37 picks checked). A full JDK model is SCIP's job (Later) |
 | D-dj (6.3) | Where member resolution stops for precision (no edge, counted): an unqualified `m()` in a class whose superclass chain leaves the index (`extends Thread`, an anonymous `new TimerTask() {..}`, an anonymous class of a library type) or in an anonymous / local class that declares `m` itself — Java would find `m` there, not in the enclosing class; an unqualified `Object` method (`toString`, `equals`, …), or `Enum` method in an enum (`compareTo`, …), that the innermost class does not declare (review H3); a member an indexed type lacks (inherited from a library class or `Object`), also when its overloads do not take the arguments (H2). Field access on a type that is not around the node (also a field inherited from an indexed superclass) is a `reference` to the declaring type; a `case` label makes no such edge. An edge's line is the line of the called name (a multi-line chain gives each call its line), of the type for `new T(..)`, of the method reference or `super(..)` itself. Call sites are method invocations, `new T(..)` (also library types: `HashSet#<init>`), `super(..)`/`this(..)` and method references except array constructors; unresolved ones are keyed `Receiver#name` with the receiver's simple type name, `?` when unknown, `this`/`super` for unqualified ones, `XBuilder` for a builder. The plan's 6.4 summary counts are already in 6.3's `index` output | Fall through to the enclosing class / static imports regardless | A wrong caller misleads more than a missing one (D-cw); the keys make 6.4's miss classification (library, lambda, generics) a matter of reading the `-v` line |
 | D-dk (6.3 review) | The review's findings, handled as follows. **Call-site counts:** *resolved to a member* = a `call` (or constructor `instantiate`) edge to one indexed method or constructor, recursion included (resolved, the edge dropped per D-cv); *implicit* = a generated member (Lombok accessor or builder method, enum/record member, annotation element) or an undeclared constructor (only a `reference`, or the type's `instantiate`); *ambiguous*; *unresolved* — also a declared constructor that takes no such arguments, unless the type is a record or has a Lombok `@…ArgsConstructor` (then implicit). 6.4's "share of resolved call sites" is the first. **One super-type walk** (`Resolver::lineage`): the indexed superclass chain first, then interfaces breadth-first, each type once — `javac`'s order for methods (a class method beats an interface method, JLS 8.4.8); used for nested types, fields, methods, implicit members and subtyping; the superclass memoized with the super types. **Scopes:** a pattern variable lives in its `if`/`while`/`?:` condition and then-branch (or body) only; Java's flow scoping (`if (!(o instanceof Foo f)) return; f.go();`, the `else` of a negated test, `&&` outside a condition) is not followed — recall only. An anonymous or local class's own fields and its indexed super types' fields come before the locals of the code around it. **Implicit members:** a 0-argument call on an indexed `@interface` other than an `Object` method is an annotation element (a `reference` to the annotation type); a builder's `Object` methods return their JDK types, and a builder class written in the source (`T.TBuilder`) is looked up first (its methods are `call`s, returning it continues the builder). **Known limits, recorded:** a receiver typed by a bounded type variable (`<T extends Msg>`) stays unknown — the bound is not in the 6.1 facts (folded into open #48); a local enum's unqualified `Enum` methods are not stopped (only named enums are); numeric arguments fit any number type (no narrowing check — only a call Java rejects would differ) | Leave "resolved" mixed and document it; fix only the three high findings; split the module in the same commit | Each fix removes a wrong edge or a misleading number (D-cw) at no cost on `argus` (no `call` edge lost or changed, +4 correct references); the counts must mean edges before 6.4 reports them as quality; the module split is a refactor and gets its own commit (AGENTS: one step per change) |
+| D-dl (6.3a) | The split follows the repo's layout, not the `mod.rs` the 6.3 review's Next named: `src/usages.rs` stays the module root (docs, API, `resolve`) with `src/usages/{resolver,members,walk,expr}.rs` as private submodules, like `src/symbols.rs` + `src/symbols/facts.rs`. `FileWalk` (≈ 1400 lines) is split once more: the walk, scopes and type mentions in `walk.rs`, expression typing and calls in `expr.rs` (a second `impl FileWalk`). Siblings, not nested modules; only what another file uses is `pub(super)`. Tests move with the code they exercise (all are fixture-driven through `resolve`, assigned by topic); the fixture helpers (`resolve_all`, `edges`, `calls`, ..) stay in `usages.rs`'s `tests` as `pub(super)` | `src/usages/mod.rs`; one `walk.rs` with all of `FileWalk`; nested `walk::expr` (no `pub(super)` on `FileWalk`'s fields); a shared `tests.rs` | Matches the neighbouring module; four files of 0.8–1.2k lines (a third to a half tests) instead of one of 4.3k; 6.4 adds `overrides` edges next to `overrides()` in `members.rs`. Inside item bodies nothing changed; outside them, only the `pub(super)` markers, the per-file imports, the `#[cfg(test)] mod tests` blocks, the second `impl` blocks and three signatures rustfmt reflowed |
 
 ## Open questions
 
