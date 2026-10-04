@@ -18,7 +18,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::config::OllamaConfig;
+use crate::config::{DescribeConfig, OllamaConfig};
 use crate::jira::Ticket;
 use crate::llm::LlmClient;
 use crate::store::Store;
@@ -131,7 +131,7 @@ fn capped(text: &str, max: usize) -> String {
 }
 
 /// Every run of whitespace replaced by one space, trimmed.
-fn collapse_whitespace(text: &str) -> String {
+pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -194,7 +194,7 @@ fn check_field(name: &str, value: &str, max: usize) -> Result<(), String> {
 /// Every content word of `purpose` (longer than three letters, compared by
 /// its first five letters) also appears in `summary`: the purpose adds no
 /// reason.
-fn restates(summary: &str, purpose: &str) -> bool {
+pub(crate) fn restates(summary: &str, purpose: &str) -> bool {
     let stems = |text: &str| -> Vec<String> {
         text.split(|c: char| !c.is_alphanumeric())
             .filter(|word| word.chars().count() > 3)
@@ -206,20 +206,31 @@ fn restates(summary: &str, purpose: &str) -> bool {
     purpose.len() >= 2 && purpose.iter().all(|word| summary.contains(word))
 }
 
-/// The LLM client the summaries stage calls. Whether it may call the model
-/// (`--no-llm`, a tripped circuit breaker) is the client's state, so every
-/// later LLM stage honours it too.
+/// The LLM client the summaries and describe stages call, with the describe
+/// prompt settings. Whether it may call the model (`--no-llm`, a tripped
+/// circuit breaker) is the client's state, so every later LLM stage honours
+/// it too.
 pub struct Summarizer {
     pub(crate) client: LlmClient,
+    pub(crate) describe: DescribeConfig,
 }
 
 impl Summarizer {
-    /// `cache_only` makes the client answer from the LLM cache only.
+    /// `cache_only` makes the client answer from the LLM cache only. The
+    /// describe settings are the defaults; see [`Summarizer::with_describe`].
     pub fn new(client: LlmClient, cache_only: bool) -> Self {
         if cache_only {
             client.set_cache_only();
         }
-        Self { client }
+        Self {
+            client,
+            describe: DescribeConfig::default(),
+        }
+    }
+
+    /// The same summarizer with `describe` as the describe prompt settings.
+    pub fn with_describe(self, describe: DescribeConfig) -> Self {
+        Self { describe, ..self }
     }
 
     /// The client, e.g. for its [`crate::llm::LlmStats`].
@@ -228,23 +239,26 @@ impl Summarizer {
     }
 
     /// The summarizer for an `index` run, or `None` without an `[ollama]`
-    /// section (one warning; tickets get no summary). `no_llm` keeps the
-    /// cached summaries but makes no chat call. The client gets its own
-    /// `cache.db` connection.
+    /// section (one warning; tickets get no summary, members no what/why).
+    /// `no_llm` keeps the cached summaries but makes no chat call. The client
+    /// gets its own `cache.db` connection.
     pub fn from_config(
         ollama: Option<&OllamaConfig>,
+        describe: DescribeConfig,
         no_llm: bool,
         store: &Store,
     ) -> Result<Option<Self>> {
         let Some(ollama) = ollama else {
-            tracing::warn!("no [ollama] section in the config; tickets get no summaries");
+            tracing::warn!(
+                "no [ollama] section in the config; tickets get no summaries, methods no what/why"
+            );
             return Ok(None);
         };
         if no_llm {
             tracing::info!("--no-llm: no chat calls; using cached summaries only");
         }
         let client = LlmClient::from_config(ollama, store.connect_cache()?)?;
-        Ok(Some(Self::new(client, no_llm)))
+        Ok(Some(Self::new(client, no_llm).with_describe(describe)))
     }
 }
 
@@ -474,7 +488,7 @@ TICKET>>>
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         assert!(
-            Summarizer::from_config(None, false, &store)
+            Summarizer::from_config(None, DescribeConfig::default(), false, &store)
                 .unwrap()
                 .is_none()
         );
@@ -485,13 +499,15 @@ TICKET>>>
             reasoning_effort: "none".to_string(),
             temperature: 0.0,
         };
-        let summarizer = Summarizer::from_config(Some(&ollama), true, &store)
-            .unwrap()
-            .expect("configured");
+        let summarizer =
+            Summarizer::from_config(Some(&ollama), DescribeConfig::default(), true, &store)
+                .unwrap()
+                .expect("configured");
         assert!(summarizer.client.is_cache_only());
-        let summarizer = Summarizer::from_config(Some(&ollama), false, &store)
-            .unwrap()
-            .expect("configured");
+        let summarizer =
+            Summarizer::from_config(Some(&ollama), DescribeConfig::default(), false, &store)
+                .unwrap()
+                .expect("configured");
         assert!(!summarizer.client.is_cache_only());
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! [`render`] looks a symbol up by its fully qualified name and prints its
 //! stored fields, then every child — nested types and members, recursively —
-//! sorted by source line. This is the read side of the index: `annatar show`
+//! sorted by source line, each with the model's `what` and `why` when it has
+//! them. This is the read side of the index: `annatar show`
 //! and later the MCP `get_symbol` tool both build on it. Ticket types, titles
 //! and the model's summary and purpose come from the index `tickets` table,
 //! never from `cache.db`.
@@ -53,6 +54,8 @@ struct StoredSymbol {
     signature: String,
     javadoc: Option<String>,
     annotations: String,
+    what: Option<String>,
+    why: Option<String>,
 }
 
 impl StoredSymbol {
@@ -69,6 +72,8 @@ impl StoredSymbol {
             signature: row.get(8).context("reading symbols.signature")?,
             javadoc: row.get(9).context("reading symbols.javadoc")?,
             annotations: row.get(10).context("reading symbols.annotations")?,
+            what: row.get(11).context("reading symbols.what")?,
+            why: row.get(12).context("reading symbols.why")?,
         })
     }
 }
@@ -110,7 +115,7 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
 async fn load_all(conn: &Connection) -> Result<Vec<StoredSymbol>> {
     let mut rows = conn
         .query(
-            "SELECT id, parent_id, kind, role, fqn, file, start_line, end_line, signature, javadoc, annotations
+            "SELECT id, parent_id, kind, role, fqn, file, start_line, end_line, signature, javadoc, annotations, what, why
              FROM symbols",
             (),
         )
@@ -220,6 +225,12 @@ fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut Stri
         symbol.file, symbol.start_line, symbol.end_line
     ));
     out.push_str(&format!("{field}- signature: {}\n", symbol.signature));
+    if let Some(what) = &symbol.what {
+        out.push_str(&format!("{field}- what: {what}\n"));
+    }
+    if let Some(why) = &symbol.why {
+        out.push_str(&format!("{field}- why: {why}\n"));
+    }
 
     let annotations = parse_annotations(&symbol.annotations)
         .with_context(|| format!("parsing annotations for `{}`", symbol.fqn))?;

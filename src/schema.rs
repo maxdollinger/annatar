@@ -15,7 +15,10 @@ use libsql::Connection;
 /// `CREATE TABLE` statements for the disposable `index.db`, in dependency
 /// order.
 pub const INDEX_TABLES: &[&str] = &[
-    // 1.5 `symbols`.
+    // 1.5 `symbols`. 4.3 adds the chat model's one-line `what` and `why`
+    // for methods and constructors (NULL when not described this run; `why`
+    // is also NULL when the history gives no reason); 4.4 fills them for
+    // types.
     "CREATE TABLE symbols (
         id INTEGER PRIMARY KEY,
         parent_id INTEGER REFERENCES symbols(id),
@@ -28,7 +31,9 @@ pub const INDEX_TABLES: &[&str] = &[
         signature TEXT NOT NULL,
         javadoc TEXT,
         annotations TEXT NOT NULL DEFAULT '[]',
-        content_hash TEXT NOT NULL
+        content_hash TEXT NOT NULL,
+        what TEXT,
+        why TEXT
     )",
     "CREATE INDEX symbols_parent_id ON symbols(parent_id)",
     // 2.2 `symbol_commits`.
@@ -68,7 +73,7 @@ pub const INDEX_TABLES: &[&str] = &[
         llm_summary TEXT,
         llm_purpose TEXT
     )",
-    // 4.3/4.4 add the what/why columns to `symbols`; 5.1 adds `symbol_vec`
+    // 5.1 adds `symbol_vec`
     // (`F32_BLOB` + `libsql_vector_idx`).
 ];
 

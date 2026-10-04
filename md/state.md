@@ -11,11 +11,90 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 4 — LLM summaries, in progress (Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
-| Step | 4.2 Ticket summaries — **done**, review fixes done (full real run on `argus`: 79/79 tickets summarised, rerun 0 chat calls); next 4.3 Method and constructor what/why |
+| Step | 4.3 Method and constructor what/why — **done** (full real run on `argus`: 729/729 members described, ~1.9 s per member, rerun 0 chat calls); next 4.4 Type what/why, bottom-up |
 | Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **4.3 Method and constructor what/why.** New `describe` module:
+  `Description { what, why }` (`deny_unknown_fields`); pure
+  `select_history(tickets, commits, &DescribeConfig)` — the first ticket
+  (oldest `first_date`) plus the `recent_tickets` (default 3) others with the
+  newest `last_date`, dates compared in UTC (small `%aI` parser), ties by key;
+  unavailable tickets left out; no available ticket → up to `commit_subjects`
+  (default 5) distinct commit subjects, newest first (ties by subject); neither
+  → code only; a chosen ticket without a summary or any never-fetched ticket
+  → `Incomplete` (D-au); pure `member_prompt(&Member, &History, body_chars)`:
+  kind, enclosing type (kind, fqn, Spring role), signature, Javadoc (capped
+  2000), the member's source dedented and capped at `body_chars` (default
+  1500, D-at), then the history (`Created for KEY (Type): summary` / `Changed
+  for …`, `Reason:` = ticket purpose when not `NULL`), fenced between
+  `<<<CONTEXT` / `CONTEXT>>>`; asks for a one-line verb-first `what` (≤ 150)
+  and a `why` from the history only, empty when it gives none (D-av);
+  `validate_description`: blank `what`, > 200 / > 300 chars, control chars,
+  meta phrases ("this method", "the ticket", "javadoc", "not stated", …), a
+  `why` that restates `what` (reuses the 4.2 word check). New fifth
+  `build_index` stage `index_descriptions` after summaries (also on a non-git
+  repository, code only): members in walk/source order, sequential
+  `complete_with` (D-ap), writes the new index columns `symbols.what` /
+  `symbols.why` (empty `why` → `NULL`); breaker, `--no-llm` and no `[ollama]`
+  as in 4.2 (shared client). `IndexedFile` keeps the file source for the
+  excerpt. New `[describe]` config section (`recent_tickets`,
+  `commit_subjects`, `body_chars`; `deny_unknown_fields`, every key optional),
+  carried on `Summarizer` (`with_describe`). `IndexStats`: `describe_members`,
+  `described`, `described_cached`, `describe_invalid`, `describe_failed`,
+  `describe_incomplete`, `describe_skipped` (sum = members) and per-stage
+  `summary_llm` / `describe_llm` next to the run total `llm`; the `summaries:`
+  line now prints its own stage's chat counts, a new `describe:` line follows
+  (D-aw). `show` prints `- what:` / `- why:` after the signature of every
+  symbol that has them (children included). Test fake: `FakeBackend::always`
+  (standing reply per response type). 22 new tests (13 `describe`: first +
+  recent selection and cap, UTC/tie order, input-order independence,
+  unavailable omitted, commit fallback (dedup/cap/blank), incomplete, prompt
+  layout with and without source/Javadoc/history, fencing, Javadoc cap,
+  validation, restated why + whitespace, schema; 8 indexer through
+  `build_index`: what/why from ticket summaries + rerun 0 chat calls + `show`,
+  unsummarised ticket waits (no call) then described with `NULL` why,
+  unfetched ticket incomplete, commit fallback prompt, non-git code only,
+  `--path` run hits the full run's cache, no summarizer / `--no-llm` skipped,
+  invalid + failed + breaker; 1 config); 220 tests pass (4 ignored).
+  *Real runs (`argus`, release, `data-real`, tickets and summaries cached):*
+  `--path …/auth/authentication/token` (20 files, 93 members): without source
+  (`body_chars = 0`) 93 described, 0 invalid, 190.7 s (2.05 s/member, first
+  call 6.5 s warm-up), prompts 365–600 tokens; with source (1500) 173.6 s
+  (1.87 s/member), prompts ≤ 813 tokens. Comparison on the 41 service,
+  REST and strategy members: without the source `what` is a paraphrase of
+  name + signature and sometimes guesses from the ticket text
+  (`UserTokenService#getValidTokens(UUID)` "… with a read fallback
+  strategy", taken from a ticket; `DatabaseCacheUserTokenStrategy#<init>`
+  claims both parameters are injected, only the repository is kept); with it
+  `what` names the actual effect, checked against the code:
+  `UserTokenService#removeAllTokens(List<UUID>)` removes the tokens and
+  publishes an async `TokenInvalidationEvent`; `TokenValidationRest#save`
+  adds the token, pre-warms the auth data, returns the web response;
+  `TokenValidationRest#deleteAllFromList` enforces a maximum count;
+  `UserTokenService#isTokenValid` skips the check for Greenland admins → the
+  source stays on by default (D-at). Full run: 729 members, **729
+  described**, 0 invalid/failed/incomplete/skipped, 636 chat calls (93 from
+  the `--path` run's cache), 0 retries, stage 1186 s (**1.86 s per call**),
+  whole run 19 min 48 s; longest prompt 1012 tokens (open #26 closed). Run 2:
+  2.0 s, 729 from cache, **0 chat calls**. Content: `what` median 101 chars,
+  max 151; no meta text ("ticket", "commit", "javadoc", "likely",
+  "unclear"); only 2 `NULL` whys; 53 members have no available ticket (commit
+  subjects). Spot checks outside the package all correct on `what`
+  (`UserDataEventRest#sendDeleteEvent` publishes a `UserDataDeletedMessage`
+  asynchronously and answers 202 with the data; `AuthDataEvent#toWebResponse`
+  maps the metadata and the first payload element;
+  `ArgusMultiOrgaUrlExtractorConfigService#getPassThroughEqualsUrls` returns
+  an empty array, `NULL` why). Weak spots (open #30): `why` is generic for
+  accessors (54 members say "proof of concept for extending JWT
+  functionality", the first ticket of `UserToken`/`UserTokenBearer`), and a
+  recent ticket can lend a member an unrelated why
+  (`DatabaseCacheUserTokenStrategy#removeToken(UUID,String)` → JWT-ID
+  storage / Redis optimisation); `AuthDataEvent#toWebResponse` got a
+  plausible but code-derived "standardized response format" why. Test
+  classes under `backend/src/test` are indexed and described (open #13).
 
 - **4.2 review fixes: model check, shared breaker, run-independent prompt,
   purpose rework.** *Real run (product owner opened `api.atlassian.com`;
@@ -915,15 +994,11 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Agent:** 4.3 Method and constructor what/why (pure prompt builder with
-  signature, Javadoc, parent class + role, ticket `llm_summary`/`llm_purpose`
-  of the first + most recent few tickets, commit subjects when all are
-  unavailable; reuse `Summarizer`, its breaker pattern and `--no-llm`; check
-  `num_ctx` with the longest prompts, open #26; try `--path` first).
-- **Product owner:** run `annatar index` twice on `argus` with the scoped
-  token from a host that can reach `api.atlassian.com` (open #27): run 1
-  should summarise all ~79 available tickets, run 2 must print `0 chat
-  calls`.
+- **Agent:** 4.4 Type what/why, bottom-up (deepest nested types first, members'
+  `what` lines as input, capped for large classes; the type's tickets are the
+  file's, cap them too; reuse `describe`'s history selection and the
+  `[describe]` caps; decide whether test classes (open #13) are worth
+  describing).
 - **Product owner:** confirm or override the PM defaults for J1, J2, J4,
   J9 (D-w–D-y, D-aa), the open #19 decision (D-ab) and J5–J8 (D-ac, D-ad);
   D-w and D-y are now backed by the real Jira (see their notes).
@@ -974,6 +1049,7 @@ the decisions taken, and the tradeoffs behind them.
 | 4.1 review fixes | done | own cache connection (`Store::connect_cache`, busy timeout) + write mutex + no explicit transactions (D-ai); `complete_with` validation hook, `deny_unknown_fields` convention (D-aj); `ChatReply` with finish reason + usage, truncation warned and named in `InvalidOutput`; canonical schema in the key (D-ag); embedding dim checks; one retry for 503 / refused connection (D-ak); README env var; open #23–#26; 167 tests |
 | 4.2 Ticket summaries | done | `summaries` module (`TicketSummary`, pure `ticket_prompt`, `validate_summary`, `Summarizer`); `index_summaries` stage after tickets → index `tickets.llm_summary`/`llm_purpose`; sequential, breaker on the first backend failure (then cache only), invalid skipped; `--no-llm`; `ollama.temperature` (default 0, in the cache key); `LlmClient::cached_with`; `IndexStats` summary buckets + `llm`; `show` prints summary/purpose; live: sequential ≈ parallel on the host Ollama; `argus` (seeded with 4 real fixture tickets, Jira gateway blocked): 4 summarised in 15.2 s, rerun 0 chat calls; D-al–D-aq; 181 tests |
 | 4.2 review fixes | done | chat-model check before the build (`/api/show`; missing → run fails, unreachable → cache-only) (D-ar); breaker state on `LlmClient` (`cache_only`, trips on a backend failure or 5 invalid in a row, `LlmUnavailable`), shared by later stages (D-an); prompt without parent key/title (D-al); purpose may be empty (→ `NULL`), meta text and restated purpose invalid, ticket fenced as data, whitespace collapsed, control chars invalid (D-as); `-0.0` temperature normalised; null content = invalid output; real run (79 tickets: 79 summarised, rerun 0 chat calls) closes open #27; new prompt on `argus`: 79/79, 0 retries, 148 s, 30 empty purposes, no meta text, rerun 0 chat calls; 198 tests |
+| 4.3 Method and constructor what/why | done | `describe` module (`Description`, pure `select_history` + `member_prompt`, `validate_description`); `index_descriptions` stage after summaries → `symbols.what`/`why`; first + 3 most recent tickets (UTC dates), commit subjects without tickets, incomplete members skipped; source excerpt (`describe.body_chars` 1500); `[describe]` config; per-stage LLM stats, `describe:` line; `show` what/why; `argus`: 729/729 described, 1.86 s/call, 19 min 48 s, rerun 0 chat calls in 2.0 s; D-at–D-aw; 220 tests |
 | 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
 
 ## Decisions and tradeoffs
@@ -1068,6 +1144,10 @@ the decisions taken, and the tradeoffs behind them.
 | D-aq (4.2 real run) | **Superseded (4.2 review):** the product owner opened `api.atlassian.com` and the full run happened (79 tickets fetched and summarised, rerun 0 chat calls; see Done). Original deviation: the agent's real run seeded `ticket_cache` with the 6 scrubbed real fixture tickets (via `parse_issue` + `TicketCache`, scratch data dir) and ran with `--offline`, because the container's proxy allowlist blocks `api.atlassian.com` | Skip the real run | Exercises the real pipeline, model and prompts on real (scrubbed) ticket text; only 4 of the 6 keys are referenced by `argus` symbols. The full 79-ticket run is the product owner's check (open #27) |
 | D-ar (4.2 review) | Before the index build, `build_index` checks once that the server has the chat model (`LlmBackend::has_model`, Ollama `POST /api/show`): missing (404) → the run fails with a "pull it or fix `ollama.chat_model`" message; unreachable/other error → the breaker trips and the run is cache-only; no check when cache-only (`--no-llm`). The check is not a chat call (`chat_calls` stays 0 on a cached rerun) | Treat a chat 404 as fatal; `GET /v1/models/{id}`; no check | Consistent with rejected Jira credentials being fatal: a typo in the model name otherwise exits 0 with no summaries on every run. Failing before the build keeps the previous index and needs no chat request; `/api/show` accepts every model name (a `/` in `hf.co/...` names breaks the `/v1/models/{id}` route) and is the same server the backend already targets |
 | D-as (4.2 review, open #28) | Purpose may be **empty** (stored `NULL`, `show` omits it) when the ticket states or clearly implies no reason; the prompt forbids talking about the ticket or missing information and restating the summary; the ticket is fenced between `<<<TICKET` / `TICKET>>>` as content, not instructions (markers inside defused). Validation: blank summary, overlong fields, control characters other than whitespace, meta phrases ("the ticket", "not stated", "does not specify", …) and a purpose whose content words all appear in the summary are invalid (→ retry); whitespace runs are collapsed before storing. `purpose` stays a required `String` | `Option<String>` / an explicit "unknown" value; reject newlines (retry) instead of collapsing; fuzzy/LLM-judged restatement check | An empty purpose tells 4.3 there is no "why" instead of a made-up one; a required string keeps the strict schema simple (an optional field may be omitted under `json_schema`). Collapsing whitespace costs no call. The word check is cheap and catches literal restatements; synonym paraphrases slip through (open #28). Real run: 30/79 empty purposes (27 without description), no meta text, 0 retries |
+| D-at (4.3) | The member's own source (declaration and body, dedented) goes into the prompt, capped by the new `describe.body_chars` (default 1500 characters, `[source truncated]` marker; `0` = signature and Javadoc only, as the plan wrote) | Signature + Javadoc only (plan text); the whole body uncapped | Measured on 93 `argus` members: without the body most members (no Javadoc) get a `what` that paraphrases the name and sometimes borrows from the ticket text (invented "read fallback strategy", wrong injected dependencies); with it the `what` names the actual effects (events published, pre-warming, limits, admin bypass), checked against the code. It costs nothing measurable (1.87 vs 2.05 s/member, prompts ≤ 1012 tokens). The body is part of the prompt, so a body change misses the cache, which is correct |
+| D-au (4.3) | History selection: first ticket = oldest `first_date`, then the `describe.recent_tickets` (default 3) others with the newest `last_date`; `%aI` dates compared in UTC, ties by key; unavailable tickets omitted; commit subjects (`describe.commit_subjects`, default 5, distinct, newest first) only when no ticket is available. A chosen ticket without a summary this run **or any ticket the index does not know** (never fetched: `--offline` without cache, failed fetch) makes the member `describe_incomplete`: not asked, asked again next run. Ticket summaries never influence which tickets are chosen | Treat unfetched tickets as unavailable; require summaries of all tickets, not only the chosen ones; string date order | The plan's "never cache from incomplete input": an unfetched ticket may turn out available, so a record built without it would be cached under a prompt that later changes anyway, but meanwhile show a weaker what/why; skipping is the same rule as a missing summary. Choosing independently of summaries keeps the prompt identical once they exist. UTC order avoids DST offsets reordering same-day commits |
+| D-av (4.3) | `Description { what, why }`: `what` one verb-first line (prompt ≤ 150, valid ≤ 200), `why` from the change history only (prompt ≤ 200, valid ≤ 300), empty (`NULL`) when the history gives none; ticket purpose sent as `Reason:`, a `NULL` purpose omitted; context fenced `<<<CONTEXT` / `CONTEXT>>>`; meta phrases ("this method", "the ticket", "javadoc", "not stated", …) and a restated `why` are invalid (retry); whitespace collapsed before storing | `why` from code too; reject newlines | Same anti-invention approach as D-as. Real run: 0 invalid replies, 0 retries; only 2 empty whys (most members have a ticket); accessor whys tend to be generic (open #30) |
+| D-aw (4.3) | Describe stage runs after summaries on every run, including a non-git repository (code-only prompts); per-stage `summary_llm` / `describe_llm` stats, the `summaries:` line shows its stage's calls and a `describe:` line shows `described (… from cache)`, invalid, failed, incomplete, skipped and the stage's calls; `[describe]` settings travel on `Summarizer` (`with_describe`) so `build_index`'s signature is unchanged; sequential calls (D-ap) | Run only on git work trees; a run-wide chat count only; a new `build_index` parameter | A structure-only index still benefits from `what`. With two LLM stages a run total no longer tells which stage called the model. 1.86 s per call is dominated by the model, so concurrency would only help with `OLLAMA_NUM_PARALLEL` > 1 |
 
 ## Open questions
 
@@ -1098,7 +1178,8 @@ the decisions taken, and the tradeoffs behind them.
 | 23 | `LlmClient` is safe to share across tasks, but nothing calls it concurrently yet. Does the host Ollama (`OLLAMA_NUM_PARALLEL`) gain from parallel requests for 4.2/4.3, or should calls stay sequential? Measure per-ticket / per-symbol time first (the debug log now has per-reply token counts and elapsed ms). If calls go concurrent: two tasks with the same prompt both miss and both call the model (no in-flight dedup); deduplicate prompts in the stage if that matters. | 4.1 | **resolved for 4.2 (D-ap)** — host Ollama serves one request at a time (4 requests: 7.56 s sequential vs 7.03 s parallel), so the stage is sequential; re-measure if the host's `OLLAMA_NUM_PARALLEL` changes |
 | 24 | `reasoning_effort: "none"` (the default, D-af) is only tested against thinking models; every chat model on the host thinks. Does a non-thinking model accept or reject it on `/v1`? Workaround if it errors: `reasoning_effort = ""` (not sent). | 4.1 review | open — check when a non-thinking model is tried (4.5) |
 | 25 | `OllamaBackend` retries a transient failure once (D-ak), but a down server still costs every call that attempt. The looping stage (4.2+) needs a circuit breaker like the Jira one: stop after N consecutive backend failures and leave the rest for the next run. | 4.1 review | **resolved (4.2, D-an)** — the summaries stage trips on the first backend failure, then serves cached summaries only; 4.3/4.4 reuse the pattern |
-| 26 | A small Ollama `num_ctx` silently truncates a long prompt (the model sees only part of it). The client does not send `num_ctx`; detection is the debug-logged `prompt_tokens` (close to the context size = suspect). Check in 4.3 with the longest real prompts; send `options.num_ctx` (config option) if needed. | 4.1 review | open — check in 4.3 |
+| 26 | A small Ollama `num_ctx` silently truncates a long prompt (the model sees only part of it). The client does not send `num_ctx`; detection is the debug-logged `prompt_tokens` (close to the context size = suspect). Check in 4.3 with the longest real prompts; send `options.num_ctx` (config option) if needed. | 4.1 review | **resolved (4.3)** — longest real prompt on `argus` 1012 tokens (ticket summaries ≤ 1050), far below any default context; no option needed. Recheck in 4.4 (type prompts with member lists are longer) |
 | 27 | The agent container cannot reach the Jira gateway `api.atlassian.com` (proxy allowlist: `CONNECT tunnel failed, response 403`; only `blueocean.jira.com` is allowed, where the scoped token gets 404), so 4.2's real run used 4 seeded fixture tickets (D-aq). Run `annatar index` twice on `argus` with the token from the host (or add `api.atlassian.com` to the allowlist): how many of the 79 tickets are summarised / invalid, time per ticket, and does run 2 print `0 chat calls`? | 4.2 | **resolved (4.2 review)** — gateway opened; run 1: 79 fetched, 79 summarised, 0 invalid/failed, 79 chat calls, ~2.4 s/ticket incl. fetching, 194 s; run 2: 2 s, 0 Jira requests, **0 chat calls** |
 | 28 | When a ticket states no reason (e.g. only an "Out of scope" list), the `purpose` restates the summary ("To enable SMS sending ..."). Allow an explicit "unknown" purpose, or let 4.3 fall back to commit subjects then? | 4.2 | **mostly resolved (4.2 review, D-as)** — empty purpose (`NULL`) when no reason: 30/79 on `argus`, no invented "parent task" or meta reasons. Still open for 4.5: a few title-only tickets get a synonym paraphrase of the summary (GRLD-20961, GRLD-35843, GRLD-88420, GRLD-90364); 4.3 treats a `NULL` purpose as "no why" (commit subjects may help) |
 | 29 | `init_logging` uses `tracing_subscriber::fmt()` defaults, which write logs to **stdout**, mixed with the `index` result lines (seen in the 4.2 review real run with `-v`). Send logs to stderr? | 4.2 review | open — small fix, before the MCP server (6.1) at the latest, where stdout is the protocol channel |
+| 30 | Method `why`s are often generic or borrowed: accessors inherit the first ticket's theme (54 of 729 say "proof of concept for extending JWT functionality"), a recent ticket can lend an unrelated reason (`DatabaseCacheUserTokenStrategy#removeToken` → JWT-ID storage / Redis), and some whys are derived from the code despite the prompt. Fewer tickets for trivial members (e.g. only the first), a "why only if specific to this member" instruction, or empty whys for accessors? | 4.3 | open — review in 4.5 with the golden set |

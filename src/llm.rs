@@ -1080,14 +1080,16 @@ pub(crate) mod fake {
     use super::*;
 
     /// A [`LlmBackend`] that answers chats from a script (in order; an empty
-    /// script is an error) and embeds a text as `[chars, first byte, 1.0]`
-    /// (without the `1.0` for a text marked [`FakeBackend::short`]).
+    /// script is an error; a standing reply for a response type comes
+    /// first) and embeds a text as `[chars, first byte, 1.0]` (without the
+    /// `1.0` for a text marked [`FakeBackend::short`]).
     /// It records every chat request and embedding batch.
     #[derive(Default)]
     pub struct FakeBackend {
         model: Mutex<ModelCheck>,
         model_checks: Mutex<Vec<String>>,
         replies: Mutex<VecDeque<ChatReply>>,
+        standing: Mutex<HashMap<String, String>>,
         chats: Mutex<Vec<ChatRequest>>,
         batches: Mutex<Vec<Vec<String>>>,
         short: Mutex<Vec<String>>,
@@ -1123,6 +1125,15 @@ pub(crate) mod fake {
                 .extend(replies.iter().map(|reply| ChatReply::stop(*reply)));
         }
 
+        /// Answer every request for the response type `schema_name` with
+        /// `reply`, ahead of the scripted replies.
+        pub fn always(&self, schema_name: &str, reply: &str) {
+            self.standing
+                .lock()
+                .unwrap()
+                .insert(schema_name.to_string(), reply.to_string());
+        }
+
         pub fn reply_with(&self, reply: ChatReply) {
             self.replies.lock().unwrap().push_back(reply);
         }
@@ -1153,6 +1164,9 @@ pub(crate) mod fake {
         fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, ChatReply> {
             Box::pin(async move {
                 self.chats.lock().unwrap().push(request.clone());
+                if let Some(reply) = self.standing.lock().unwrap().get(&request.schema_name) {
+                    return Ok(ChatReply::stop(reply.clone()));
+                }
                 self.replies
                     .lock()
                     .unwrap()

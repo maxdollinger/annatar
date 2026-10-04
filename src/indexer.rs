@@ -16,10 +16,13 @@
 //!    `tickets` table; runs after history, on git work trees only;
 //! 4. **summaries** (`index_summaries`) gives every available ticket in the
 //!    index `tickets` table an English summary and purpose from the chat
-//!    model (through the LLM cache); runs after tickets.
+//!    model (through the LLM cache); runs after tickets;
+//! 5. **describe** (`index_descriptions`) gives every method and constructor
+//!    a one-line `what` and a `why` from the chat model, built from its code,
+//!    its enclosing type and its tickets' summaries (or commit subjects);
+//!    runs after summaries, also on a repository without git (code only).
 //!
-//! Later stages (method and type what/why) slot in after summaries the same
-//! way. A stage never commits: the transaction commits and the temporary file is
+//! The type what/why stage slots in after describe the same way. A stage never commits: the transaction commits and the temporary file is
 //! atomically renamed over `index.db` exactly once, after the last stage. Any
 //! stage error drops the transaction and the build, leaving the previous index
 //! untouched.
@@ -39,6 +42,10 @@ use anyhow::{Context, Result};
 use libsql::{Connection, Transaction, params};
 use regex::Regex;
 
+use crate::describe::{
+    Description, Member, MemberCommit, MemberTicket, Parent, TicketState, member_prompt,
+    select_history, validate_description,
+};
 use crate::history::{self, Commit, HistoryCache};
 use crate::jira::{FetchError, Ticket};
 use crate::llm::{InvalidOutput, LlmStats, LlmUnavailable};
@@ -105,8 +112,33 @@ pub struct IndexStats {
     /// `[ollama]` section, or not in the LLM cache with `--no-llm` or after
     /// the circuit breaker tripped.
     pub summaries_skipped: usize,
-    /// LLM client counters for this run; `llm.chat_calls` is zero on a fully
-    /// cached run.
+    /// LLM client counters of the summaries stage.
+    pub summary_llm: LlmStats,
+    /// Methods and constructors indexed. When an LLM stage runs, `described +
+    /// describe_invalid + describe_failed + describe_incomplete +
+    /// describe_skipped == describe_members`.
+    pub describe_members: usize,
+    /// Members given a `what` (and maybe a `why`), from the LLM cache or the
+    /// model.
+    pub described: usize,
+    /// Of `described`, those answered from the LLM cache.
+    pub described_cached: usize,
+    /// Members whose reply was still invalid after the retry; not cached,
+    /// asked again next run.
+    pub describe_invalid: usize,
+    /// Members whose chat call failed (backend error; trips the breaker).
+    pub describe_failed: usize,
+    /// Members not described because their input is incomplete this run: a
+    /// chosen ticket has no summary, or a ticket was never fetched. Described
+    /// on a later run that has it.
+    pub describe_incomplete: usize,
+    /// Members not sent to the model: no `[ollama]` section, or not in the
+    /// LLM cache with `--no-llm` or after the circuit breaker tripped.
+    pub describe_skipped: usize,
+    /// LLM client counters of the describe stage.
+    pub describe_llm: LlmStats,
+    /// LLM client counters for this run (all stages); `llm.chat_calls` is
+    /// zero on a fully cached run.
     pub llm: LlmStats,
     /// Files that parsed cleanly but produced no symbols (`package-info.java`).
     pub empty: usize,
@@ -145,11 +177,12 @@ pub struct IndexStats {
 /// request. Bad Jira credentials abort the run; see `index_tickets` for the
 /// other outcomes.
 ///
-/// `llm` summarises the available tickets; `None` (no `[ollama]` section)
-/// leaves them without a summary. Its chat model is checked once before the
+/// `llm` summarises the available tickets and describes every method and
+/// constructor; `None` (no `[ollama]` section) leaves them without a summary
+/// or what/why. Its chat model is checked once before the
 /// stages run: a model the server does not have fails the run (like rejected
 /// Jira credentials). Other LLM failures never fail the run; see
-/// `index_summaries`.
+/// `index_summaries` and `index_descriptions`.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
@@ -191,7 +224,8 @@ pub async fn build_index(
         .await
         .context("starting index transaction")?;
     let mut stats = IndexStats::default();
-    let llm_before = llm.map(|llm| llm.client.stats());
+    let llm_stats = || llm.map(|llm| llm.client.stats()).unwrap_or_default();
+    let run_before = llm_stats();
 
     let indexed = index_structure(&transaction, repo, &files, &mut stats).await?;
     if is_repo {
@@ -205,11 +239,14 @@ pub async fn build_index(
         )
         .await?;
         index_tickets(&transaction, store.cache(), jira, &mut stats).await?;
+        let before = llm_stats();
         index_summaries(&transaction, llm, &mut stats).await?;
+        stats.summary_llm = llm_stats().since(&before);
     }
-    if let (Some(llm), Some(before)) = (llm, llm_before) {
-        stats.llm = llm.client.stats().since(&before);
-    }
+    let before = llm_stats();
+    index_descriptions(&transaction, &indexed, llm, &mut stats).await?;
+    stats.describe_llm = llm_stats().since(&before);
+    stats.llm = llm_stats().since(&run_before);
 
     transaction
         .commit()
@@ -236,6 +273,13 @@ pub async fn build_index(
         summaries_invalid = stats.summaries_invalid,
         summaries_failed = stats.summaries_failed,
         summaries_skipped = stats.summaries_skipped,
+        describe_members = stats.describe_members,
+        described = stats.described,
+        described_cached = stats.described_cached,
+        describe_invalid = stats.describe_invalid,
+        describe_failed = stats.describe_failed,
+        describe_incomplete = stats.describe_incomplete,
+        describe_skipped = stats.describe_skipped,
         chat_calls = stats.llm.chat_calls,
         chat_hits = stats.llm.chat_hits,
         chat_retries = stats.llm.chat_retries,
@@ -247,10 +291,11 @@ pub async fn build_index(
     Ok(stats)
 }
 
-/// One file the structure stage parsed, with the rows it wrote (none if every
-/// fqn was a duplicate).
+/// One file the structure stage parsed, with its source and the rows it
+/// wrote (none if every fqn was a duplicate).
 struct IndexedFile {
     path: PathBuf,
+    source: String,
     symbols: Vec<IndexedSymbol>,
 }
 
@@ -319,6 +364,7 @@ async fn index_structure(
         }
         indexed.push(IndexedFile {
             path: relative.clone(),
+            source,
             symbols,
         });
     }
@@ -746,6 +792,213 @@ async fn write_summary(conn: &Connection, key: &str, summary: &TicketSummary) ->
     )
     .await
     .with_context(|| format!("writing the summary of ticket {key}"))?;
+    Ok(())
+}
+
+/// Describe stage: give every method and constructor the structure stage
+/// wrote a `what` and a `why` from the chat model, stored on its `symbols`
+/// row. Runs after summaries, which it reads from the index `tickets` table.
+///
+/// Members are taken in walk and source order and asked one at a time (the
+/// host Ollama serves one request at a time, D-ap). Each prompt is built by
+/// [`member_prompt`] from the member alone, so a rerun hits the LLM cache. A
+/// member whose input is incomplete (a chosen ticket without a summary, an
+/// unfetched ticket) is `describe_incomplete` and not asked. Invalid replies,
+/// backend failures and the circuit breaker behave as in `index_summaries`
+/// (the breaker is shared, so a tripped summaries stage leaves this one
+/// cache-only). Without a summarizer every member is `describe_skipped`. Only
+/// an index write error fails the stage.
+async fn index_descriptions(
+    transaction: &Transaction,
+    files: &[IndexedFile],
+    llm: Option<&Summarizer>,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let members: Vec<(&IndexedFile, &IndexedSymbol)> = files
+        .iter()
+        .flat_map(|file| file.symbols.iter().map(move |symbol| (file, symbol)))
+        .filter(|(_, indexed)| !indexed.symbol.kind.is_type())
+        .collect();
+    stats.describe_members = members.len();
+    let Some(llm) = llm else {
+        stats.describe_skipped += members.len();
+        return Ok(());
+    };
+    let types: HashMap<&str, &Symbol> = files
+        .iter()
+        .flat_map(|file| &file.symbols)
+        .filter(|indexed| indexed.symbol.kind.is_type())
+        .map(|indexed| (indexed.symbol.fqn.as_str(), &indexed.symbol))
+        .collect();
+    let mut tickets = member_tickets(transaction).await?;
+    let mut commits = member_commits(transaction).await?;
+    let config = &llm.describe;
+    let started = std::time::Instant::now();
+    for (done, (file, indexed)) in members.iter().enumerate() {
+        let symbol = &indexed.symbol;
+        let history = match select_history(
+            &tickets.remove(&indexed.id).unwrap_or_default(),
+            &commits.remove(&indexed.id).unwrap_or_default(),
+            config,
+        ) {
+            Ok(history) => history,
+            Err(incomplete) => {
+                tracing::debug!(fqn = %symbol.fqn, reason = %incomplete, "member input incomplete; not described this run");
+                stats.describe_incomplete += 1;
+                continue;
+            }
+        };
+        let member = Member {
+            kind: symbol.kind.as_str().to_string(),
+            signature: symbol.signature.clone(),
+            javadoc: symbol.javadoc.clone(),
+            source: file
+                .source
+                .get(symbol.start_byte..symbol.end_byte)
+                .unwrap_or_default()
+                .to_string(),
+            parent: symbol
+                .parent
+                .as_deref()
+                .and_then(|fqn| types.get(fqn))
+                .map(|parent| Parent {
+                    fqn: parent.fqn.clone(),
+                    kind: parent.kind.as_str().to_string(),
+                    role: parent.role.map(|role| role.as_str().to_string()),
+                }),
+        };
+        let prompt = member_prompt(&member, &history, config.body_chars);
+        let hits = llm.client.stats().chat_hits;
+        let description = match llm
+            .client
+            .complete_with::<Description, _>(&prompt, validate_description)
+            .await
+        {
+            Ok(description) => description,
+            Err(err) if err.downcast_ref::<LlmUnavailable>().is_some() => {
+                stats.describe_skipped += 1;
+                continue;
+            }
+            Err(err) if err.downcast_ref::<InvalidOutput>().is_some() => {
+                tracing::warn!(
+                    fqn = %symbol.fqn,
+                    error = format!("{err:#}"),
+                    "no valid what/why; skipping the member this run"
+                );
+                stats.describe_invalid += 1;
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    fqn = %symbol.fqn,
+                    error = format!("{err:#}"),
+                    remaining = members.len() - done - 1,
+                    "the chat model failed; remaining members use cached what/why only"
+                );
+                stats.describe_failed += 1;
+                continue;
+            }
+        };
+        write_description(transaction, indexed.id, &description).await?;
+        stats.described += 1;
+        if llm.client.stats().chat_hits > hits {
+            stats.described_cached += 1;
+        }
+        tracing::debug!(
+            fqn = %symbol.fqn,
+            done = done + 1,
+            total = members.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "member described"
+        );
+    }
+    tracing::info!(
+        members = members.len(),
+        described = stats.described,
+        cached = stats.described_cached,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "member what/why done"
+    );
+    if stats.describe_invalid + stats.describe_failed + stats.describe_incomplete > 0 {
+        tracing::warn!(
+            members = members.len(),
+            described = stats.described,
+            invalid = stats.describe_invalid,
+            failed = stats.describe_failed,
+            incomplete = stats.describe_incomplete,
+            skipped = stats.describe_skipped,
+            "some methods got no what/why this run; they are asked again next run"
+        );
+    }
+    Ok(())
+}
+
+/// Every member's tickets with what the index `tickets` table knows about
+/// them, by symbol id.
+async fn member_tickets(conn: &Connection) -> Result<HashMap<i64, Vec<MemberTicket>>> {
+    let mut rows = conn
+        .query(
+            "SELECT st.symbol_id, st.ticket_key, st.first_date, st.last_date,
+                    t.unavailable, t.issue_type, t.llm_summary, t.llm_purpose
+             FROM symbol_tickets st LEFT JOIN tickets t ON t.key = st.ticket_key",
+            (),
+        )
+        .await
+        .context("reading member tickets")?;
+    let mut tickets: HashMap<i64, Vec<MemberTicket>> = HashMap::new();
+    while let Some(row) = rows.next().await.context("reading member ticket row")? {
+        let unavailable: Option<i64> = row.get(4).context("reading tickets.unavailable")?;
+        let issue_type: Option<String> = row.get(5).context("reading tickets.issue_type")?;
+        let state = match (unavailable, issue_type) {
+            (None, _) => TicketState::Unknown,
+            (Some(0), Some(issue_type)) => TicketState::Available {
+                issue_type,
+                summary: row.get(6).context("reading tickets.llm_summary")?,
+                purpose: row.get(7).context("reading tickets.llm_purpose")?,
+            },
+            _ => TicketState::Unavailable,
+        };
+        tickets
+            .entry(row.get(0).context("reading symbol_tickets.symbol_id")?)
+            .or_default()
+            .push(MemberTicket {
+                key: row.get(1).context("reading symbol_tickets.ticket_key")?,
+                first_date: row.get(2).context("reading symbol_tickets.first_date")?,
+                last_date: row.get(3).context("reading symbol_tickets.last_date")?,
+                state,
+            });
+    }
+    Ok(tickets)
+}
+
+/// Every member's commits, by symbol id.
+async fn member_commits(conn: &Connection) -> Result<HashMap<i64, Vec<MemberCommit>>> {
+    let mut rows = conn
+        .query("SELECT symbol_id, date, subject FROM symbol_commits", ())
+        .await
+        .context("reading member commits")?;
+    let mut commits: HashMap<i64, Vec<MemberCommit>> = HashMap::new();
+    while let Some(row) = rows.next().await.context("reading member commit row")? {
+        commits
+            .entry(row.get(0).context("reading symbol_commits.symbol_id")?)
+            .or_default()
+            .push(MemberCommit {
+                date: row.get(1).context("reading symbol_commits.date")?,
+                subject: row.get(2).context("reading symbol_commits.subject")?,
+            });
+    }
+    Ok(commits)
+}
+
+/// Store one member's `what` and `why` (whitespace collapsed, an empty `why`
+/// as `NULL`) on its `symbols` row.
+async fn write_description(conn: &Connection, id: i64, description: &Description) -> Result<()> {
+    conn.execute(
+        "UPDATE symbols SET what = ?2, why = ?3 WHERE id = ?1",
+        params![id, description.what_text(), description.why_text()],
+    )
+    .await
+    .with_context(|| format!("writing the what/why of symbol {id}"))?;
     Ok(())
 }
 
@@ -2688,9 +2941,13 @@ public class UserService {
     }
 
     const BRIEF: &str = r#"{"summary": "Adds the service.", "purpose": "Users need it."}"#;
+    const DESCRIBED: &str = r#"{"what": "Returns the value.", "why": ""}"#;
     const BLANK: &str = r#"{"summary": " ", "purpose": "Users need it."}"#;
 
+    /// A summarizer over `backend`; the summary tests' describe stage gets
+    /// [`DESCRIBED`] for every member.
     fn summarizer(store: &Store, backend: &Arc<FakeBackend>, cache_only: bool) -> Summarizer {
+        backend.always("Description", DESCRIBED);
         let config = OllamaConfig {
             url: "http://localhost:11434".to_string(),
             chat_model: "chat".to_string(),
@@ -2795,8 +3052,8 @@ public class UserService {
 
         assert_eq!(cold.summary_tickets, 2, "GRLD-2 is unavailable");
         assert_eq!(cold.summaries, 2);
-        assert_eq!(cold.llm.chat_calls, 2);
-        assert_eq!(cold.llm.chat_hits, 0);
+        assert_eq!(cold.summary_llm.chat_calls, 2);
+        assert_eq!(cold.summary_llm.chat_hits, 0);
         let chats = backend.chats();
         let prompt = &chats[1].messages[0].content;
         assert!(prompt.contains("Key: GRLD-3\n"), "{prompt}");
@@ -2812,8 +3069,8 @@ public class UserService {
         let quiet = FakeBackend::new();
         let warm = summarise_with(repo.path(), data.path(), Some(&jira), &quiet, false).await;
 
-        assert_eq!(warm.llm.chat_calls, 0, "a rerun makes no LLM calls");
-        assert_eq!(warm.llm.chat_hits, 2);
+        assert_eq!(warm.summary_llm.chat_calls, 0, "a rerun makes no LLM calls");
+        assert_eq!(warm.summary_llm.chat_hits, 2);
         assert_eq!(warm.summaries, 2);
         assert_eq!(warm.jira_requests, 0);
         assert!(quiet.chats().is_empty());
@@ -2871,8 +3128,8 @@ public class UserService {
 
         assert_eq!(first.summaries_invalid, 1);
         assert_eq!(first.summaries, 1);
-        assert_eq!(first.llm.chat_calls, 3);
-        assert_eq!(first.llm.chat_retries, 1);
+        assert_eq!(first.summary_llm.chat_calls, 3);
+        assert_eq!(first.summary_llm.chat_retries, 1);
         assert_eq!(
             indexed_summaries(data.path()).await,
             vec![
@@ -2887,10 +3144,10 @@ public class UserService {
 
         assert_eq!(second.summaries, 2);
         assert_eq!(
-            second.llm.chat_calls, 1,
+            second.summary_llm.chat_calls, 1,
             "only the invalid ticket is asked again"
         );
-        assert_eq!(second.llm.chat_hits, 1);
+        assert_eq!(second.summary_llm.chat_hits, 1);
     }
 
     #[tokio::test]
@@ -2914,8 +3171,8 @@ public class UserService {
         assert_eq!(stats.summaries_failed, 1);
         assert_eq!(stats.summaries, 2, "cached summaries are still used");
         assert_eq!(stats.summaries_skipped, 1, "GRLD-4 is not cached");
-        assert_eq!(stats.llm.chat_calls, 1);
-        assert_eq!(stats.llm.chat_hits, 2);
+        assert_eq!(stats.summary_llm.chat_calls, 1);
+        assert_eq!(stats.summary_llm.chat_hits, 2);
         assert_eq!(
             indexed_summaries(data.path()).await,
             vec![
@@ -2940,7 +3197,7 @@ public class UserService {
         let stats = summarise_with(repo.path(), data.path(), Some(&jira), &quiet, true).await;
 
         assert!(quiet.chats().is_empty());
-        assert_eq!(stats.llm.chat_calls, 0);
+        assert_eq!(stats.summary_llm.chat_calls, 0);
         assert_eq!(stats.summaries, 1);
         assert_eq!(stats.summaries_skipped, 1);
         assert_eq!(stats.summaries_failed + stats.summaries_invalid, 0);
@@ -3012,7 +3269,7 @@ public class UserService {
 
         assert_eq!(stats.summaries_invalid, MAX_CONSECUTIVE_INVALID);
         assert_eq!(stats.summaries_skipped, 1);
-        assert_eq!(stats.llm.chat_calls, 2 * MAX_CONSECUTIVE_INVALID);
+        assert_eq!(stats.summary_llm.chat_calls, 2 * MAX_CONSECUTIVE_INVALID);
     }
 
     #[tokio::test]
@@ -3043,5 +3300,304 @@ public class UserService {
             "{output}"
         );
         assert!(!output.contains("purpose:"), "{output}");
+    }
+
+    const WHAT_WHY: &str =
+        r#"{"what": "Returns the\nconfigured value.", "why": "Callers need the value."}"#;
+
+    async fn describe_with(
+        repo: &Path,
+        data: &Path,
+        path: Option<&Path>,
+        jira: Option<&TicketFetch>,
+        backend: &Arc<FakeBackend>,
+        cache_only: bool,
+    ) -> IndexStats {
+        let store = Store::open(data).await.unwrap();
+        let config = OllamaConfig {
+            url: "http://localhost:11434".to_string(),
+            chat_model: "chat".to_string(),
+            embedding_model: "embed".to_string(),
+            reasoning_effort: "none".to_string(),
+            temperature: 0.0,
+        };
+        let client = LlmClient::new(backend.clone(), store.connect_cache().unwrap(), &config);
+        let llm = Summarizer::new(client, cache_only);
+        let stats = build_index(&store, repo, path, &ticket_regex(), jira, Some(&llm))
+            .await
+            .unwrap();
+        assert_describe_buckets(&stats);
+        stats
+    }
+
+    fn assert_describe_buckets(stats: &IndexStats) {
+        assert_eq!(
+            stats.described
+                + stats.describe_invalid
+                + stats.describe_failed
+                + stats.describe_incomplete
+                + stats.describe_skipped,
+            stats.describe_members,
+            "{stats:?}"
+        );
+    }
+
+    /// `(what, why)` of `fqn` in the committed index.
+    async fn what_why(data: &Path, fqn: &str) -> (Option<String>, Option<String>) {
+        let reader = IndexReader::open(data).await.unwrap();
+        let conn = reader.connection();
+        (
+            text_of(conn, fqn, "what").await,
+            text_of(conn, fqn, "why").await,
+        )
+    }
+
+    /// The prompts of the describe requests `backend` received.
+    fn describe_prompts(backend: &FakeBackend) -> Vec<String> {
+        backend
+            .chats()
+            .into_iter()
+            .filter(|chat| chat.schema_name == "Description")
+            .map(|chat| chat.messages[0].content.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn members_get_what_why_from_ticket_summaries_and_a_rerun_makes_no_chat_calls() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1")]);
+        let backend = FakeBackend::new();
+        backend.reply(&[BRIEF, WHAT_WHY]);
+
+        let cold =
+            describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
+
+        assert_eq!(cold.describe_members, 1);
+        assert_eq!(cold.described, 1);
+        assert_eq!(cold.described_cached, 0);
+        assert_eq!(cold.describe_llm.chat_calls, 1);
+        assert_eq!(cold.summary_llm.chat_calls, 1);
+        assert_eq!(cold.llm.chat_calls, 2);
+        let prompts = describe_prompts(&backend);
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("Declared in: class com.acme.Service\nKind: method\nSignature: public int value()\nJavadoc: (none)\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("        return 1;") || prompt.contains("    return 1;"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- Created for GRLD-1 (Story): Adds the service.\n  Reason: Users need it.\nCONTEXT>>>"),
+            "GRLD-2 is unavailable and left out: {prompt}"
+        );
+        assert_eq!(
+            what_why(data.path(), "com.acme.Service#value()").await,
+            (
+                Some("Returns the configured value.".to_string()),
+                Some("Callers need the value.".to_string())
+            )
+        );
+
+        let quiet = FakeBackend::new();
+        let warm = describe_with(repo.path(), data.path(), None, Some(&jira), &quiet, false).await;
+
+        assert_eq!(warm.llm.chat_calls, 0, "a rerun makes no LLM calls");
+        assert_eq!(warm.described, 1);
+        assert_eq!(warm.described_cached, 1);
+        assert!(quiet.chats().is_empty());
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let output = crate::show::render(reader.connection(), "com.acme.Service")
+            .await
+            .unwrap();
+        assert!(
+            output.contains(
+                "  com.acme.Service#value() [method]
+    - file: src/main/java/com/acme/Service.java:4-6
+    - signature: public int value()
+    - what: Returns the configured value.
+    - why: Callers need the value.
+"
+            ),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_with_an_unsummarised_ticket_waits_for_its_summary() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1")]);
+        let backend = FakeBackend::new();
+        backend.reply(&[BLANK, BLANK]);
+
+        let first =
+            describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
+
+        assert_eq!(first.summaries_invalid, 1);
+        assert_eq!(first.describe_incomplete, 1);
+        assert_eq!(
+            first.describe_llm.chat_calls, 0,
+            "not described without the summary"
+        );
+        assert_eq!(
+            what_why(data.path(), "com.acme.Service#value()").await,
+            (None, None)
+        );
+
+        let backend = FakeBackend::new();
+        backend.reply(&[BRIEF, r#"{"what": "Returns the value.", "why": ""}"#]);
+        let second =
+            describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
+
+        assert_eq!(second.described, 1);
+        assert_eq!(
+            what_why(data.path(), "com.acme.Service#value()").await,
+            (Some("Returns the value.".to_string()), None),
+            "an empty why is stored as NULL"
+        );
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let output = crate::show::render(reader.connection(), "com.acme.Service#value()")
+            .await
+            .unwrap();
+        assert!(output.contains("- what: Returns the value.\n"), "{output}");
+        assert!(!output.contains("- why:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn unfetched_ticket_leaves_the_member_incomplete() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+
+        let stats = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
+
+        assert_eq!(stats.tickets_not_fetched, 1);
+        assert_eq!(stats.describe_incomplete, 1);
+        assert!(backend.chats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_subjects_stand_in_when_no_ticket_is_available() {
+        let repo = repo_with_commits(&["GRLD-2 change", "Tidy up", "Tidy up"]);
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[]);
+        let backend = FakeBackend::new();
+        backend.reply(&[WHAT_WHY]);
+
+        let stats =
+            describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
+
+        assert_eq!(stats.summary_tickets, 0);
+        assert_eq!(stats.described, 1);
+        let prompt = &describe_prompts(&backend)[0];
+        assert!(
+            prompt.contains(
+                "Change history (commit messages, newest first):\n- Tidy up\n- GRLD-2 change\nCONTEXT>>>"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_repo_members_are_described_from_code_alone() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Service.java", &java(7));
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.reply(&[WHAT_WHY]);
+
+        let stats = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
+
+        assert_eq!(stats.described, 1);
+        let prompt = &describe_prompts(&backend)[0];
+        assert!(prompt.contains("Change history: (none)\n"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn prompt_does_not_depend_on_the_rest_of_a_path_run() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/a/A.java",
+            &java_class("A", 1).replace("package com.acme;", "package com.acme.a;"),
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/b/B.java",
+            &java_class("B", 2).replace("package com.acme;", "package com.acme.b;"),
+        );
+        commit(repo.path(), "Add A and B", "2024-01-01T00:00:00+00:00");
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.reply(&[WHAT_WHY, WHAT_WHY]);
+        let full = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
+        assert_eq!(full.described, 2);
+
+        let quiet = FakeBackend::new();
+        let narrow = describe_with(
+            repo.path(),
+            data.path(),
+            Some(Path::new("src/main/java/com/acme/a")),
+            None,
+            &quiet,
+            false,
+        )
+        .await;
+
+        assert_eq!(narrow.describe_members, 1);
+        assert_eq!(narrow.described_cached, 1, "same prompt as in the full run");
+        assert!(quiet.chats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_summarizer_or_with_no_llm_members_are_skipped() {
+        let repo = repo_with_commits(&["Add service"]);
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = index_with(repo.path(), data.path(), None).await.unwrap();
+        assert_eq!(stats.describe_members, 1);
+        assert_eq!(stats.describe_skipped, 1);
+        assert_describe_buckets(&stats);
+
+        let backend = FakeBackend::new();
+        let stats = describe_with(repo.path(), data.path(), None, None, &backend, true).await;
+        assert_eq!(stats.describe_skipped, 1);
+        assert!(backend.chats().is_empty());
+        assert_eq!(
+            what_why(data.path(), "com.acme.Service#value()").await,
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_and_failed_descriptions_are_counted_and_the_breaker_holds() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            "package com.acme;\nclass Service {\n    Service() {}\n    int a() { return 1; }\n    int b() { return 2; }\n}\n",
+        );
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.reply(&[
+            r#"{"what": "This method does things.", "why": ""}"#,
+            r#"{"what": " ", "why": ""}"#,
+        ]);
+
+        let stats = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
+
+        assert_eq!(stats.describe_members, 3);
+        assert_eq!(stats.describe_invalid, 1, "the constructor");
+        assert_eq!(stats.describe_failed, 1, "a(): no scripted reply");
+        assert_eq!(stats.describe_skipped, 1, "b() after the breaker tripped");
+        assert_eq!(stats.describe_llm.chat_calls, 3);
+        assert_eq!(stats.describe_llm.chat_retries, 1);
+        let prompt = &describe_prompts(&backend)[0];
+        assert!(prompt.contains("one Java constructor"), "{prompt}");
     }
 }

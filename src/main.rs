@@ -43,8 +43,8 @@ enum Command {
         /// already in cache.db are still used.
         #[arg(long)]
         offline: bool,
-        /// Make no chat-model calls; summaries already in cache.db are
-        /// still used, other tickets get none.
+        /// Make no chat-model calls; summaries and what/why already in
+        /// cache.db are still used, the rest get none.
         #[arg(long)]
         no_llm: bool,
     },
@@ -79,7 +79,8 @@ async fn main() -> Result<()> {
         Command::Index { offline, no_llm } => {
             let jira = TicketFetch::from_config(config.jira.as_ref(), *offline)?;
             let store = Store::open(&config.data_dir).await?;
-            let llm = Summarizer::from_config(config.ollama.as_ref(), *no_llm, &store)?;
+            let llm =
+                Summarizer::from_config(config.ollama.as_ref(), config.describe, *no_llm, &store)?;
             let stats = indexer::build_index(
                 &store,
                 &config.repo,
@@ -119,9 +120,22 @@ async fn main() -> Result<()> {
                 stats.summaries_invalid,
                 stats.summaries_failed,
                 stats.summaries_skipped,
-                stats.llm.chat_calls,
-                stats.llm.chat_hits,
-                stats.llm.chat_retries
+                stats.summary_llm.chat_calls,
+                stats.summary_llm.chat_hits,
+                stats.summary_llm.chat_retries
+            );
+            println!(
+                "describe: {} methods, {} described ({} from cache), {} invalid, {} failed, {} incomplete, {} skipped; {} chat calls, {} cache hits, {} retries",
+                stats.describe_members,
+                stats.described,
+                stats.described_cached,
+                stats.describe_invalid,
+                stats.describe_failed,
+                stats.describe_incomplete,
+                stats.describe_skipped,
+                stats.describe_llm.chat_calls,
+                stats.describe_llm.chat_hits,
+                stats.describe_llm.chat_retries
             );
         }
         Command::Show { fqn } => {
