@@ -3,11 +3,14 @@
 
 Usage:
   run.py run --tasks tasks.toml --out DIR [--reps 2] [--only T1,T2] [--arms with,without]
+             [--with-prompt files|symbols]
   run.py summary --out DIR          # per-run CSV + per task/arm means; warns about incomplete runs
   run.py blind --out DIR            # shuffled final answers for grading, annatar mentions redacted
 
 `run` writes DIR/raw/<task>-<arm>-<rep>.jsonl (the stream) and .meta.json (exit code, timeout,
-wall time); a run without a result event is repeated by the next `run`.
+wall time, the with-arm prompt); a run without a result event is repeated by the next `run`.
+`--with-prompt` picks the appended system prompt of the "with" arm: `files` describes the file-level
+`annatar search` output (5.5, the default), `symbols` the symbol list the 5.4 trial ran with.
 Tests (stdlib, no network): python3 -m unittest discover -s scripts/agent_trial
 
 The task file (private) holds `preamble` and `[[task]]` tables with `id`, `label`, `prompt`.
@@ -30,10 +33,16 @@ import time
 import tomllib
 from pathlib import Path
 
-WITH_PROMPT = """This machine has `annatar`, a command-line index of this repository. Every class, interface, method and constructor has a short description of what it does and, where Jira tickets or commits explain it, why it was built or changed.
+WITH_PROMPTS = {
+    "symbols": """This machine has `annatar`, a command-line index of this repository. Every class, interface, method and constructor has a short description of what it does and, where Jira tickets or commits explain it, why it was built or changed.
 - `annatar search "<words>"` lists the symbols whose descriptions are most similar in meaning to the words: rank, similarity, fully qualified name (third field), [kind], role, file:lines, and the description on the next line. `-k N` sets the number of results (default 10).
 - `annatar show '<fqn>'` prints one symbol (fqn exactly as search prints it): description, parent, children, file and lines, recent commits and Jira tickets with an English summary and purpose.
-Results are ranked by similarity of meaning; the best match is not always first, and descriptions can be incomplete or wrong, so check the code."""
+Results are ranked by similarity of meaning; the best match is not always first, and descriptions can be incomplete or wrong, so check the code.""",
+    "files": """This machine has `annatar`, a command-line index of this repository. Every class, interface, method and constructor has a short description of what it does and, where Jira tickets or commits explain it, why it was built or changed.
+- `annatar search "<words>"` lists the files whose symbols' descriptions are most similar in meaning to the words: rank, similarity, file path; its class (fully qualified name, kind, role, lines) with the description on the next line; then its members with lines, the best matches ending in `*similarity`. `-k N` sets the number of files (default 5); `--symbols` lists symbols instead.
+- `annatar show '<fqn>'` prints one symbol (a member's fqn is the class fqn + `#name(params)`): description, parent, children, file and lines, recent commits and Jira tickets with an English summary and purpose.
+Results are ranked by similarity of meaning; the best match is not always first, and descriptions can be incomplete or wrong, so check the code.""",
+}
 
 TOOLS = "Bash,Read,Grep,Glob"
 ARMS = ("with", "without")
@@ -42,7 +51,7 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)|`([^`]*)`")
 
 
-def claude_cmd(model, arm, prompt, max_turns, budget):
+def claude_cmd(model, arm, prompt, max_turns, budget, with_prompt="files"):
     cmd = [
         "claude", "-p", prompt,
         "--model", model,
@@ -59,7 +68,7 @@ def claude_cmd(model, arm, prompt, max_turns, budget):
         "--max-budget-usd", str(budget),
     ]
     if arm == "with":
-        cmd += ["--append-system-prompt", WITH_PROMPT]
+        cmd += ["--append-system-prompt", WITH_PROMPTS[with_prompt]]
     return cmd
 
 
@@ -171,13 +180,15 @@ def run(args):
                 start = time.time()
                 with open(raw, "w") as f:
                     try:
-                        returncode = subprocess.run(claude_cmd(model, arm, prompt, args.max_turns, args.budget),
+                        returncode = subprocess.run(claude_cmd(model, arm, prompt, args.max_turns, args.budget,
+                                                               args.with_prompt),
                                                     cwd=repo, env=env, stdout=f, stderr=subprocess.STDOUT,
                                                     timeout=args.timeout).returncode
                     except subprocess.TimeoutExpired:
                         returncode = None
                 wall = time.time() - start
-                meta = {"returncode": returncode, "timeout": returncode is None, "wall_s": round(wall, 1)}
+                meta = {"returncode": returncode, "timeout": returncode is None, "wall_s": round(wall, 1),
+                        "with_prompt": args.with_prompt if arm == "with" else None}
                 (out / "raw" / f"{name}.meta.json").write_text(json.dumps(meta) + "\n")
                 if repo_state(repo) != baseline:
                     sys.exit(f"{name}: repository changed")
@@ -292,6 +303,7 @@ def main():
     r.add_argument("--max-turns", type=int, default=60)
     r.add_argument("--budget", type=float, default=3.0)
     r.add_argument("--timeout", type=int, default=1200)
+    r.add_argument("--with-prompt", choices=sorted(WITH_PROMPTS), default="files")
     s = sub.add_parser("summary")
     s.add_argument("--out", required=True)
     b = sub.add_parser("blind")
