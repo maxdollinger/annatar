@@ -31,10 +31,25 @@ fn workspace() -> tempfile::TempDir {
     dir
 }
 
+/// Run the binary in `dir` with no proxy, so requests to the fake servers on
+/// loopback never leave the machine whatever the caller's environment says.
 fn annatar(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_annatar"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_annatar"));
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(var);
+    }
+    command
         .current_dir(dir)
         .env_remove("RUST_LOG")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
         .args(args)
         .output()
         .unwrap()
@@ -389,6 +404,24 @@ fn eval_fails_on_a_golden_symbol_missing_from_the_index() {
         text(&eval.stderr),
         "error: the golden set does not match the index: com.acme.sample.Gone is not in the index (\"Who lists users?\")\n"
     );
+}
+
+#[test]
+fn eval_rejects_limits_below_five() {
+    let dir = workspace();
+    for args in [
+        &["eval", "-k", "4", "golden.toml"][..],
+        &["eval", "-k", "101", "golden.toml"][..],
+    ] {
+        let output = annatar(dir.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&output.stdout), "");
+        assert!(
+            text(&output.stderr).contains("expected a number from 5 to 100"),
+            "{}",
+            text(&output.stderr)
+        );
+    }
 }
 
 #[test]

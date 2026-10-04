@@ -54,7 +54,7 @@ rank, cosine similarity (1 = identical), fqn, `[kind]`, `role=<role>` when the s
 
 A golden set (questions with the fqns that answer them, the benchmark retrieval is measured against) is a TOML file of `[[question]]` tables (`text`, `expect` = the fqn the question is about first, then acceptable alternates, optional `kind` and `note`; see `src/golden.rs` and `tests/fixtures/golden/sample.toml`). A real set names a private repository's symbols and stays out of git (`.annatar-local/` is ignored). Check it against a full index (a run without `--path`) with `ANNATAR_GOLDEN_SET=<set.toml> ANNATAR_GOLDEN_DATA_DIR=<data dir holding index.db> cargo test real_golden_set -- --ignored`: it fails on any expected fqn the index does not hold and on a first fqn of another kind.
 
-`annatar eval <golden.toml>` measures retrieval against a golden set: it runs that check first (any problem is the error, nothing is searched), then searches every question exactly like `annatar search "<question>"` (no filter, `-k` hits, default 10) and prints one line per question and three summary lines:
+`annatar eval <golden.toml>` measures retrieval against a golden set: it runs that check first (any problem is the error, nothing is searched), then searches every question exactly like `annatar search "<question>"` (no filter, `-k` hits, default 10, at least 5 because the summary counts top-5) and prints one line per question and three summary lines:
 
 ```text
 eval: embedding_model=bge-m3:latest dim=1024 parent_description=false k=10

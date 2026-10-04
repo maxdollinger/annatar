@@ -16,6 +16,9 @@ use crate::golden::{self, GoldenSet, Question};
 use crate::schema;
 use crate::search::{self, Filter, QueryEmbedder};
 
+/// The fewest hits searched per question: the report counts top-5.
+pub const MIN_LIMIT: usize = 5;
+
 /// Whether a question asks for a type or for a method or constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {

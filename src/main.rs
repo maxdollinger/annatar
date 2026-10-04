@@ -84,16 +84,27 @@ enum Command {
     Eval {
         /// The golden set (TOML, see `golden`).
         golden: PathBuf,
-        /// Hits searched per question.
-        #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_limit)]
+        /// Hits searched per question; at least 5, as the report counts top-5.
+        #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_eval_limit)]
         limit: usize,
     },
 }
 
 fn parse_limit(text: &str) -> Result<usize, String> {
+    parse_limit_from(text, 1)
+}
+
+fn parse_eval_limit(text: &str) -> Result<usize, String> {
+    parse_limit_from(text, eval::MIN_LIMIT)
+}
+
+fn parse_limit_from(text: &str, min: usize) -> Result<usize, String> {
     match text.parse::<usize>() {
-        Ok(limit) if (1..=search::MAX_LIMIT).contains(&limit) => Ok(limit),
-        _ => Err(format!("expected a number from 1 to {}", search::MAX_LIMIT)),
+        Ok(limit) if (min..=search::MAX_LIMIT).contains(&limit) => Ok(limit),
+        _ => Err(format!(
+            "expected a number from {min} to {}",
+            search::MAX_LIMIT
+        )),
     }
 }
 
