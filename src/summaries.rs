@@ -317,7 +317,7 @@ impl Summarizer {
     ) -> Result<Option<Self>> {
         let Some(ollama) = ollama else {
             tracing::warn!(
-                "no [ollama] section in the config; tickets get no summaries, methods no what/why"
+                "no [ollama] section in the config; tickets get no summaries, methods and types no what/why"
             );
             return Ok(None);
         };

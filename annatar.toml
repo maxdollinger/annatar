@@ -46,8 +46,8 @@ ticket_regex = '\bGRLD-\d+'
 # regenerated record matches the cached one) to 2.0. Part of the LLM cache key.
 # temperature = 0.0
 
-# What goes into the method and constructor what/why prompts. Optional; every
-# value changes the prompts, so changing one misses the LLM cache.
+# What goes into the method, constructor and type what/why prompts. Optional;
+# every value changes the prompts, so changing one misses the LLM cache.
 # [describe]
 # Most recent tickets shown besides the member's first (oldest) ticket
 # (default 3); each with its summary and purpose from the ticket summaries.
@@ -55,6 +55,13 @@ ticket_regex = '\bGRLD-\d+'
 # Commit subjects shown when none of the member's tickets is available
 # (default 5).
 # commit_subjects = 5
-# Characters of the member's source (declaration and body) shown (default
-# 1500); 0 sends only the signature and Javadoc.
+# Characters of the member's source (declaration and body), or of a type's
+# declaration with its members cut out, shown (default 1500); 0 sends only the
+# signature and Javadoc.
 # body_chars = 1500
+# Members and nested types listed with their what in a type's prompt, public
+# ones first (default 30); the rest are only counted.
+# type_members = 30
+# Most recent tickets shown besides a type's first ticket (default 3). A
+# type's history spans its whole body, so these are about the file's tickets.
+# type_recent_tickets = 3

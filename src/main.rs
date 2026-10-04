@@ -135,6 +135,19 @@ async fn main() -> Result<()> {
                 stats.describe_llm.chat_hits,
                 stats.describe_llm.chat_retries
             );
+            println!(
+                "types: {} types, {} described ({} from cache), {} invalid, {} failed, {} incomplete, {} skipped; {} chat calls, {} cache hits, {} retries",
+                stats.type_symbols,
+                stats.types_described,
+                stats.types_described_cached,
+                stats.types_invalid,
+                stats.types_failed,
+                stats.types_incomplete,
+                stats.types_skipped,
+                stats.type_llm.chat_calls,
+                stats.type_llm.chat_hits,
+                stats.type_llm.chat_retries
+            );
         }
         Command::Show { fqn } => {
             let reader = IndexReader::open(&config.data_dir).await?;

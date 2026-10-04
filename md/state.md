@@ -11,11 +11,88 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 4 — LLM summaries, in progress (Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
-| Step | 4.3 Method and constructor what/why — **done**, review fixes done (real run on `argus` after the fixes: 81 tickets, 729/729 members re-described in 1362 s, rerun 0 chat calls and 0 Jira requests); next 4.4 Type what/why, bottom-up |
+| Step | 4.4 Type what/why, bottom-up — **done** (real run on `argus`: 175/175 types described, 161 chat calls at 2.31 s, rerun 0 chat calls; nested `src/test` trees no longer indexed, open #13 closed); next 4.5 Quality review and golden set |
 | Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **4.4 Type what/why, bottom-up.** Two commits. *Walker (separate commit
+  `fix(walk)`, D-bd):* a `src` directory directly followed by `test` before
+  the first `java` component is test code, so `argus`'s `backend/src/test`
+  (55 files) is no longer indexed or described (open #13 closed). *Types:*
+  new sixth `build_index` stage `index_type_descriptions` after describe;
+  `index_descriptions` now returns what each member got this run
+  (`describe::ChildWhat`: `Described(what)` / `Invalid` / `Missing`). Types
+  are taken bottom-up (deepest nesting first, then walk/source order), each
+  result feeding its outer type. New in `describe`: `TypeDescription` (own
+  response schema, same fields), `TypeContext`, pure `outline(source, span,
+  cuts)` (the type's declaration with members and nested types cut out from
+  their Javadoc line: annotations, header, fields, enum constants, comments;
+  blank lines dropped, dedented), `select_children` (public first, then the
+  rest, each in source order, capped at `describe.type_members`, listed in
+  source order, the rest counted as "(N more not listed)"), `is_public`
+  (explicit `public`, or not `private` inside an interface/annotation),
+  `type_prompt` (type kind + fqn + Spring role, `Nested in:`, Javadoc,
+  declaration capped at `body_chars` — `Signature:` only without it —
+  children as `- method find(Long): what`, `- constructor Orders(Repo): …`,
+  `- class Line: …`, invalid ones `(not described)`, then the history),
+  `validate_type_description` ("This class / interface / enum / record /
+  annotation / type" openers and mentions, shared reason meta checks). The
+  type's history is chosen by `select_history` with
+  `describe.type_recent_tickets` (default 3), with the same blocking and
+  title-fallback rules (D-az, D-ba). A listed child without a `what` this run
+  holds the type back (`types_incomplete`, which in turn holds back its outer
+  type); an invalid child is listed bare (D-bg). New config
+  `[describe] type_members` (30) and `type_recent_tickets` (3); `IndexStats`
+  `type_symbols`, `types_described`, `types_described_cached`,
+  `types_invalid`, `types_failed`, `types_incomplete`, `types_skipped`,
+  `type_llm`; a new `types:` output line. `show` already printed what/why for
+  every symbol, so types and the children listing show them unchanged.
+  Member prompts and the member validation messages are unchanged (the
+  Javadoc and history blocks moved into shared helpers; the member cache
+  still hits: 479/479 on `argus`). 13 new tests (7 `describe`: child order,
+  cap and omitted count, holding back vs bare invalid, `is_public`, outline
+  cuts and clamping, exact type prompt with nested/role/children/history,
+  prompt without outline + cap + fencing, type validation; 5 indexer through
+  `build_index`: bottom-up order with nested `what`s in the outer prompt,
+  exact outer prompt, rerun 0 chat calls and `show` for the outer, nested
+  and doubly nested type; cap with public first; invalid member listed bare
+  then, under `--no-llm`, the missing member holding back two levels; an
+  unfetched chosen ticket holds the type back; no summarizer → skipped; the
+  `--path` test now also proves type prompts are run-independent; 1 walker
+  test, 1 config extension); 244 tests pass (4 ignored).
+  *Real runs (`argus`, release, `data-real`, tickets/summaries/members
+  cached):* `--path …/messaging/consume/pactum` (9 files, 14 types incl.
+  `ContractMessage.Contract.Customer`, three levels): 14 described, 0
+  invalid, 33.3 s (**2.38 s per type**). Full run: 162 files (was 217), 654
+  symbols, 69 tickets (0 Jira requests), 479 members from the cache, **175
+  types, 175 described** (14 from the `--path` run's cache), 0
+  invalid/failed/incomplete/skipped, 161 chat calls, 0 retries, stage 372 s
+  (2.31 s per call), whole run 6 min 13 s. Run 2: **0 chat calls** (69 +
+  479 + 175 cache hits), 2.7 s. Content: `what` median 110, max 156 chars;
+  0 `NULL` whys; no "ticket", "commit", "javadoc", "likely", "unclear",
+  "this class"; openers "Stores" 52, "Represents" 23, "Consumes" 12,
+  "Defines" 11. Large class `auth.event.dynamoDB.DynamoDBEvent` (16
+  members): "Stores authentication event data with DynamoDB annotations for
+  partitioning, indexing, and TTL management." — correct (partition/sort
+  keys, two indexes, TTL). Nested `messaging.consume.pactum.ContractMessage`
+  → `.Contract` ("Stores customer organization ID and lifecycle status")
+  → `.Contract.Customer` ("Stores the organizationId") and
+  `.Contract.LifecycleStatus` (lists the seven states) — all correct, and
+  the outer `what` sums up its nested types. Spot checks against the code:
+  `UserTokenService` (adds/removes/validates via a strategy, publishes
+  invalidation events, admin exception) correct; `TokenValidationRest`
+  (save/retrieve/invalidate, bulk delete with a count limit) correct;
+  `AuthDataService` (aggregates cached roles, security and organization data
+  into `AuthData`, cache invalidation events) correct;
+  `SubscriptionDataService.UnprocessableContractException` correct `what`,
+  borrowed `why` (redirect loop ticket of the outer file); `Privilege.User`
+  is an empty class but got "Represents a user entity … for access
+  control" (invented; open #32), `Privilege.GreenlandAdmin` correct.
+  Weak spots: nested types share the file's tickets, so their whys repeat
+  the outer type's (all four `ContractMessage` types say "Core-Split"; 6+5
+  types share the same "parallel caching structure" why) (open #30).
 
 - **4.3 review fixes: chosen tickets only, permanent fetch failures, title
   fallback, narrower meta check.** Two commits. *Regex (low, separate
@@ -1065,12 +1142,11 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Agent:** 4.4 Type what/why, bottom-up (deepest nested types first, members'
-  `what` lines as input, capped for large classes; the type's tickets are the
-  file's, cap them too; reuse `describe`'s history selection and the
-  `[describe]` caps and the D-az/D-ba rules (chosen tickets only, title
-  fallback), call `reset_invalid_streak` first; decide whether test classes (open #13) are worth
-  describing).
+- **Agent:** 4.5 Quality review and golden set (review 20–30 known symbols —
+  members and types — against code and tickets, adjust prompts; open #30 and
+  #32 belong here; write 15–20 plain-language questions with expected fqns as
+  a fixture). A member prompt change re-describes every member (~15 min on
+  `argus` now) and then every type (~6 min).
 - **Product owner:** confirm or override the PM defaults for J1, J2, J4,
   J9 (D-w–D-y, D-aa), the open #19 decision (D-ab) and J5–J8 (D-ac, D-ad);
   D-w and D-y are now backed by the real Jira (see their notes).
@@ -1123,6 +1199,7 @@ the decisions taken, and the tradeoffs behind them.
 | 4.2 review fixes | done | chat-model check before the build (`/api/show`; missing → run fails, unreachable → cache-only) (D-ar); breaker state on `LlmClient` (`cache_only`, trips on a backend failure or 5 invalid in a row, `LlmUnavailable`), shared by later stages (D-an); prompt without parent key/title (D-al); purpose may be empty (→ `NULL`), meta text and restated purpose invalid, ticket fenced as data, whitespace collapsed, control chars invalid (D-as); `-0.0` temperature normalised; null content = invalid output; real run (79 tickets: 79 summarised, rerun 0 chat calls) closes open #27; new prompt on `argus`: 79/79, 0 retries, 148 s, 30 empty purposes, no meta text, rerun 0 chat calls; 198 tests |
 | 4.3 Method and constructor what/why | done | `describe` module (`Description`, pure `select_history` + `member_prompt`, `validate_description`); `index_descriptions` stage after summaries → `symbols.what`/`why`; first + 3 most recent tickets (UTC dates), commit subjects without tickets, incomplete members skipped; source excerpt (`describe.body_chars` 1500); `[describe]` config; per-stage LLM stats, `describe:` line; `show` what/why; `argus`: 729/729 described, 1.86 s/call, 19 min 48 s, rerun 0 chat calls in 2.0 s; D-at–D-aw; 220 tests |
 | 4.3 review fixes | done | default `ticket_regex` `\bGRLD-\d+` (separate commit, D-ay); only chosen tickets block, permanent fetch failures cached unavailable, `JiraMode` (Disabled → uncached tickets unavailable), blocking keys in the warning (D-az); Jira title for an invalid summary (D-ba); narrowed meta checks in describe and summaries (D-bb); excerpt replaces signature, merges dropped, invalid streak per stage (D-bc); `argus`: 81 tickets, 729/729 re-described in 1362 s, rerun 0 chat calls / 0 Jira requests in 2.0 s; 231 tests |
+| 4.4 Type what/why, bottom-up | done | `fix(walk)`: nested `src/test` skipped (D-bd, #13); `index_type_descriptions` after describe, bottom-up; pure `outline` / `select_children` / `type_prompt` / `validate_type_description`; `[describe] type_members` (30), `type_recent_tickets` (3); held back on a missing listed child, invalid child listed bare (D-be–D-bg); `types:` line; 244 tests; `argus`: 175/175 types in 372 s (2.31 s/call), rerun 0 chat calls |
 | 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
 
 ## Decisions and tradeoffs
@@ -1228,6 +1305,9 @@ the decisions taken, and the tradeoffs behind them.
 | D-bb (4.3 review, finding 3) | Meta-text checks narrowed. `what`: only the openers "This method / This constructor / This function". `why` and ticket `purpose`: the shared `summaries::REASON_META_PHRASES` ("the ticket does/states/says/…", "according to the ticket", "this ticket", "the commit", "commit message", "the javadoc", "change history", "not stated/specified/mentioned/provided/given in", "no reason (is) given/stated", "no specific reason", "does not state/specify") plus, for `why`, "this method/constructor/function"; a whole reply that only says "Not specified." / "Unknown" / "None" / "N/A" is invalid. Ticket `summary`: only the openers "This ticket / The ticket" (amends D-as, D-av) | Keep the broad substring list; an LLM judge | The broad list rejected ordinary domain text ("Uses the default page size when the size is not specified.", "Falls back to the default locale if one is not provided.", "Returns the ticket price …", "Prevents sessions being revoked for no reason."), costing a retry and, twice in a row, the record. The narrowed phrases still catch every meta reply seen in the 4.2/4.3 probes. Loosening a check never invalidates cached rows (they are re-validated on a hit and still pass) |
 | D-bc (4.3 review, findings 5, 7, 10) | The source excerpt replaces the `Signature:` line (the signature is sent only when `body_chars = 0` or the source is empty; an abstract/interface method's excerpt is its declaration, sent once); merge commits (`Merge ` prefix) are left out of the commit-subject fallback before dedup and cap; `LlmClient::reset_invalid_streak` runs at the start of each LLM stage, so the 5-in-a-row breaker counts per stage (amends D-an) | Keep both lines; keep merges; one streak per run | The excerpt starts with the declaration, so the signature line only repeated it (and twice for abstract methods). Merge subjects ("Merge branch 'x' into master") say nothing about why the code exists. Four invalid ticket summaries followed by one invalid description are not evidence of a broken model in the describe stage. The prompt change misses the describe cache for every member once (re-describe on `argus` in the real run below) |
 | D-bd (before 4.4, open #13) | The walker treats a file as test code when a `src` component is directly followed by `test` anywhere before the first `java` component (`backend/src/test/java/…`, `a/b/src/test/…`); `src/test` inside a source root (`src/main/java/com/acme/src/test/…`) stays a package, `src/testng` and `test/src` stay production | Repo-root `src/test` only (1.1); any `test` directory; Maven/Gradle module detection | Plan 1.1 already says skip `src/test/`; `argus` keeps its tests in `backend/src/test`, so 55 test files (and their members) were indexed, described (≈ 20 % of the chat calls) and would pollute search. Same "not under a source root" rule as the build-dir pruning (decision 25). Drops their history/describe rows from the next index; their cache rows stay unused |
+| D-be (4.4) | Type prompt: kind, fqn, Spring role, `Nested in:` (enclosing kind + fqn, no role), Javadoc, the declaration with members and nested types cut out (from the start of their Javadoc's line; blank lines dropped; dedented; capped by the existing `body_chars`, `Signature:` only without it), the children's `what` lines, the type's history. Own response type `TypeDescription` (same fields, so its own schema in the cache key); `what` asks for one responsibility summing up the members, verb first; validation rejects "This class/interface/enum/record/annotation/type" | Fields extracted by tree-sitter into `Symbol`; signature + annotations only; reuse `Description` | The outline gives annotations (`@Service`, `@DynamoDbBean`), header with extends/implements, fields (Lombok classes have no methods), enum constants and annotation elements at no parser change; cutting from the Javadoc line keeps member docs out. Fields are worth it: on `argus` most entities/DTOs have Lombok accessors only. The enclosing role is left out (the outer's own `what` comes later, bottom-up, so it cannot be sent) |
+| D-bf (4.4) | Children listed: public first (explicit `public`, or not `private` in an interface/annotation type), then the rest, each in source order, at most `describe.type_members` (default 30), shown in source order, the rest counted "(N more not listed)". Type history: `select_history` with `describe.type_recent_tickets` (default 3), commit fallback and blocking as for members. Both are new options (D-ab style: add an option rather than change a default) | Sort by kind; count tokens; cap the type's tickets lower (1–2) | Visibility is the cheapest proxy for "what the type offers". 30 lines × ~110 chars stays far below the context window; the largest `argus` type has 16 children, so the cap never fired there (tested with `type_members = 1`). The first ticket is the type's origin and the recent ones its current role; the file-wide ticket list is already cut to 4 |
+| D-bg (4.4) | Bottom-up (deepest nesting first, then walk/source order). A *listed* child (member or nested type) without a `what` this run (`Missing`: incomplete input, breaker, `--no-llm` miss, failed call) holds the type back (`types_incomplete`), which then holds back its outer type; a child whose reply was *invalid* is listed as "(not described)"; a child left out by the cap never blocks | Describe with whatever is there; skip invalid children silently; hold back on invalid too | Same rule as D-au/D-ba: the cache never holds a type built from partial input, and a deterministic stand-in for an invalid (temperature 0, reproducible) child keeps the prompt a stable key instead of blocking the type forever. A later valid `what` changes the prompt and re-describes the type, as the plan wants ("a changed method misses the cache for its class"). Under `--no-llm` an invalid member is a cache miss, so its types wait (accepted, as in D-ba) |
 
 ## Open questions
 
@@ -1262,5 +1342,6 @@ the decisions taken, and the tradeoffs behind them.
 | 27 | The agent container cannot reach the Jira gateway `api.atlassian.com` (proxy allowlist: `CONNECT tunnel failed, response 403`; only `blueocean.jira.com` is allowed, where the scoped token gets 404), so 4.2's real run used 4 seeded fixture tickets (D-aq). Run `annatar index` twice on `argus` with the token from the host (or add `api.atlassian.com` to the allowlist): how many of the 79 tickets are summarised / invalid, time per ticket, and does run 2 print `0 chat calls`? | 4.2 | **resolved (4.2 review)** — gateway opened; run 1: 79 fetched, 79 summarised, 0 invalid/failed, 79 chat calls, ~2.4 s/ticket incl. fetching, 194 s; run 2: 2 s, 0 Jira requests, **0 chat calls** |
 | 28 | When a ticket states no reason (e.g. only an "Out of scope" list), the `purpose` restates the summary ("To enable SMS sending ..."). Allow an explicit "unknown" purpose, or let 4.3 fall back to commit subjects then? | 4.2 | **mostly resolved (4.2 review, D-as)** — empty purpose (`NULL`) when no reason: 30/79 on `argus`, no invented "parent task" or meta reasons. Still open for 4.5: a few title-only tickets get a synonym paraphrase of the summary (GRLD-20961, GRLD-35843, GRLD-88420, GRLD-90364); 4.3 treats a `NULL` purpose as "no why" (commit subjects may help) |
 | 29 | `init_logging` uses `tracing_subscriber::fmt()` defaults, which write logs to **stdout**, mixed with the `index` result lines (seen in the 4.2 review real run with `-v`). Send logs to stderr? | 4.2 review | open — small fix, before 5.2 (the CLI is the agents' interface, D-ax); was: before the MCP server (6.1) at the latest, where stdout is the protocol channel |
-| 30 | Method `why`s are often generic or borrowed: accessors inherit the first ticket's theme (54 of 729 say "proof of concept for extending JWT functionality"), a recent ticket can lend an unrelated reason (`DatabaseCacheUserTokenStrategy#removeToken` → JWT-ID storage / Redis), and some whys are derived from the code despite the prompt. Fewer tickets for trivial members (e.g. only the first), a "why only if specific to this member" instruction, or empty whys for accessors? | 4.3 | open — review in 4.5 with the golden set |
+| 30 | Method `why`s are often generic or borrowed: accessors inherit the first ticket's theme (54 of 729 say "proof of concept for extending JWT functionality"), a recent ticket can lend an unrelated reason (`DatabaseCacheUserTokenStrategy#removeToken` → JWT-ID storage / Redis), and some whys are derived from the code despite the prompt. Fewer tickets for trivial members (e.g. only the first), a "why only if specific to this member" instruction, or empty whys for accessors? | 4.3 | open — review in 4.5 with the golden set; types (4.4) share it: a nested type's history is its outer file's, so its why repeats the outer type's (all four `ContractMessage` types say "Core-Split"). |
 | 31 | A ticket whose summary stays invalid is asked again (two chat calls) on every run, so "a rerun makes 0 chat calls" fails while one exists, and under `--no-llm` its members wait although a normal run describes them from the Jira title (D-ba). Remember invalid prompts (a negative cache entry keyed like `llm_cache`) so the title fallback also applies cache-only? | 4.3 review | open — none on `argus` (0 invalid of 81); revisit if real runs show one |
+| 32 | A type with no members, fields or Javadoc (an empty namespace class such as `Privilege.User`) gets an invented `what` ("Represents a user entity … for access control"). Tell the model to say only what the declaration shows, or skip such types / give them a fixed `what`? | 4.4 | open — review in 4.5 |
