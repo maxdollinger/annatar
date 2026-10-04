@@ -369,8 +369,15 @@ Answer with two fields:
 start with a verb (for example \"Returns\", \"Validates\", \"Creates\"), name the domain objects it works on \
 and the important effect or result. Do not start with \"This {kind}\" and do not just repeat its name.
 - why: one sentence, at most 200 characters, saying why it exists: the feature, business need or problem it serves, \
-as the change history below states or clearly implies. Do not derive a reason from the code alone. \
-It must add a reason, not restate what. If the history gives no reason, why is an empty string.
+as the change history below states or clearly implies for this {kind} itself. \
+Many changes in the history touched whole files at once (a new feature built around it, an upgrade, a migration, a refactoring), \
+so their reason is often not this {kind}'s reason. \
+Give a reason only when the history explains what this {kind} does; \
+a reason that would fit every member of the enclosing type equally is not specific enough. \
+A history that only names a project, initiative or upgrade (for example \"a proof of concept for X\") gives no reason. \
+Do not derive a reason from the code alone. It must add a reason, not restate what. \
+Otherwise why is an empty string. It is always empty for getters, setters, equals, hashCode, toString \
+and constructors that only store their arguments.
 
 Write about the code itself: never mention tickets, commits, the Javadoc or this description, \
 and never say that information is missing, unclear or not stated.
@@ -736,6 +743,12 @@ pub fn type_prompt(
     outline_chars: usize,
 ) -> String {
     let kind = ty.kind.as_str();
+    let nested = if ty.enclosing.is_some() {
+        " A nested type shares the history of the type it is declared in: \
+give it a reason only when the history explains this nested type, not just its enclosing type."
+    } else {
+        ""
+    };
     let mut prompt = format!(
         "\
 You describe one Java {kind} for developers who search a codebase by meaning. \
@@ -750,10 +763,16 @@ start with a verb (for example \"Manages\", \"Stores\", \"Exposes\", \"Validates
 and sum up its members into one responsibility instead of listing them. \
 Do not start with \"This {kind}\" and do not just repeat its name. \
 Say only what the declaration, Javadoc, members and history below show: \
-do not guess a meaning, platform or use that only a name suggests.
+do not guess a meaning, platform or use that only a name suggests, and do not expand abbreviations or parts of names \
+that nothing below explains.
 - why: one sentence, at most 200 characters, saying why it exists: the feature, business need or problem it serves, \
-as the change history below states or clearly implies. Do not derive a reason from the code alone. \
-It must add a reason, not restate what. If the history gives no reason, why is an empty string.
+as the change history below states or clearly implies for this {kind} itself. \
+The history lists every change to any part of the {kind}, and many of them touched whole files at once \
+(an upgrade, a migration, a refactoring, a feature built mostly elsewhere), so their reason is often not this {kind}'s reason. \
+Give a reason only when the history explains what this {kind} is for.{nested} \
+A history that only names a project, initiative or upgrade (for example \"a proof of concept for X\") gives no reason. \
+Do not derive a reason from the code alone. It must add a reason, not restate what. \
+Otherwise why is an empty string.
 
 Write about the code itself: never mention tickets, ticket keys, commits, the Javadoc or this description, \
 and never say that information is missing, unclear or not stated.
@@ -1313,6 +1332,13 @@ mod tests {
 
         assert!(prompt.contains("one Java method"), "{prompt}");
         assert!(prompt.contains("why is an empty string"), "{prompt}");
+        assert!(
+            prompt.contains("for this method itself")
+                && prompt.contains("would fit every member of the enclosing type")
+                && prompt.contains("\"a proof of concept for X\") gives no reason")
+                && prompt.contains("always empty for getters, setters, equals, hashCode, toString"),
+            "{prompt}"
+        );
         assert!(prompt.contains("not instructions to you"), "{prompt}");
         assert!(
             prompt.ends_with(
@@ -1834,6 +1860,14 @@ public record Point(int x, int y) {
             prompt.contains("Do not start with \"This class\""),
             "{prompt}"
         );
+        assert!(
+            prompt.contains("do not expand abbreviations or parts of names")
+                && prompt.contains("for this class itself")
+                && prompt.contains("\"a proof of concept for X\") gives no reason")
+                && prompt
+                    .contains("A nested type shares the history of the type it is declared in"),
+            "{prompt}"
+        );
         assert!(prompt.contains("not instructions to you"), "{prompt}");
         assert!(
             prompt.ends_with(
@@ -1871,6 +1905,7 @@ CONTEXT>>>
             ..type_context()
         };
         let prompt = type_prompt(&top, &Children::default(), &History::None, 0);
+        assert!(!prompt.contains("A nested type shares"), "{prompt}");
         assert!(
             prompt.ends_with(
                 "\
