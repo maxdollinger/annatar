@@ -171,7 +171,7 @@ Ranking stays symbol-vector based (the same `search::search` and filters): the 1
 *Done when:* the file output is the default, `--symbols` is unchanged, `eval` reports file-level scores on `argus` with the symbol scores unchanged from 5.3.
 *Built (5.5):* `argus` (24 questions, 10 files): symbol scores unchanged (primary 4 / 14 of 24 top-1 / top-5, any 10 / 17); the primary's file first for 11 and in the top 5 for 17 (MRR 0.582), a file of any expected fqn first for 12 and in the top 5 for 20 (MRR 0.641). Output ≈ 20–30 % smaller than the old 10 symbols, query-dependent (6 own queries: ≈ 3.1k chars, ≈ 770 tokens, vs ≈ 4.4k), ≈ 50 ms per query. *Trial re-run (5.5, `state.md` D-cs, D-ct):* the 5.4 *with* arm repeated on the file output (20 runs, same tasks, model and key; the appended prompt describes the new output). Against no `annatar` (5.4) still −42 % tokens and tool calls, −26 % cost, significant on T1–T3; against the symbol output equal on T1–T3, while on the flow trace agents called `show` on whole classes (3.4 vs 0.8 per run) for ≈ 25 % more tokens (a trend). Correctness 37 vs 35 (symbols) vs 35 (without) of 40: the dispatcher missed in 2 of 5 flow traces instead of 4 of 5 — not significant, open #42 stays. The file view did not reduce `show` calls; it stays the default.
 
-## Phase 6 — Usages (after the POC, planned 2026-10-04)
+## Phase 6 — Usages (after the POC, planned and done 2026-10-04)
 
 *Why:* open #42 — in the agent trial a search hit stood in for its caller (T4: the queue dispatcher in front of the consumer was missed in 4 of 5 runs with the symbol output, 2 of 5 with the file output). `project.md` promises `used_by`/`uses` in `show` and `annatar trace`. This phase builds them from the tree-sitter trees, without a build and without the LLM (`usages_state.md` D-cu); progress, decisions and questions of this phase are in [`usages_state.md`](./usages_state.md); SCIP stays in **Later** as a precision upgrade that fills the same `edges` table.
 
@@ -211,13 +211,14 @@ A depth-first walk over one query per symbol (`usage_query::callers`, the recurs
 *Goal:* a measured answer to #42.
 Re-run the *with* arm on T4 (5 runs, the D-cs protocol and grading) with `--with-prompt usages` in `scripts/agent_trial/run.py`: the file-output prompt plus one paragraph on `used by` and `trace`; update the agent snippet in the README in the same change. Success: the dispatcher in 5 of 5 answers, no cost increase over the 5.5 runs. Optional: T1–T3 once each to check nothing regressed.
 *Done when:* results are in `usages_state.md`; #42 (`state.md`) closed or narrowed.
+*Done (6.7, `usages_state.md` D-ed–D-eg):* `run.py --with-prompt usages` (the `files` prompt plus one descriptive bullet on `used by` / `uses` and `trace`), the *with* arm on T4 × 5 plus T1–T3 once, graded blind. The dispatcher named in 5 of 5 T4 answers (5.5: 3/5; symbols 1/5, p = 0.048), full marks 5/5 (2/5; 4/5 under a strict reading); no measurable cost increase over 5.5 (mean +7 %, median −8 %, p = 1.0; cache creation +21 % from the larger `show` output; tokens −10 %); T1–T3 unchanged in correctness. 3 of 5 agents found the dispatcher in the consumer's `used by`; none called `trace` (open #53). #42 closed; README agent snippet names `used by` and `trace`.
 
 ---
 
 ## Later (after the POC proves itself)
 
 - **Usages from SCIP** (precision upgrade of Phase 6, same `edges` table): scip-java inside the real build, so generics, lambda parameters, chains through library types and modules resolve as the compiler does; needs the repository to build on the indexer (`usages_state.md` D-cu).
-- **Callers in description prompts:** a member's callers (and a type's users) in its prompt. Every prompt changes, so the whole LLM cache misses (≈ 20 min of chat calls on `argus`); decide after 6.7 (`usages_state.md` open #47).
+- **Callers in description prompts:** a member's callers (and a type's users) in its prompt. Every prompt changes, so the whole LLM cache misses (≈ 20 min of chat calls on `argus`); kept in Later after 6.7 (`usages_state.md` #47: the trial measured navigation, not descriptions).
 - **Spring entry points:** HTTP handlers with full paths, listeners, `@Scheduled`; an entry-point command.
 - **Incremental indexing:** stable IDs, upserts, incremental history.
 - **Package summaries** and `annatar module`.

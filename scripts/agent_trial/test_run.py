@@ -35,6 +35,10 @@ class AnnatarCallsTest(unittest.TestCase):
         self.assertEqual(run.annatar_calls("annatar --path=src show x"), ["show"])
         self.assertEqual(run.annatar_calls("annatar --help"), ["?"])
 
+    def test_trace(self):
+        self.assertEqual(run.annatar_calls("annatar trace 'a.B#c()' --depth 8 | head"), ["trace"])
+        self.assertEqual(run.annatar_calls("annatar --config x trace a.B --depth 8 && annatar show a.B"), ["trace", "show"])
+
     def test_query_with_separators_stays_one_call(self):
         self.assertEqual(run.annatar_calls('annatar search "a; annatar show b"'), ["search"])
 
@@ -46,7 +50,7 @@ class StreamTest(unittest.TestCase):
     def test_parse_stream(self):
         tools, annatar, result, final = run.parse_stream(FIXTURES / "raw" / "T1-with-1.jsonl")
         self.assertEqual(tools, {"Bash": 2, "Read": 1})
-        self.assertEqual(annatar, {"search": 2, "show": 1, "other": 0})
+        self.assertEqual(annatar, {"search": 2, "show": 1, "trace": 0, "other": 0})
         self.assertEqual(result["subtype"], "success")
         self.assertEqual(final, "The cap is in TokenStore.")
 
@@ -63,7 +67,7 @@ class StreamTest(unittest.TestCase):
         self.assertEqual((first["task"], first["arm"], first["rep"]), ("T1", "with", 1))
         self.assertEqual(first["tokens_total"], 6 + 1000 + 200 + 50)
         self.assertEqual(first["tool_calls"], 3)
-        self.assertEqual((first["annatar_search"], first["annatar_show"]), (2, 1))
+        self.assertEqual((first["annatar_search"], first["annatar_show"], first["annatar_trace"]), (2, 1, 0))
         self.assertIsNone(first["returncode"])
         self.assertEqual(data[1]["returncode"], 1)
         self.assertEqual((data[1]["grep"], data[1]["glob"]), (1, 1))
@@ -89,6 +93,15 @@ class ClaudeCmdTest(unittest.TestCase):
         self.assertIn("(default 10)", self.appended(symbols))
         self.assertEqual(files[:files.index("--append-system-prompt")],
                          symbols[:symbols.index("--append-system-prompt")])
+
+    def test_usages_prompt_adds_one_bullet_to_files(self):
+        usages = run.claude_cmd("m", "with", "q", 60, 3.0, "usages")
+        self.assertEqual(self.appended(usages), run.WITH_PROMPTS["usages"])
+        lines = run.WITH_PROMPTS["usages"].splitlines()
+        self.assertEqual(lines[:3] + lines[4:], run.WITH_PROMPTS["files"].splitlines())
+        self.assertTrue(lines[3].startswith("- `annatar show` also lists `used by`"))
+        self.assertIn("`annatar trace '<fqn>'`", lines[3])
+        self.assertIn("(`--depth N`, default 6)", lines[3])
 
     def test_without_arm_gets_no_prompt(self):
         for variant in run.WITH_PROMPTS:

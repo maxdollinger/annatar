@@ -18,12 +18,120 @@ unique across both files.
 
 | | |
 | --- | --- |
-| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.6 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
-| Step | 6.6 `annatar trace <fqn> [--depth N]` — **done** (reviewed, findings fixed); next: 6.7 agent trial (T4) on usages |
-| Last updated | 2026-10-04 (6.6) |
+| Phase | 6 — Usages — **done** (2026-10-04; 6.1–6.7 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
+| Step | 6.7 agent trial (T4) on usages — **done** (graded blind; reviewed, findings fixed): dispatcher 5/5, full marks 5/5 (4/5 under a strict reading), no measurable cost increase vs 5.5 (mean +7 %, median −8 %, p = 1.0); #42 closed. Phase 6 complete; next: open items / `plan.md` Later with the product owner |
+| Last updated | 2026-10-04 (6.7) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
+
+- **6.7 Agent trial (T4) on usages.** `scripts/agent_trial/run.py`
+  `--with-prompt usages` (D-ed): the `files` prompt with one bullet
+  inserted before its last line — `show` also lists `used by` (callers,
+  grouped by file with lines, `via` for calls through an interface) and
+  `uses`; `annatar trace '<fqn>'` prints the callers transitively up to the
+  entry points such as `[entry: @Scheduled]` (`--depth N`, default 6);
+  reflection, events, message queues, configuration and test code are not
+  seen — 1495 vs 974 characters, the other lines byte-identical; the
+  stream parser counts `annatar trace` apart (`annatar_trace` column in
+  `runs.csv` and the summary) and knows `--depth` as a value option.
+  README agent snippet: `show` names `used by` / what it uses, a `trace`
+  line; POC findings line on call chains updated. *Tests:* 15 Python unit
+  tests (+2: the usages prompt is `files` plus one bullet naming `used
+  by`, `trace` and the default depth; `trace` and `--depth` in Bash
+  commands), Rust unchanged (fmt, clippy, 392 + 14 CLI tests green).
+  *Protocol:* the 6.7 amendment in the private `protocol.md`, fixed
+  before any run (D-cs otherwise unchanged: Claude Code 2.1.289,
+  `claude-sonnet-5` checked per run, effort medium, tools, limits, task
+  prompts, answer key, rubric and the 5.4-regrade strictness, the read-only
+  `argus` checkout at 8f4664a — `git status` unchanged after every run,
+  auto-memory empty); changed: the wrapper runs a fresh release build of
+  HEAD dea3461, the index is `data-real` with its Phase 6 `edges` (not
+  rebuilt; `trace` checked through the wrapper:
+  `BusinessFeatureMessageConsumer#perform` → `SubscriptionMessageDispatcher
+  #performMessage` → `#dispatch` → `#processMessages() [entry:
+  @Scheduled]`), the prompt `usages`. Only the *with* arm, T4 × 5
+  (`.annatar-local/agent-trial/main-67/`), then T1–T3 once each as a
+  regression check. Baseline: the 5 5.5 T4 runs (`main-55/`), 5.4 runs
+  (`main/`) for reference. *Grading:* blind by a separate grader subagent:
+  the 8 new answers among 30 old ones (all 15 5.5 T1–T3, the 5 5.5 T4, the
+  10 5.4 T4 — re-shuffled, new codes, `annatar` → `[index]` and
+  `[index] show|trace|search` → `[index]`, no arm labels; the bundle
+  holds the 5.5 T1–T3 answers beyond the protocol's T4 answers, to blind
+  the 3 new regression answers; bundle, grades and mapping in
+  `.annatar-local/agent-trial/blind-67*`). It gave all 30 old answers
+  their published grades (30 / 30 agree, dispatcher and fresh read flags
+  included). Two new T4 answers it called borderline on the fresh read
+  (`getAuthData` named "separately" / "e.g."), both scored 2; spot-checked,
+  kept. A third borderline, on the location, it did not flag: T4-with-5
+  names only `SubscriptionMessageDispatcher#performMessage(MessageBearer)`,
+  not the scheduled `processMessages` poll of the key's MUST location —
+  kept at 2 as graded (the protocol scores new answers from the grading),
+  1 under a strict reading. *Results* (T4, mean of 5; 5.5 *files* in
+  brackets; exact two-sided Mann-Whitney 5 vs 5 with mid-ranks, Fisher
+  exact; pre-registered: tokens, cost, tool calls, dispatcher, full
+  marks — the rest exploratory): **dispatcher named 5/5** (3/5, p = 0.44;
+  5.4 symbols 1/5, p = 0.048; without 5/5), **full marks 5/5** (2/5, p =
+  0.17; symbols 0/5, p = 0.008; without 5/5; strict reading 4/5: p = 0.52
+  vs 5.5, p = 0.048 vs symbols), fresh read 5/5 (3/5); tokens 247 k
+  (275 k, −10 %, p = 0.42), **cost $0.214 (0.200): no measurable cost
+  increase (mean +7 %, median −8 %, p = 1.0; cache creation 35 k vs 29 k,
+  +21 %, from the larger `show` output)**, tool calls 13.2 (14.8, p =
+  0.41). Exploratory: Reads 3.6 (6.2, p = 0.21), `annatar search` 3.4
+  (3.6), **`show` 6.4 (3.4, p = 0.12), `trace` 0 in every run**, wall
+  33 s (37 s); against 5.4 *without*: −20 % tokens (p = 0.22), +13 % cost
+  (p = 1.0), −36 % tool calls (p = 0.008), same score — on T4 `annatar`
+  still saves tool calls, not money. How the dispatcher first appeared
+  (first tool result naming it): in 3 of 5 runs from the consumer's
+  `used by` in `show` (runs 1, 3, 5: the class or `perform` —
+  `SubscriptionMessageDispatcher#performMessage(MessageBearer) via
+  …MessageConsumer#perform(T) :122`), the intended mechanism; in 1 (run 2)
+  from an incidental `reference` in the `used by` of the class
+  `AuthDataEventService`, which lists five dispatcher methods
+  (`processMessages() reference :98, 103 [entry: @Scheduled]` among them)
+  because they log `AuthDataEventService.LOG_PREFIX` — a real edge that
+  says nothing about the dispatcher calling the consumer; that agent never
+  read the dispatcher nor `show`ed the consumer and inferred the dispatch;
+  in 1 (run 4) from a search result (`"pactum message listener
+  consume"`). `processMessages` came from reading the dispatcher (runs 1,
+  3), the `AuthDataEventService` `used by` (2), the search outline (4); run
+  5 does not name it. No agent ran `show` on the dispatcher or called
+  `trace`: one `used by` hop reached the dispatcher's file, the rest was in
+  it (→ open #53). T1–T3 (1 run each, regression check): all score 2 (T2
+  / T3 reason 1/1); T1 72.8 k tokens / $0.065 (5.5: 51.6 k / $0.049, range
+  50.4–54.0 k: above it, one more search and one more turn), T2 78.0 k /
+  $0.081 (109 k), T3 74.8 k / $0.066 (75 k / $0.059, cost +12 %) —
+  correctness unchanged; the cost of n = 1 is not interpretable. *#51
+  cost:* `show` output read by the T4 agents 46.7 KB per run (5.5:
+  26.3 KB), of it the `used by` / `uses` sections 14.9 KB and the package
+  prefixes in them 4.3 KB (≈ 1.1 k tokens per run, < 2 % of a run's
+  tokens even if read on every later turn's cache); of the 32 `show`
+  calls most fqns were copied from earlier output (about half from usage
+  lines), 2 were typed for a member inherited from a supertype
+  (`AuthDataEventService#publishAsync…`, declared in
+  `DynamoDBEventService`) and failed with "not found in the index" (→ open
+  #54). No trace, so no depth data for #52 (Measurements). *Data:*
+  `main-55/runs.csv` regenerated by `run.py summary` with the new
+  `annatar_trace` column (all 0); every other value unchanged (checked
+  against HEAD's `run.py`). *Spend:* $1.28 for 8 runs (estimate $1.2–1.7,
+  abort $8), grader ≈ 75 k subagent tokens. *Decisions:* D-ed (prompt),
+  D-ee (verdict: #42 closed), D-ef (#46: no usages in `search`), D-eg
+  (#51: keep full fqns); #47, #49, #50 decided (see Open questions); new
+  open #53, #54. *Review:* 11 findings, all addressed, no code change
+  beyond a test: the mechanism is 3/5 via the consumer's `used by`, not
+  4/5, and the `processMessages` provenance corrected (F1); cost worded as
+  no measurable increase with the cache-creation driver (F2); the
+  T4-with-5 location borderline recorded, strict 4/5 (F3); D-eg's premise
+  corrected, inherited-member `show` → #54 (F4); the prompt's
+  `[entry: @Scheduled]` example and "message queues" as mild cues in
+  D-ed / D-ee (F5); deviations disclosed (bundle, exploratory tests, exact
+  amendment time 20:47:57, first run ≈ 20:48:03) here and in a post-hoc
+  note appended to `protocol.md` (F6); README findings line scoped to the
+  re-run, cost wording, link to this file (F7); `main-55/runs.csv` and T1
+  wording (F8); #50's evidence (F9); doc drift in `state.md` (Current
+  state, #42, #40), `plan.md` (Phase 6 done, 6.7 *Done*, Later #47) and
+  `usages.md` (#46, #47) (F10); `test_trace` uses the real CLI order
+  (`--depth` after `trace`) (F11).
 
 - **6.6 `annatar trace <fqn> [--depth N]`.** New module `src/trace.rs`
   (`render(conn, fqn, depth, limit)`, `DEFAULT_DEPTH` 6, `MAX_DEPTH` 10,
@@ -693,15 +801,13 @@ unique across both files.
 
 ### Next
 
-- **6.7 Agent trial (T4) on usages** (`plan.md` Phase 6): re-run the 5.5
-  *with* arm on T4 (5 runs, the D-cs protocol and grading) with
-  `--with-prompt usages` in `scripts/agent_trial/run.py` — the file-output
-  prompt plus one paragraph on `used by` (`show`) and `trace` — and update
-  the README agent snippet in the same change. Success: the dispatcher in
-  5 of 5 answers, no cost increase over the 5.5 runs
-  (`.annatar-local/agent-trial/main-55/`). Record for #51 what the agents'
-  `show` / `trace` output cost (bytes, tokens), and whether any trace hit
-  the default depth 6 (D-ea, #52 closed).
+- Phase 6 is complete (6.7 reviewed and committed); `plan.md` has no
+  further step. The next work is chosen with the product owner from the
+  open items and `plan.md` Later — e.g. a multi-hop agent task to measure
+  `trace` (open #53), `show` of an inherited member (open #54), SCIP as the
+  precision upgrade (#49), test sources as edge sources (#45), the
+  cross-phase questions in `state.md` (#39, #40, #41, #43, #44). Nothing
+  started.
 
 ## Step log
 
@@ -715,7 +821,7 @@ unique across both files.
 | 6.4 Overrides and measured quality | done | `overrides` edges, nearest per Java with type-argument substitution through generic super types, shared with the "overridden nearer" lookup (D-dn); #48 decided: super-type arguments substituted in inherited members, method-level bounded type variables typed by the bound (D-dp), receivers' own type arguments → open #49; `edges:` line + `edges_overrides`; `src/usage_eval.rs` + `annatar eval-usages` (D-do); hand-built 29-symbol `argus` usage set (D-dm); `argus`: 1200 edges (50 `overrides`), call sites 424 / 174 / 0 / 788, P 1.000 R 0.967 (88/91), overriders 10/10, misses 3 × lambda; review: 11 findings — fixed: a type variable of the nearer method or type matched any type (H1, wrong `overrides` and `call` edges) and a farther variable bound to a nearer variable (H2, the test expected a false override) via `Sig` / `Arg::Var`, varargs vs single parameter (M1), the random part of the set made reproducible and grown to 33 symbols with random-only scores (M2), bounds leaking between same-named variables (L1), package-private across packages (L2, `is_package_private`), header type arguments around the type (L3), eval wording and `symbol N` in index errors (L5); recorded: L4 recall gaps (`usages.md`), L5's optional checks (D-dq); 54-symbol set P 1.000 R 0.972 (104/107), random only 23/23, members 50/53; `argus` edges unchanged |
 | 6.5 `show`: `used by` / `uses` | done | `src/usage_query.rs`: `used_by` / `uses` as SQL joins (`inside` CTE over `parent_id`, `overridden` CTE up `overrides`), `entry_point` (D-du); `show`: `- entry point:`, `- used by:` / `- uses:` grouped by file, `fqn [kind] [ambiguous] [via I#m] :lines [entry: …]`, `-k`/`--limit` (default 20, 1–100) with `… N more`, `none` when empty, shown symbol only (D-dt); `via` = callers of every method it overrides, transitively; incoming `overrides` listed (D-dr); a type's `uses` rolls up its members' (D-ds); #45 decided: deferred to Later (D-dv); new open #50, #51; tests: `via`, roll-up, cap, no users, entry points, exact format, CLI `-k`; `argus`: `SecurityDataAddEventConsumer` names `SecurityDataEventDispatcherConfig` (:24, :28, :45) and `SecurityDataEventDispatcher#dispatch` (`call` :76), `via` on `UserCreatedMessageConsumer#perform` → `UserMessageDispatcher#performMessage` :123; index not rebuilt, 0 LLM calls; review: 10 findings — fixed: `uses` lines vs the used symbol's path (F1, title `uses (lines in this symbol's file)`), members' `overrides` left out of a type's roll-up (F2, `AbstractCache` 36 → 18 entries, its callers within the cap), duplicate `instantiate` of type and constructor (F3), `@ExceptionHandler` / `@PreDestroy` (F5), `none in main sources` (F6), total `ORDER BY` (F7), tests for `ambiguous`, two overrides and a diamond (F8), wording (F10); recorded: full fqns' token cost → open #51 with `via` kept as an fqn (F4, D-dw), `trace` reuse (F9 → Next) |
 | 6.6 `annatar trace` | done | `src/trace.rs`: two-pass walk (BFS levels, DFS print, D-eb) over `usage_query::callers` (new: `used_by`'s query with a `call`/`instantiate`/`reference` filter, roll-up only at the root; `Usage::symbol_kind`), one query per printed symbol (D-dx); tree `fqn [kind] [ambiguous] [via I#m] file:lines; …`, file left out when unchanged (D-dz), `(see above)`, `[entry: @A]`, `[no callers in main sources]`, `[N callers beyond depth D]`, `(see below)`, each symbol expanded at its shallowest level (D-eb), types below the root `[type, not followed]` or `[initializer]` (followed through `usage_query::constructions`, D-dy), entry points labelled on every copy and followed when code calls them (D-ec); `--depth` 1–10 (default 6), `-k` per symbol 1–100 (default 10, D-ea), usage errors exit 2; tests: via, diamond, cycle, entry / no-caller leaves, depth, re-expansion, cap, type root, format, CLI ranges; `argus`: the T4 consumer → `dispatch` :76 → `receiveAndDispatchMessages` :67 → `processMessages` :59 `[entry: @Scheduled]`; sizes over 654 symbols (Measurements); index not rebuilt, 0 LLM calls; review: 6 findings, all fixed — `(see above)` into a depth-cut expansion hid callers (F1, 26 → 0 on `argus`; `UserOrganizationService` now reaches the role dispatcher's `@Scheduled`), default depth 6 and #52 closed (F2), initializer types followed (F3), entry label on repeats and entry points with code callers followed (F4), elision wording (F5), docs (F6) |
-| 6.7 Agent trial (T4) on usages | planned | |
+| 6.7 Agent trial (T4) on usages | done | `run.py --with-prompt usages` (files + one bullet on `used by` / `uses` / `trace`, D-ed), `trace` counted apart, +2 Python tests; README agent snippet; 6.7 protocol amendment; T4 × 5 + T1–T3 × 1, *with* arm, `main-67/`; blind grading 30/30 old grades agree; T4 dispatcher 5/5 (5.5: 3/5), full marks 5/5 (2/5), cost +7 % / tokens −10 % (n.s.), `show` 6.4 vs 3.4, `trace` 0; T1–T3 all 2; $1.28; D-ed–D-eg, #42 closed, #46/#47/#49/#50/#51 decided, open #53; review: 11 findings, all addressed — mechanism 3/5 via the consumer's `used by` (one hit via a `LOG_PREFIX` reference, one via search), cost "no measurable increase" (mean +7 %, median −8 %, p = 1.0; cache creation +21 %), T4-with-5 strict 4/5, D-eg premise, prompt cues, deviations disclosed (post-hoc note in `protocol.md`), README scope, doc drift, test CLI order; new open #54 |
 
 ## Measurements
 
@@ -731,7 +837,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | Edge stage time (benchmark, `argus`) | 6.2 / 6.3 / 6.4 | 6.4: `argus` 11 ms (release, overrides and substitution included); benchmark (release) ≈ 5 ms per run (no overrides in it). 6.3 after the review: `argus` 11 ms, benchmark ≈ 26–27 ms. 6.3: `argus` 10–11 ms (release); benchmark (200 files, 1000 edges, debug) ≈ 25 ms per run. 6.2: `argus` 7 ms (release, 162 files, `index --offline` 2.2 s wall in all); synthetic benchmark (200 files, debug) ≈ 12 ms per run |
 | `show` list sizes on `argus` (654 symbols, `-k 100`) | 6.5 | after the review (members' `overrides` out of type roll-ups, no type `instantiate` beside its constructor's): `used by`: empty 230, median 1 entry, > 20 entries 2 (max 29, `DynamoDBEvent`; `AbstractCache` 18); `uses`: empty 289, median 1, > 20 4 (max 27, `RoleRelationsUpdatedMessageConsumer`); ≈ 14 ms per `show` including process start, so the default cap 20 cuts 2 + 4 lists. Before the review: `used by` > 20 for 5 (max 36, `AbstractCache`, half of it its subclasses' `overrides`), `uses` > 20 for 5 (max 31) |
 | `trace` sizes on `argus` (654 symbols) | 6.6 | after the review (D-eb shallowest expansion), `-k 10`: **default `--depth 6`**: only the root line (no callers) 237, median 3 lines / 538 bytes, p90 37 lines / 8.4 KB, max 75 lines / 16.6 KB (`DynamoDBEvent`), > 20 lines 109, 1.46 MB in all; a `@Scheduled` reached in 238 traces, cut by the depth 36 (33 of them on a `…Dispatcher#` line); a `… N more` in 20; a `(see below)` in 44 (76 lines). By depth (`-k 10`; reaching `@Scheduled` / cut / cut on a dispatcher line / p90 / max / total): 4: 165 / 136 / 92 / 7.2 KB, 27 L / 13.6 KB, 56 L / 1.20 MB; 5: 206 / 76 / 60 / 8.1 KB, 33 L / 15.7 KB, 68 L / 1.37 MB; **6: 238 / 36 / 33 / 8.4 KB, 37 L / 16.6 KB, 75 L / 1.46 MB**; 8: 261 / 2 / 2 / 8.8 KB, 38 L / 19.9 KB, 82 L / 1.50 MB; `--depth 10 -k 100`: 262 / 0, max 103 lines / 23.6 KB (`DynamoDBEvent`), no trace reaches depth 10. ≈ 235 bytes per line, most of it the full path and fqn (#51). The T4 trace 830 bytes, 4 lines; the type `SecurityDataAddEventConsumer` 1947 bytes, 8 lines; `DynamoDBEventService#publishAsync(DynamoDBEvent)` 43 lines / 9.4 KB (all unchanged from depth 4). Before the review (depth 4, `cut` re-expansion only at the limit): reaching `@Scheduled` 162, cut 141, same p90 / max; `--depth 4 -k 20` max 84 lines / 20.6 KB. Before D-dy (type nodes followed, depth 4): max 75 lines / 17.6 KB (`AuthDataEvent`), > 20 lines 97. ≈ 8 ms per trace including process start |
-| T4: dispatcher named / full marks / cost vs 5.5 | 6.7 | – |
+| T4: dispatcher named / full marks / cost vs 5.5 | 6.7 | **dispatcher 5/5 (5.5: 3/5, Fisher p = 0.44; 5.4 symbols 1/5, p = 0.048), full marks 5/5 (2/5, p = 0.17; symbols 0/5, p = 0.008; 4/5 under a strict reading of T4-with-5, p = 0.52 / 0.048), fresh read 5/5 (3/5)**; per run tokens 266 / 174 / 402 / 204 / 191 k, mean 247 k (275 k, −10 %, MW p = 0.42), cost $0.214 (0.200): no measurable increase (mean +7 %, median −8 %, p = 1.0), tool calls 13.2 (14.8, p = 0.41); exploratory: Reads 3.6 (6.2), search 3.4 (3.6), `show` 6.4 (3.4, p = 0.12), `trace` 0, cache creation 35 k (29 k, +21 %, the larger `show` output), wall 33 s (37 s). Dispatcher first seen in the consumer's `used by` in 3 runs, in an incidental `reference` (`LOG_PREFIX`) in `AuthDataEventService`'s `used by` in 1, in a search result in 1. T1–T3 once each: score 2, 72.8 / 78.0 / 74.8 k tokens. `show` output read per T4 run 46.7 KB (26.3 KB), usage sections 14.9 KB, package prefixes in them 4.3 KB; no `trace` call, so no run hit the depth. Spend $1.28 |
 
 ## Decisions and tradeoffs
 
@@ -772,16 +878,22 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-ea (6.6) | **`-k` caps callers per symbol** (each printed symbol's list, `… N more` under it), the flag meaning "entries per list" as in `show`; **default 10**, not `show`'s 20; `--depth` 1–10, out of range a usage error like `-k`; **default depth 6** (review F2, closes #52; `plan.md` had 4) | A cap per tree level (all symbols at one depth); default 20 as `show` | A trace multiplies lists: at 20 the largest `argus` trace is 84 lines / 20.6 KB, at 10 56 / 13.6 KB, and only 20 of 654 traces hit 10 (none 20). Per level would cut a deep branch for a wide sibling. Depth (measured after D-eb, `-k 10`, 654 symbols): 4 reaches `@Scheduled` in 165 traces and cuts 136 (92 on a dispatcher line — a symbol two calls below a consumer needs 5–6 hops to its `processMessages`), 6 reaches it in 238 and cuts 36 (33), 8: 261 / 2; p90 7.2 → 8.4 KB, max 13.6 → 16.6 KB, median unchanged (3 lines). 6.7's agents use the default, so deciding after the trial would measure the wrong setting; 8 adds 23 traces for +20 % max bytes |
 | D-eb (6.6 review, F1) | **Each symbol is expanded at its shallowest occurrence**: a breadth-first pass from the root (same `-k` caps, one memoized query per symbol, also for the symbols at the depth limit to count their callers) records each symbol's shallowest level; the depth-first print expands a symbol at its first occurrence on that level, prints `(see above)` for a later copy and `(see below)` for an earlier, deeper one; the `cut` set (re-expansion only of a symbol sitting exactly at the limit) is gone | Store the remaining depth per expanded symbol and expand again when a repeat has more (correct, but prints shared subtrees twice); the first occurrence depth first as before | The first-occurrence rule let the first-listed branch decide how deep a shared symbol was expanded: a symbol expanded one level above the limit had its callers cut, and its copy at level 1 read `(see above)` — 26 `argus` traces hid callers within the depth, among them a cronus dispatcher's `@Scheduled` (the T4 chain 6.7 grades). By induction every symbol within the depth is expanded once, at its shallowest level, so the depth never hides a reachable caller and `[N callers beyond depth D]` appears only on a symbol really at the limit; the query count is unchanged |
 | D-ec (6.6 review, F4) | **An entry point is labelled on every copy and followed on when code calls it**: `[entry: @A]` before `(see above)` / `(see below)` / the children; an entry point without callers in main sources ends the branch with just the label (no `[no callers in main sources]`), one with code callers (an inter-bean `@Bean` call, a controller method reused internally) is traced like any other symbol | Stop at every entry point (design "trace stops there"), silently dropping code callers; stop and count them (`[entry: @Bean; N callers not followed]`) | `project.md`'s blast radius: a change to the method also breaks its code callers, which the framework entry does not replace. On `argus` no entry method has an incoming `call` / `instantiate` / `reference` edge, so every entry still ends its branch there and the output only gains the label on repeats (an agent grepping for `@Scheduled` finds every copy) |
+| D-ed (6.7) | **The 6.7 *with* prompt is the 5.5 `files` prompt with one descriptive bullet inserted before its last line** (`run.py --with-prompt usages`): `show`'s `used by` / `uses`, `trace` with its default depth and entry-point marks, and what usages cannot see; no instruction to check who calls a hit. Fixed before any run in the protocol amendment; only the *with* arm on T4 (5 runs) plus T1–T3 once | Add "before answering a flow question, check the callers" (the #42 prompt lever); describe `used by` inside the `show` bullet; re-run both arms | The question is whether the tool output closes #42, not whether an instruction does: an instruction would confound the two. Keeping the other lines byte-identical keeps the comparison with 5.5 to one change (the tool and its description). The *without* arm has no `annatar`, so nothing in it changed (as D-cs). *Caveat (review F5):* neutral in instruction, but its one example, `[entry: @Scheduled]`, is the annotation of the T4 target `processMessages`, and "message queues" in the limits names the T4 topic — mild cues; probably of small effect (no agent called `trace`, and `@Scheduled` is in the `show` / Read output anyway). A future re-run uses a neutral example, as the README's "(`@Scheduled`, HTTP mappings, …)" |
+| D-ee (6.7) | **Verdict: usages close #42.** With `used by` in `show`, all 5 T4 agents named the queue dispatcher and got full marks (5.5: 3/5 and 2/5; 5.4 symbols: 1/5 and 0/5, p = 0.048 / 0.008), with cost not measurably different from 5.5 (mean +7 %, median −8 %, MW p = 1.0, n = 5; tokens −10 %); T1–T3 unchanged in correctness. The agents reached the dispatcher mostly through `show`'s `used by`, not `trace` (0 calls) | Call #42 narrowed until `trace` is used; keep it open for more runs | #42 is a correctness question and the dispatcher went to 5/5 (full marks 5/5, 4/5 under a strict reading of T4-with-5). The plan's cost criterion is met in the sense of no measurable increase, not strictly: the +7 % mean comes from cache creation (+21 %) from the larger `show` output (46.7 vs 26.3 KB per run), the real price of usages; vs 5.4 *without* T4 costs +13 % (n.s.) for −36 % tool calls. Vs 5.5 the gain is not significant at n = 5 (p = 0.44 / 0.17), vs the 5.4 symbol output it is. The intended mechanism, the consumer's `used by` naming `SubscriptionMessageDispatcher#performMessage … via MessageConsumer#perform`, shows in 3 of 5 streams; 1 found the dispatcher through an incidental `LOG_PREFIX` `reference` in another class's `used by`, 1 through search. `trace`'s value for agents is untested by T4 (one hop suffices) → #53. Caveats as D-ct: one task, 5 runs, the same kind of LLM grades, baselines ≈ 6.5 h older; and the prompt's mild cues (D-ed) |
+| D-ef (6.7, #46) | **No usages in the `search` file view**; callers stay one `show` away | `used by N` per hit, or the callers' files under each hit | The agents called `show` on their own in every T4 run (6.4 per run) and read `used by` there; a count or callers on every search result would cost output on every query (T1–T3 never needed them) to save at most one call. `project.md` keeps search as the entry and `show` / `trace` as the drill-down |
+| D-eg (6.7, #51) | **Usage lists keep full fqns** (D-dw stands) | Members relative to the file's top-level type, as `search` prints them | The package prefixes in the usage sections the T4 agents read were 4.3 KB per run (≈ 1.1 k tokens, < 2 % of a run's tokens even when re-read on later turns). The fqns the agents passed to `show` were mostly copied from earlier output (about half from usage lines), which a relative name would break; 2 typed ones for an inherited member failed (→ #54, not a naming issue). The usage sections do cost: the T4 cost rose +7 % (n.s.) through cache creation from the larger `show` output (D-ee), but the prefixes are a small part of it |
 
 ## Open questions
 
 | # | Question | Raised at | Status |
 | --- | --- | --- | --- |
 | 45 | Test sources are not indexed, so `used by` and `trace` never show test callers ("who relies on it" stops at main code). Index test files for edges only (as sources of usages, not as symbols or descriptions)? | 6 plan | **decided (6.5, D-dv):** deferred to the Later test-code indexing item (edge sources only), nothing built in Phase 6 |
-| 46 | Show usages in the `search` file view (e.g. `used by N` or the callers' files under a hit) so an agent sees the caller without a second command? Costs output size on every query | 6 plan | open — after 6.7, depending on whether agents call `trace` / `show` on their own |
-| 47 | Callers in the description prompts (plan Later): a member's callers could sharpen what and why, but every prompt changes and the whole LLM cache misses (≈ 20 min on `argus`) | 6 plan | open — after 6.7 |
+| 46 | Show usages in the `search` file view (e.g. `used by N` or the callers' files under a hit) so an agent sees the caller without a second command? Costs output size on every query | 6 plan | **decided (6.7, D-ef):** no — agents called `show` on their own in every T4 run (6.4 per run); 3 of 5 found the dispatcher in the consumer's `used by` |
+| 47 | Callers in the description prompts (plan Later): a member's callers could sharpen what and why, but every prompt changes and the whole LLM cache misses (≈ 20 min on `argus`) | 6 plan | **decided (6.7):** stays in Later, nothing built — the trial measured navigation, which `used by` already fixed (D-ee); it gives no evidence that callers would improve descriptions, and the change costs a full cold run. Revisit with a description-quality measure |
 | 48 | Substitute a super type's type arguments in inherited members (`SecurityMethodAddMessage extends SecurityDataMessageBearer<SecurityData>` → `getPayload()` returns `SecurityData`) and in receivers' generic types (`Box<Item>#get()`)? Today a type variable stops the chain (`usages.md`, where resolution stops): on `argus` every message consumer's `message.getPayload().getUserId()` is unresolved. Also a **bounded** type variable (`<T extends UserDataMessageBearer> void sendAsync(T message)` → `message.getMessageType()`): its erasure, the bound, is as precise as a declared type, but 6.1 keeps only the type variables' names (6.3 review L3) | 6.3 | **closed (6.4, D-dp):** super-type arguments are substituted in inherited members (return types, fields, Lombok/record accessors) and in `overrides`; a method's bounded type variable types its variables by the bound — the 3 generics misses of the usage golden set are gone (+8 correct edges on `argus`). A receiver's own type arguments (`Box<Item>#get()`) and class-level bounds stay out → #49 |
-| 49 | A receiver's own type arguments and lambda parameter types (`List<UserToken> tokens; tokens.removeIf(t -> t.getId()…)`, `events.forEach(e -> e.toWebResponse())`): `Ty` keeps no type arguments and an untyped lambda parameter has no type, so the call is unresolved. All 3 misses of the 6.4 usage golden set (3 of 91 users), at most 13 of `argus`'s 1386 call sites. Model type arguments on `Ty` plus the parameter types of common JDK functional interfaces (`forEach`, `removeIf`, `stream().map/filter/anyMatch`), or leave it to SCIP? | 6.4 | open — after 6.7: only if the agent trial shows a caller missing for this reason |
-| 50 | A type's `used by` line names the user and the lines, not which member of the type it uses (`…Dispatcher#dispatch(..) :76` under `SecurityDataEventDispatcherConfig` could be `getQueueName()` or the getter). Name the member (`→ #getX()`), at the cost of longer lines, or leave it to `show` of the member? | 6.5 | open — after 6.7, if agents misread a type's users |
-| 51 | Usage lists repeat the full package in every fqn under a file header that already contains it (`show` of `AbstractCache -k 100`: 6595 bytes, 4275 without the package, −35 %; `SecurityDataAddEventConsumer` −28 %). Print members relative to the file's top-level type, as `search`'s file view does, at the cost of names an agent cannot paste into `show` / `trace` unchanged (D-dw)? `trace` (6.6) prints the full path and fqn on most lines too, ≈ 235 bytes per line on `argus` (Measurements) | 6.5 review | open — after 6.7, on the trial's token cost |
+| 49 | A receiver's own type arguments and lambda parameter types (`List<UserToken> tokens; tokens.removeIf(t -> t.getId()…)`, `events.forEach(e -> e.toWebResponse())`): `Ty` keeps no type arguments and an untyped lambda parameter has no type, so the call is unresolved. All 3 misses of the 6.4 usage golden set (3 of 91 users), at most 13 of `argus`'s 1386 call sites. Model type arguments on `Ty` plus the parameter types of common JDK functional interfaces (`forEach`, `removeIf`, `stream().map/filter/anyMatch`), or leave it to SCIP? | 6.4 | **decided (6.7):** left to SCIP (Later) — no 6.7 answer or stream shows a caller missing for this reason; nothing built in Phase 6 |
+| 50 | A type's `used by` line names the user and the lines, not which member of the type it uses (`…Dispatcher#dispatch(..) :76` under `SecurityDataEventDispatcherConfig` could be `getQueueName()` or the getter). Name the member (`→ #getX()`), at the cost of longer lines, or leave it to `show` of the member? | 6.5 | **decided (6.7):** leave it to `show` of the member — one case seen, n = 1: `AuthDataEventService`'s `used by` lists five `SubscriptionMessageDispatcher` methods as `reference` without the member they use (they log the `LOG_PREFIX` constant, exactly this ambiguity); not misread, but only because that agent did not need to know what was referenced. Weak evidence; revisit if a trial shows a misreading |
+| 51 | Usage lists repeat the full package in every fqn under a file header that already contains it (`show` of `AbstractCache -k 100`: 6595 bytes, 4275 without the package, −35 %; `SecurityDataAddEventConsumer` −28 %). Print members relative to the file's top-level type, as `search`'s file view does, at the cost of names an agent cannot paste into `show` / `trace` unchanged (D-dw)? `trace` (6.6) prints the full path and fqn on most lines too, ≈ 235 bytes per line on `argus` (Measurements) | 6.5 review | **decided (6.7, D-eg):** keep full fqns — prefixes ≈ 1.1 k tokens per T4 run, agents paste them into `show` |
 | 52 | `trace`'s default depth 4 cuts 141 of 654 `argus` traces (`-k 100`; 85 at 5, 46 at 6, 2 at 8, none at 10), and of the 669 cut lines in them most fall on the message dispatchers (pactum, cronus, cives, janus: `performMessage` / `dispatch` / `receiveAndDispatchMessages`, one or two hops below their `@Scheduled` `processMessages`) — the T4 pattern, for a symbol a few calls below a consumer — then `AuthDataService#preWarm(UUID)` (35). Raise the default (6 cuts a third as many, at more output) or keep 4 and let agents pass `--depth`? | 6.6 | **closed (6.6 review, F2): default depth 6** (D-ea): after D-eb, 4 → 6 raises the traces reaching `@Scheduled` 165 → 238 and lowers the cut ones 136 → 36 (dispatcher lines 92 → 33) for p90 7.2 → 8.4 KB; 6.7 records whether any trial trace still ends at the depth |
+| 53 | No agent called `trace` in 6.7 (0 of 8 runs, though the prompt named it): on T4 one `used by` hop reaches the dispatcher's file and the rest is in that file. Does `trace` help agents where several hops are needed (a blast-radius task: "what breaks if this changes", `project.md`), or should `show`'s `used by` point to it? | 6.7 | open — Later: needs a multi-hop agent task; nothing built |
+| 54 | `show` of a member inherited from a supertype, named through the subtype (`show '…AuthDataEventService#publishAsync(AuthDataCacheUpdateEvent)'`, declared in `DynamoDBEventService`), is "not found in the index": 2 of 32 `show` calls in the 6.7 T4 runs, both typed by the agent. Resolve it to the declaring type's member, or suggest it in the error? Agent friction (`project.md` agent quality) | 6.7 review | open — Later; nothing built |

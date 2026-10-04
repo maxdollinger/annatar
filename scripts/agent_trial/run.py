@@ -3,14 +3,15 @@
 
 Usage:
   run.py run --tasks tasks.toml --out DIR [--reps 2] [--only T1,T2] [--arms with,without]
-             [--with-prompt files|symbols]
+             [--with-prompt files|symbols|usages]
   run.py summary --out DIR          # per-run CSV + per task/arm means; warns about incomplete runs
   run.py blind --out DIR            # shuffled final answers for grading, annatar mentions redacted
 
 `run` writes DIR/raw/<task>-<arm>-<rep>.jsonl (the stream) and .meta.json (exit code, timeout,
 wall time, the with-arm prompt); a run without a result event is repeated by the next `run`.
 `--with-prompt` picks the appended system prompt of the "with" arm: `files` describes the file-level
-`annatar search` output (5.5, the default), `symbols` the symbol list the 5.4 trial ran with.
+`annatar search` output (5.5, the default), `symbols` the symbol list the 5.4 trial ran with, `usages`
+the `files` prompt plus a bullet on `show`'s `used by` / `uses` and `annatar trace` (6.7).
 Tests (stdlib, no network): python3 -m unittest discover -s scripts/agent_trial
 
 The task file (private) holds `preamble` and `[[task]]` tables with `id`, `label`, `prompt`.
@@ -42,11 +43,16 @@ Results are ranked by similarity of meaning; the best match is not always first,
 - `annatar search "<words>"` lists the files whose symbols' descriptions are most similar in meaning to the words: rank, similarity, file path; its class (fully qualified name, kind, role, lines) with the description on the next line; then its members with lines, the best matches ending in `*similarity`. `-k N` sets the number of files (default 5); `--symbols` lists symbols instead.
 - `annatar show '<fqn>'` prints one symbol (a member's fqn is the class fqn + `#name(params)`): description, parent, children, file and lines, recent commits and Jira tickets with an English summary and purpose.
 Results are ranked by similarity of meaning; the best match is not always first, and descriptions can be incomplete or wrong, so check the code.""",
+    "usages": """This machine has `annatar`, a command-line index of this repository. Every class, interface, method and constructor has a short description of what it does and, where Jira tickets or commits explain it, why it was built or changed.
+- `annatar search "<words>"` lists the files whose symbols' descriptions are most similar in meaning to the words: rank, similarity, file path; its class (fully qualified name, kind, role, lines) with the description on the next line; then its members with lines, the best matches ending in `*similarity`. `-k N` sets the number of files (default 5); `--symbols` lists symbols instead.
+- `annatar show '<fqn>'` prints one symbol (a member's fqn is the class fqn + `#name(params)`): description, parent, children, file and lines, recent commits and Jira tickets with an English summary and purpose.
+- `annatar show` also lists `used by` (the methods and types that call, instantiate or reference the symbol, grouped by file with lines; callers through an interface marked `via` its method) and `uses` (what the symbol calls or references). `annatar trace '<fqn>'` prints the callers transitively as a tree, up to the entry points such as `[entry: @Scheduled]` (`--depth N`, default 6). Usages come from the source code: calls through reflection, events, message queues or configuration, and test code, are not included.
+Results are ranked by similarity of meaning; the best match is not always first, and descriptions can be incomplete or wrong, so check the code.""",
 }
 
 TOOLS = "Bash,Read,Grep,Glob"
 ARMS = ("with", "without")
-VALUE_OPTIONS = {"--path", "--config", "-k", "--limit", "--kind", "--role"}
+VALUE_OPTIONS = {"--path", "--config", "-k", "--limit", "--kind", "--role", "--depth"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)|`([^`]*)`")
 
@@ -135,7 +141,7 @@ def subcommand(args):
 
 
 def parse_stream(path):
-    tools, annatar, result, final = {}, {"search": 0, "show": 0, "other": 0}, None, ""
+    tools, annatar, result, final = {}, {"search": 0, "show": 0, "trace": 0, "other": 0}, None, ""
     for line in Path(path).read_text().splitlines():
         try:
             ev = json.loads(line)
@@ -149,7 +155,7 @@ def parse_stream(path):
                 tools[name] = tools.get(name, 0) + 1
                 if name == "Bash":
                     for sub in annatar_calls(block.get("input", {}).get("command", "")):
-                        annatar[sub if sub in ("search", "show") else "other"] += 1
+                        annatar[sub if sub in ("search", "show", "trace") else "other"] += 1
         elif ev.get("type") == "result":
             result = ev
             final = ev.get("result") or ""
@@ -243,7 +249,8 @@ def rows(out):
             "tool_calls": sum(tools.values()),
             "bash": tools.get("Bash", 0), "read": tools.get("Read", 0), "grep": tools.get("Grep", 0),
             "glob": tools.get("Glob", 0), "other_tools": sum(v for k, v in tools.items() if k not in ("Bash", "Read", "Grep", "Glob")),
-            "annatar_search": annatar["search"], "annatar_show": annatar["show"], "annatar_other": annatar["other"],
+            "annatar_search": annatar["search"], "annatar_show": annatar["show"], "annatar_trace": annatar["trace"],
+            "annatar_other": annatar["other"],
             "final_chars": len(final),
         })
     return spec_rows, problems
@@ -259,7 +266,8 @@ def summary(args):
         w = csv.DictWriter(f, fieldnames=list(data[0]))
         w.writeheader()
         w.writerows(data)
-    keys = ["tokens_total", "cost_usd", "tool_calls", "turns", "duration_s", "annatar_search", "annatar_show"]
+    keys = ["tokens_total", "cost_usd", "tool_calls", "turns", "duration_s", "annatar_search", "annatar_show",
+            "annatar_trace"]
     groups = {}
     for r in data:
         groups.setdefault((r["task"], r["arm"]), []).append(r)
