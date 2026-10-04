@@ -177,29 +177,40 @@ fn on_prefix_path(relative: &Path, prefix: &Path) -> bool {
     relative.starts_with(prefix) || prefix.starts_with(relative)
 }
 
-/// Reduce `prefix` to a path relative to `repo`. Absolute prefixes that fall
-/// outside `repo` return `None`; a relative prefix is normalised by dropping
-/// leading `./` components.
+/// Reduce `prefix` to a path relative to `repo`, normalised lexically: `.`
+/// components are dropped and `..` removes the component before it. Prefixes
+/// that fall outside `repo` (absolute, or a `..` that climbs above it) return
+/// `None`; the repository itself is the empty path.
 pub fn relative_prefix(repo: &Path, prefix: &Path) -> Option<PathBuf> {
     if prefix.is_absolute() {
         if let Ok(relative) = prefix.strip_prefix(repo) {
-            return Some(relative.to_path_buf());
+            return normalize(relative);
         }
         if repo.is_relative()
             && let Ok(cwd) = std::env::current_dir()
             && let Ok(relative) = prefix.strip_prefix(cwd.join(repo))
         {
-            return Some(relative.to_path_buf());
+            return normalize(relative);
         }
         return None;
     }
+    normalize(prefix)
+}
 
+/// `relative` without `.` components and with each `..` applied, or `None`
+/// when a `..` climbs above its start.
+fn normalize(relative: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
-    for component in prefix.components() {
-        if let Component::CurDir = component {
-            continue;
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            component => normalized.push(component.as_os_str()),
         }
-        normalized.push(component.as_os_str());
     }
     Some(normalized)
 }
@@ -365,6 +376,51 @@ mod tests {
                 "src/main/java/com/acme/App.java",
                 "src/main/java/com/acme/other/Other.java",
             ])
+        );
+    }
+
+    #[test]
+    fn relative_prefix_applies_dots_and_rejects_escapes() {
+        let repo = Path::new("/repo");
+        for (prefix, expected) in [
+            (".", Some("")),
+            ("./", Some("")),
+            ("/repo", Some("")),
+            ("/repo/", Some("")),
+            ("src/web/", Some("src/web")),
+            ("./src/./web", Some("src/web")),
+            ("backend/../backend/src", Some("backend/src")),
+            ("/repo/backend/../src", Some("src")),
+            ("backend/..", Some("")),
+            ("..", None),
+            ("../x", None),
+            ("src/../../x", None),
+            ("/repo/../x", None),
+            ("/other", None),
+        ] {
+            assert_eq!(
+                relative_prefix(repo, Path::new(prefix)),
+                expected.map(PathBuf::from),
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_prefix_with_parent_dirs_is_normalised() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "backend/src/main/java/A.java");
+        write_file(root, "frontend/src/main/java/B.java");
+
+        assert_eq!(
+            java_files(root, Some(Path::new("backend/../backend"))).unwrap(),
+            paths(&["backend/src/main/java/A.java"])
+        );
+        assert!(
+            java_files(root, Some(Path::new("../backend")))
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -144,3 +144,91 @@ fn search_rejects_unknown_filters_and_limits() {
         assert_eq!(text(&output.stdout), "");
     }
 }
+
+/// Every file in `dir` with its contents, sorted by name.
+fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn search_leaves_the_data_dir_unchanged() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    let data = dir.path().join("data");
+    std::fs::remove_file(data.join(annatar::store::CACHE_DB)).unwrap();
+    {
+        let db = libsql::Builder::new_local(data.join(annatar::store::INDEX_DB))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        annatar::schema::create_vectors(&conn, 3).await.unwrap();
+        conn.execute(
+            "INSERT INTO symbol_vectors (symbol_id, embedding) SELECT id, vector32('[1, 0, 0]') FROM symbols",
+            (),
+        )
+        .await
+        .unwrap();
+        for (key, value) in [
+            (annatar::schema::META_EMBEDDING_MODEL, "other"),
+            (annatar::schema::META_EMBEDDING_DIM, "3"),
+        ] {
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES (?1, ?2)",
+                libsql::params![key, value],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let before = files(&data);
+    assert_eq!(
+        before
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [annatar::store::INDEX_DB]
+    );
+
+    for args in [
+        &["search", "users"][..],
+        &["--path", ".", "search", "--kind", "method", "users"][..],
+    ] {
+        let search = annatar(dir.path(), args);
+        assert_eq!(search.status.code(), Some(1), "{args:?}");
+        assert_eq!(text(&search.stdout), "");
+        let stderr = text(&search.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.starts_with("error: the index was embedded with \"other\""),
+            "{stderr}"
+        );
+        assert!(files(&data) == before, "search changed the data dir");
+    }
+}
+
+#[test]
+fn search_path_outside_the_repo_is_one_error_line() {
+    let dir = workspace();
+    for prefix in ["..", "../repo", "src/../../x"] {
+        let search = annatar(dir.path(), &["--path", prefix, "search", "users"]);
+        assert_eq!(search.status.code(), Some(1), "{prefix}");
+        assert_eq!(text(&search.stdout), "");
+        assert_eq!(
+            text(&search.stderr),
+            format!("error: --path {prefix} is outside the repository ./repo\n")
+        );
+    }
+}
