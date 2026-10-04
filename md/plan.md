@@ -162,6 +162,8 @@ The set is `.annatar-local/golden-argus.toml` (outside git, D-bl), loaded with `
 The agent uses Annatar through the CLI (`annatar search`, `annatar show`) with its normal shell tool; there is no MCP server (`state.md` D-ax). Pick 3–5 real tasks where you know the relevant code. Decide up front how to measure tokens and tool calls (e.g. the agent's session cost or usage report). Run each task with and without Annatar.
 *Done when:* results are written down. **This answers question 3.**
 
+*Done (5.4, `state.md` D-cj–D-cl):* Claude Code headless on `claude-sonnet-5`, 4 read-only `argus` tasks (a cap found from user-facing words, two "which code and why" questions whose reasons live in Jira, one message-flow trace) × with/without `annatar` × 5 runs; metrics from the CLI's stream (tokens incl. cache, cost, tool calls by tool, turns, time), correctness 0/1/2 against an answer key written before the runs and graded blind; harness `scripts/agent_trial/run.py`, tasks and raw results private. With `annatar`: −47 % tokens, −40 % tool calls, −32 % cost, −39 % time on average and lower on every task; correctness 36 vs 35 of 40 — ticket reasons only with `annatar`, but on the flow trace 4 of 5 runs skipped the dispatcher in front of the consumer that search returned (open #42). Verdict for question 3: yes on this repository; n is small (5 runs × 4 tasks, one ≈ 7k-line repo, one model; open #41).
+
 ---
 
 ## Later (after the POC proves itself)
