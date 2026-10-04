@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags};
@@ -11,6 +12,10 @@ pub const INDEX_DB: &str = "index.db";
 /// Persists across runs and holds only expensive, content-keyed results.
 pub const CACHE_DB: &str = "cache.db";
 
+/// How long a cache connection waits for another connection's write lock
+/// before a statement fails with `SQLITE_BUSY`.
+pub const CACHE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Opens the two database files and manages the index rebuild lifecycle.
 ///
 /// `<data_dir>/cache.db` is opened once and shared. `<data_dir>/index.db` is
@@ -22,8 +27,8 @@ pub const CACHE_DB: &str = "cache.db";
 pub struct Store {
     data_dir: PathBuf,
     cache: Connection,
-    // Anchors the cache connection; never read directly.
-    _cache_db: Database,
+    // Anchors the cache connections and opens more of them.
+    cache_db: Database,
 }
 
 /// An owned, in-progress index build. Hold it for the whole run, write tables
@@ -94,7 +99,7 @@ impl Store {
         Ok(Self {
             data_dir,
             cache,
-            _cache_db: cache_db,
+            cache_db,
         })
     }
 
@@ -102,6 +107,21 @@ impl Store {
     /// here with `CREATE TABLE IF NOT EXISTS`.
     pub fn cache(&self) -> &Connection {
         &self.cache
+    }
+
+    /// A new, separate connection to `cache.db`, for a component that writes
+    /// from concurrent tasks (the LLM client). It has its own transaction
+    /// state, so its writes never join or interleave with a transaction open
+    /// on [`Store::cache`], and it waits up to [`CACHE_BUSY_TIMEOUT`] for
+    /// another connection's write lock.
+    pub fn connect_cache(&self) -> Result<Connection> {
+        let conn = self
+            .cache_db
+            .connect()
+            .context("connecting to cache database")?;
+        conn.busy_timeout(CACHE_BUSY_TIMEOUT)
+            .context("setting the cache busy timeout")?;
+        Ok(conn)
     }
 
     pub fn index_path(&self) -> PathBuf {
@@ -431,6 +451,33 @@ mod tests {
         assert!(
             !cache_path.exists(),
             "the read path must not recreate cache.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_cache_connection_does_not_join_open_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .cache()
+            .execute("CREATE TABLE c (v TEXT)", ())
+            .await
+            .unwrap();
+        let other = store.connect_cache().unwrap();
+
+        let transaction = store.cache().transaction().await.unwrap();
+        other
+            .execute("INSERT INTO c VALUES ('kept')", ())
+            .await
+            .unwrap();
+        transaction.rollback().await.unwrap();
+
+        assert_eq!(
+            first_string(store.cache(), "SELECT v FROM c")
+                .await
+                .as_deref(),
+            Some("kept"),
+            "a rollback on the shared connection must not undo the other's write"
         );
     }
 

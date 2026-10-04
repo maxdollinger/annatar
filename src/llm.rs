@@ -3,20 +3,32 @@
 //! [`LlmClient::complete`] turns a prompt into a `T: DeserializeOwned +
 //! JsonSchema`: the `schemars` schema of `T` is sent as the structured-output
 //! format (`response_format` of type `json_schema`), and the reply must
-//! deserialize into `T`. An invalid reply is retried once, with the bad reply
-//! and the error appended to the conversation; a second invalid reply is an
-//! [`InvalidOutput`] error and nothing is cached. [`LlmClient::embed`] returns
-//! one vector per text, sending only the texts the cache does not hold.
+//! deserialize into `T` and pass the caller's check
+//! ([`LlmClient::complete_with`]). An invalid reply is retried once, with the
+//! bad reply and the error appended to the conversation; a second invalid
+//! reply is an [`InvalidOutput`] error and nothing is cached. A reply cut off
+//! at the token limit is logged as a warning and named in that error.
+//! [`LlmClient::embed`] returns one vector per text, sending only the texts the
+//! cache does not hold; all vectors of one call must have the same length.
+//!
+//! Response types should carry `#[serde(deny_unknown_fields)]`: schemars then
+//! sends `additionalProperties: false`, and a reply with extra fields is
+//! invalid instead of silently accepted.
 //!
 //! Both go through `cache.db`: `llm_cache` keyed by a hash of chat model,
-//! reasoning effort, schema and prompt (the prompt is the full text, input
-//! included), `embedding_cache` keyed by a hash of embedding model and text.
-//! A changed key simply misses. Cache faults degrade: an unreadable or
-//! undecodable row is a miss, a failed write warns and keeps the result.
+//! reasoning effort, canonical schema and prompt (the prompt is the full text,
+//! input included), `embedding_cache` keyed by a hash of embedding model and
+//! text. A changed key simply misses. Cache faults degrade: an unreadable,
+//! undecodable or no longer valid row is a miss, a failed write warns and keeps
+//! the result. The client is shared by reference across concurrent tasks; give
+//! it its own connection ([`crate::store::Store::connect_cache`]) so its
+//! writes never join another stage's transaction. Its writes are single
+//! statements, serialised by the client.
 //!
 //! [`LlmBackend`] is the seam the client calls through; [`OllamaBackend`]
-//! implements it with `reqwest`, tests use a fake. [`LlmStats`] counts backend
-//! calls and cache hits, so a caller can show that a rerun made no LLM calls.
+//! implements it with `reqwest` and retries a 503 or a failed connection once,
+//! tests use a fake. [`LlmStats`] counts backend calls and cache hits, so a
+//! caller can show that a rerun made no LLM calls.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -24,14 +36,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use libsql::{Connection, params};
+use libsql::{Connection, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::sync::Mutex;
 
 use crate::config::OllamaConfig;
 
@@ -44,6 +57,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How much of a non-success response body is kept for the error message.
 const MAX_ERROR_BODY: usize = 4 * 1024;
+
+/// HTTP attempts per backend request: the first and one retry after a
+/// transient failure (503 or no connection).
+const HTTP_ATTEMPTS: usize = 2;
+
+/// Wait before retrying a transient failure.
+const TRANSIENT_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Chat attempts per completion: the first and one retry on invalid output.
 pub const MAX_ATTEMPTS: usize = 2;
@@ -87,14 +107,42 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
 }
 
+/// One chat completion as the backend returned it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatReply {
+    /// The assistant's reply text.
+    pub content: String,
+    /// `stop`, `length` (cut off at the token limit), ...
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+}
+
+impl ChatReply {
+    /// A complete (`stop`) reply without usage.
+    pub fn stop(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            finish_reason: Some("stop".to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// The reply was cut off at the token limit.
+    pub fn truncated(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
+}
+
 /// The future an [`LlmBackend`] method returns: boxed so the trait stays
 /// object-safe.
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-/// The calls [`LlmClient`] makes. No caching, no validation, no retries.
+/// The calls [`LlmClient`] makes. No caching, no validation, no retries on
+/// invalid output.
 pub trait LlmBackend: Send + Sync {
-    /// The assistant's reply text for `request`.
-    fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, String>;
+    /// The assistant's reply for `request`.
+    fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, ChatReply>;
 
     /// One vector per text, in input order. `texts` is never empty.
     fn embed<'a>(&'a self, model: &'a str, texts: &'a [String])
@@ -106,6 +154,7 @@ pub trait LlmBackend: Send + Sync {
 pub struct OllamaBackend {
     http: reqwest::Client,
     base_url: String,
+    retry_backoff: Duration,
 }
 
 impl OllamaBackend {
@@ -127,6 +176,7 @@ impl OllamaBackend {
         Ok(Self {
             http,
             base_url: base_url.to_string(),
+            retry_backoff: TRANSIENT_BACKOFF,
         })
     }
 
@@ -135,22 +185,39 @@ impl OllamaBackend {
     }
 
     /// `POST` `body` to `path` and return the JSON of a 2xx answer; any other
-    /// status is an error carrying Ollama's message.
+    /// status is an error carrying Ollama's message. A transient failure (see
+    /// [`transient_status`]) is retried once after a short backoff.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path);
-        let mut response = self
-            .http
-            .post(&url)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("calling {url}"))?;
+        let mut attempt = 1;
+        loop {
+            match self.post_once(&url, body).await {
+                Err((err, true)) if attempt < HTTP_ATTEMPTS => {
+                    tracing::warn!(attempt, "transient Ollama failure, retrying: {err:#}");
+                    tokio::time::sleep(self.retry_backoff).await;
+                    attempt += 1;
+                }
+                result => return result.map_err(|(err, _)| err),
+            }
+        }
+    }
+
+    /// One `POST`; an error comes with whether it is transient.
+    async fn post_once(&self, url: &str, body: &Value) -> Result<Value, (anyhow::Error, bool)> {
+        let mut response = match self.http.post(url).json(body).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                let transient = err.is_connect();
+                return Err((anyhow!(err).context(format!("calling {url}")), transient));
+            }
+        };
         let status = response.status();
         if status.is_success() {
             return response
                 .json()
                 .await
-                .with_context(|| format!("reading the response of {url}"));
+                .with_context(|| format!("reading the response of {url}"))
+                .map_err(|err| (err, false));
         }
         let mut error_body = Vec::new();
         while error_body.len() < MAX_ERROR_BODY {
@@ -160,16 +227,25 @@ impl OllamaBackend {
             let take = chunk.len().min(MAX_ERROR_BODY - error_body.len());
             error_body.extend_from_slice(&chunk[..take]);
         }
-        bail!(
-            "{url} answered HTTP {}: {}",
-            status.as_u16(),
-            error_message(&error_body)
-        )
+        Err((
+            anyhow!(
+                "{url} answered HTTP {}: {}",
+                status.as_u16(),
+                error_message(&error_body)
+            ),
+            transient_status(status),
+        ))
     }
 }
 
+/// Statuses worth one retry: Ollama answers 503 while it is overloaded or
+/// loading. Client errors (4xx) and other server errors are not retried.
+fn transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+}
+
 impl LlmBackend for OllamaBackend {
-    fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, String> {
+    fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, ChatReply> {
         Box::pin(async move {
             let response = self.post("chat/completions", &chat_body(request)).await?;
             parse_chat_response(&response)
@@ -210,9 +286,9 @@ fn chat_body(request: &ChatRequest) -> Value {
     body
 }
 
-/// The reply text of a chat completion. A thinking model's reasoning arrives
-/// in `message.reasoning` and is ignored.
-fn parse_chat_response(response: &Value) -> Result<String> {
+/// The reply of a chat completion. A thinking model's reasoning arrives in
+/// `message.reasoning` and is ignored.
+fn parse_chat_response(response: &Value) -> Result<ChatReply> {
     let choice = response
         .pointer("/choices/0")
         .ok_or_else(|| anyhow!("chat response has no choices"))?;
@@ -220,10 +296,19 @@ fn parse_chat_response(response: &Value) -> Result<String> {
         .pointer("/message/content")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("chat response has no message content"))?;
-    if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
-        tracing::debug!("chat reply was cut off at the token limit");
-    }
-    Ok(content.to_string())
+    Ok(ChatReply {
+        content: content.to_string(),
+        finish_reason: choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        prompt_tokens: response
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64),
+        completion_tokens: response
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64),
+    })
 }
 
 /// One vector per input, ordered by each item's `index`.
@@ -281,13 +366,16 @@ fn error_message(body: &[u8]) -> String {
         .unwrap_or_else(|| text.trim().to_string())
 }
 
-/// The model's reply still did not deserialize into the requested type after
-/// [`MAX_ATTEMPTS`] attempts. Nothing was cached.
+/// The model's reply still did not deserialize into the requested type, or
+/// failed the caller's check, after [`MAX_ATTEMPTS`] attempts. Nothing was
+/// cached.
 #[derive(Debug)]
 pub struct InvalidOutput {
     pub type_name: String,
     pub error: String,
     pub output: String,
+    /// The last reply's finish reason; `length` means it was cut off.
+    pub finish_reason: Option<String>,
 }
 
 impl fmt::Display for InvalidOutput {
@@ -296,7 +384,14 @@ impl fmt::Display for InvalidOutput {
             f,
             "the model's reply is not a valid {} after {MAX_ATTEMPTS} attempts: {}",
             self.type_name, self.error
-        )
+        )?;
+        if self.finish_reason.as_deref() == Some("length") {
+            write!(
+                f,
+                " (the reply was cut off at the token limit, finish_reason \"length\")"
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -330,10 +425,12 @@ struct Counters {
     embed_hits: AtomicUsize,
 }
 
-/// The cached, typed client. Cheap to share by reference across tasks.
+/// The cached, typed client. Share it by reference (or in an `Arc`) across
+/// concurrent tasks; cache writes are serialised internally.
 pub struct LlmClient {
     backend: Arc<dyn LlmBackend>,
     cache: Connection,
+    write_lock: Mutex<()>,
     chat_model: String,
     embedding_model: String,
     reasoning_effort: Option<String>,
@@ -342,11 +439,14 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// A client calling `backend` with the models and reasoning effort from
-    /// `config`, caching in `cache` (typically [`crate::store::Store::cache`]).
+    /// `config`, caching in `cache`: a connection of its own,
+    /// [`crate::store::Store::connect_cache`], not the shared
+    /// [`crate::store::Store::cache`].
     pub fn new(backend: Arc<dyn LlmBackend>, cache: Connection, config: &OllamaConfig) -> Self {
         Self {
             backend,
             cache,
+            write_lock: Mutex::new(()),
             chat_model: config.chat_model.clone(),
             embedding_model: config.embedding_model.clone(),
             reasoning_effort: Some(config.reasoning_effort.clone())
@@ -377,28 +477,44 @@ impl LlmClient {
     /// Answer `prompt` with a `T`, from the cache or the chat model. See the
     /// module docs for retries and caching. A reply that is still invalid
     /// after the retry is an [`InvalidOutput`] error; backend failures are
-    /// returned as is and not retried.
+    /// returned as is (the backend retries a transient one itself).
     pub async fn complete<T: DeserializeOwned + JsonSchema>(&self, prompt: &str) -> Result<T> {
+        self.complete_with(prompt, accept::<T>).await
+    }
+
+    /// [`LlmClient::complete`] with a check on the parsed reply, such as a
+    /// blank or overlong field. An `Err` message makes the reply invalid: it
+    /// is sent back to the model for the retry, and nothing is cached. A
+    /// cached reply that fails the check is a miss.
+    pub async fn complete_with<T, F>(&self, prompt: &str, validate: F) -> Result<T>
+    where
+        T: DeserializeOwned + JsonSchema,
+        F: Fn(&T) -> Result<(), String>,
+    {
         let schema =
             serde_json::to_value(schemars::schema_for!(T)).context("serializing schema")?;
-        let schema_text = serde_json::to_string(&schema).context("serializing schema")?;
         let type_name = T::schema_name();
         let key = completion_key(
             &self.chat_model,
             self.reasoning_effort.as_deref(),
-            &schema_text,
+            &canonical_schema(&schema),
             prompt,
         );
+        let decode = |output: &str| -> Result<T, String> {
+            let value = serde_json::from_str::<T>(output).map_err(|err| err.to_string())?;
+            validate(&value)?;
+            Ok(value)
+        };
 
         match self.cached_completion(&key).await {
-            Ok(Some(output)) => match serde_json::from_str::<T>(&output) {
+            Ok(Some(output)) => match decode(&output) {
                 Ok(value) => {
                     self.counters.chat_hits.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(r#type = %type_name, "llm cache hit");
                     return Ok(value);
                 }
                 Err(err) => {
-                    tracing::warn!(r#type = %type_name, "llm cache row does not decode, treating as a miss: {err}");
+                    tracing::warn!(r#type = %type_name, "llm cache row is not valid, treating as a miss: {err}");
                 }
             },
             Ok(None) => {}
@@ -415,14 +531,32 @@ impl LlmClient {
         let mut attempt = 1;
         loop {
             self.counters.chat_calls.fetch_add(1, Ordering::Relaxed);
-            let output = self
+            let started = Instant::now();
+            let reply = self
                 .backend
                 .chat(&request)
                 .await
                 .context("chat completion")?;
-            match serde_json::from_str::<T>(&output) {
+            tracing::debug!(
+                r#type = %type_name,
+                attempt,
+                prompt_tokens = ?reply.prompt_tokens,
+                completion_tokens = ?reply.completion_tokens,
+                finish_reason = ?reply.finish_reason,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "chat reply"
+            );
+            if reply.truncated() {
+                tracing::warn!(
+                    r#type = %type_name,
+                    attempt,
+                    completion_tokens = ?reply.completion_tokens,
+                    "chat reply was cut off at the token limit"
+                );
+            }
+            match decode(&reply.content) {
                 Ok(value) => {
-                    if let Err(err) = self.store_completion(&key, output.trim()).await {
+                    if let Err(err) = self.store_completion(&key, reply.content.trim()).await {
                         tracing::warn!("writing llm cache: {err:#}");
                     }
                     return Ok(value);
@@ -430,15 +564,16 @@ impl LlmClient {
                 Err(err) if attempt < MAX_ATTEMPTS => {
                     tracing::warn!(r#type = %type_name, attempt, "invalid model reply, retrying: {err}");
                     self.counters.chat_retries.fetch_add(1, Ordering::Relaxed);
-                    request.messages.push(Message::assistant(output));
+                    request.messages.push(Message::assistant(reply.content));
                     request.messages.push(Message::user(retry_prompt(&err)));
                     attempt += 1;
                 }
                 Err(err) => {
                     return Err(InvalidOutput {
                         type_name: type_name.into_owned(),
-                        error: err.to_string(),
-                        output,
+                        error: err,
+                        output: reply.content,
+                        finish_reason: reply.finish_reason,
                     }
                     .into());
                 }
@@ -448,9 +583,12 @@ impl LlmClient {
 
     /// One vector per text, in input order. Cached texts are not sent;
     /// repeated texts are sent once; the rest go out in batches of
-    /// [`EMBED_BATCH`].
+    /// [`EMBED_BATCH`]. Vectors of different lengths (a changed model behind
+    /// the same name, a bad cache row) are an error, and such a batch is not
+    /// cached.
     pub async fn embed<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut dim: Option<usize> = None;
         let mut missing: Vec<(&str, String)> = Vec::new();
         let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
         for (position, text) in texts.iter().enumerate() {
@@ -462,7 +600,10 @@ impl LlmClient {
             positions.insert(text, vec![position]);
             let key = embedding_key(&self.embedding_model, text);
             match self.cached_embedding(&key).await {
-                Ok(Some(vector)) => vectors[position] = Some(vector),
+                Ok(Some(vector)) => {
+                    check_dim(&mut dim, vector.len())?;
+                    vectors[position] = Some(vector);
+                }
                 Ok(None) => missing.push((text, key)),
                 Err(err) => {
                     tracing::warn!("reading embedding cache, treating as a miss: {err:#}");
@@ -488,6 +629,9 @@ impl LlmClient {
                     embedded.len(),
                     inputs.len()
                 );
+            }
+            for vector in &embedded {
+                check_dim(&mut dim, vector.len())?;
             }
             let rows: Vec<(&str, &[f32])> = batch
                 .iter()
@@ -531,6 +675,7 @@ impl LlmClient {
     }
 
     async fn store_completion(&self, key: &str, output: &str) -> Result<()> {
+        let _write = self.write_lock.lock().await;
         self.cache
             .execute(
                 "INSERT OR REPLACE INTO llm_cache (key, model, output, created_at)
@@ -545,38 +690,68 @@ impl LlmClient {
         let mut rows = self
             .cache
             .query(
-                "SELECT vector FROM embedding_cache WHERE key = ?1",
+                "SELECT dim, vector FROM embedding_cache WHERE key = ?1",
                 params![key],
             )
             .await?;
-        match rows.next().await? {
-            Some(row) => decode_vector(&row.get::<Vec<u8>>(0)?).map(Some),
-            None => Ok(None),
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let dim = row.get::<i64>(0)?;
+        let vector = decode_vector(&row.get::<Vec<u8>>(1)?)?;
+        if i64::try_from(vector.len()).ok() != Some(dim) {
+            bail!("cached embedding has {} values but dim {dim}", vector.len());
         }
+        Ok(Some(vector))
     }
 
+    /// One multi-row `INSERT`: atomic without an explicit transaction.
     async fn store_embeddings(&self, rows: &[(&str, &[f32])]) -> Result<()> {
-        let tx = self.cache.transaction().await?;
-        for (key, vector) in rows {
-            tx.execute(
-                "INSERT OR REPLACE INTO embedding_cache (key, model, dim, vector)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    *key,
-                    self.embedding_model.as_str(),
-                    vector.len() as i64,
-                    encode_vector(vector)
-                ],
-            )
-            .await?;
+        if rows.is_empty() {
+            return Ok(());
         }
-        tx.commit().await?;
+        let placeholders = vec!["(?, ?, ?, ?)"; rows.len()].join(", ");
+        let sql = format!(
+            "INSERT OR REPLACE INTO embedding_cache (key, model, dim, vector) VALUES {placeholders}"
+        );
+        let values: Vec<libsql::Value> = rows
+            .iter()
+            .flat_map(|(key, vector)| {
+                [
+                    libsql::Value::Text(key.to_string()),
+                    libsql::Value::Text(self.embedding_model.clone()),
+                    libsql::Value::Integer(vector.len() as i64),
+                    libsql::Value::Blob(encode_vector(vector)),
+                ]
+            })
+            .collect();
+        let _write = self.write_lock.lock().await;
+        self.cache.execute(&sql, params_from_iter(values)).await?;
         Ok(())
     }
 }
 
+/// The check of [`LlmClient::complete`]: any parsed reply is valid.
+fn accept<T>(_: &T) -> Result<(), String> {
+    Ok(())
+}
+
+/// Record the first vector length seen in `dim`; a different one is an error.
+fn check_dim(dim: &mut Option<usize>, len: usize) -> Result<()> {
+    match *dim {
+        Some(expected) if expected != len => bail!(
+            "embedding vectors differ in length ({expected} and {len}); did the embedding model change?"
+        ),
+        Some(_) => Ok(()),
+        None => {
+            *dim = Some(len);
+            Ok(())
+        }
+    }
+}
+
 /// The follow-up message after an invalid reply.
-fn retry_prompt(error: &serde_json::Error) -> String {
+fn retry_prompt(error: &str) -> String {
     format!(
         "Your previous reply was not valid: {error}. Reply again with only a JSON value that matches the requested schema."
     )
@@ -612,7 +787,34 @@ fn hash_parts(parts: &[&str]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// `llm_cache` key: chat model, reasoning effort, schema and prompt.
+/// The schema as it goes into the cache key: object keys sorted recursively
+/// (independent of `serde_json`'s `preserve_order` feature) and the top-level
+/// `$schema` dialect URI dropped.
+fn canonical_schema(schema: &Value) -> String {
+    let mut schema = schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+    }
+    sorted_keys(&schema).to_string()
+}
+
+fn sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), sorted_keys(&object[key])))
+                    .collect::<Map<String, Value>>(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `llm_cache` key: chat model, reasoning effort, canonical schema and prompt.
 fn completion_key(
     model: &str,
     reasoning_effort: Option<&str>,
@@ -661,13 +863,15 @@ pub(crate) mod fake {
     use super::*;
 
     /// A [`LlmBackend`] that answers chats from a script (in order; an empty
-    /// script is an error) and embeds a text as `[chars, first byte, 1.0]`.
+    /// script is an error) and embeds a text as `[chars, first byte, 1.0]`
+    /// (without the `1.0` for a text marked [`FakeBackend::short`]).
     /// It records every chat request and embedding batch.
     #[derive(Default)]
     pub struct FakeBackend {
-        replies: Mutex<VecDeque<String>>,
+        replies: Mutex<VecDeque<ChatReply>>,
         chats: Mutex<Vec<ChatRequest>>,
         batches: Mutex<Vec<Vec<String>>>,
+        short: Mutex<Vec<String>>,
     }
 
     impl FakeBackend {
@@ -679,7 +883,16 @@ pub(crate) mod fake {
             self.replies
                 .lock()
                 .unwrap()
-                .extend(replies.iter().map(|reply| reply.to_string()));
+                .extend(replies.iter().map(|reply| ChatReply::stop(*reply)));
+        }
+
+        pub fn reply_with(&self, reply: ChatReply) {
+            self.replies.lock().unwrap().push_back(reply);
+        }
+
+        /// Embed `text` one value short from now on.
+        pub fn short(&self, text: &str) {
+            self.short.lock().unwrap().push(text.to_string());
         }
 
         pub fn chats(&self) -> Vec<ChatRequest> {
@@ -700,7 +913,7 @@ pub(crate) mod fake {
     }
 
     impl LlmBackend for FakeBackend {
-        fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, String> {
+        fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, ChatReply> {
             Box::pin(async move {
                 self.chats.lock().unwrap().push(request.clone());
                 self.replies
@@ -719,7 +932,17 @@ pub(crate) mod fake {
             Box::pin(async move {
                 assert!(!texts.is_empty(), "the client never sends an empty batch");
                 self.batches.lock().unwrap().push(texts.to_vec());
-                Ok(texts.iter().map(|text| vector_for(text)).collect())
+                let short = self.short.lock().unwrap();
+                Ok(texts
+                    .iter()
+                    .map(|text| {
+                        let mut vector = vector_for(text);
+                        if short.contains(text) {
+                            vector.pop();
+                        }
+                        vector
+                    })
+                    .collect())
             })
         }
     }
@@ -737,6 +960,7 @@ mod tests {
     use crate::store::Store;
 
     #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     struct Summary {
         what: String,
         why: String,
@@ -772,7 +996,7 @@ mod tests {
     }
 
     fn client(backend: &Arc<FakeBackend>, store: &Store, config: &OllamaConfig) -> LlmClient {
-        LlmClient::new(backend.clone(), store.cache().clone(), config)
+        LlmClient::new(backend.clone(), store.connect_cache().unwrap(), config)
     }
 
     async fn count(store: &Store, table: &str) -> i64 {
@@ -827,6 +1051,7 @@ mod tests {
         assert_eq!(request.messages, vec![Message::user("prompt")]);
         assert_eq!(request.schema_name, "Summary");
         assert_eq!(request.schema["required"], json!(["what", "why"]));
+        assert_eq!(request.schema["additionalProperties"], json!(false));
         assert_eq!(request.reasoning_effort.as_deref(), Some("none"));
 
         let body = chat_body(request);
@@ -962,6 +1187,156 @@ mod tests {
         assert_eq!(backend.chats().len(), 2, "the bad row was rewritten");
     }
 
+    fn not_blank(summary: &Summary) -> Result<(), String> {
+        if summary.what.trim().is_empty() {
+            return Err("`what` is blank".to_string());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_and_failed_checks_are_retried() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[
+            r#"{"what": "", "why": "x", "extra": 1}"#,
+            r#"{"what": " ", "why": "x"}"#,
+        ]);
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        let err = llm
+            .complete_with::<Summary, _>("prompt", not_blank)
+            .await
+            .unwrap_err();
+        let invalid = err.downcast_ref::<InvalidOutput>().unwrap();
+        assert!(invalid.error.contains("`what` is blank"), "{err}");
+        let retry = &backend.chats()[1].messages[2].content;
+        assert!(retry.contains("unknown field `extra`"), "{retry}");
+        assert_eq!(count(&store, "llm_cache").await, 0);
+
+        backend.reply(&[r#"{"what": "", "why": "x"}"#, SUMMARY]);
+        assert_eq!(
+            llm.complete_with::<Summary, _>("prompt", not_blank)
+                .await
+                .unwrap(),
+            summary()
+        );
+        let retry = &backend.chats()[3].messages[2].content;
+        assert!(retry.contains("`what` is blank"), "{retry}");
+        assert_eq!(count(&store, "llm_cache").await, 1);
+    }
+
+    #[tokio::test]
+    async fn cached_reply_failing_the_check_is_a_miss() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[r#"{"what": "", "why": "x"}"#, SUMMARY]);
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.complete::<Summary>("prompt").await.unwrap();
+
+        assert_eq!(
+            llm.complete_with::<Summary, _>("prompt", not_blank)
+                .await
+                .unwrap(),
+            summary()
+        );
+        assert_eq!(backend.chats().len(), 2);
+        assert_eq!(llm.stats().chat_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_reply_is_named_in_the_error() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        for _ in 0..MAX_ATTEMPTS {
+            backend.reply_with(ChatReply {
+                content: r#"{"what": "Loads"#.to_string(),
+                finish_reason: Some("length".to_string()),
+                prompt_tokens: Some(4000),
+                completion_tokens: Some(96),
+            });
+        }
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        let err = llm.complete::<Summary>("prompt").await.unwrap_err();
+        let invalid = err.downcast_ref::<InvalidOutput>().unwrap();
+        assert_eq!(invalid.finish_reason.as_deref(), Some("length"));
+        assert!(
+            err.to_string().contains("cut off at the token limit"),
+            "{err}"
+        );
+
+        backend.reply(&["not json", "still not json"]);
+        let err = llm.complete::<Summary>("prompt").await.unwrap_err();
+        assert!(!err.to_string().contains("cut off"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_tasks_share_one_client_and_cache_everything() {
+        const TASKS: usize = 16;
+        const TEXTS: usize = 200;
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&vec![SUMMARY; TASKS]);
+        let texts = |task: usize| -> Vec<String> {
+            (0..TEXTS)
+                .map(|i| format!("task {task} text {i}"))
+                .collect()
+        };
+
+        let run = |llm: Arc<LlmClient>| async move {
+            let handles: Vec<_> = (0..TASKS)
+                .map(|task| {
+                    let llm = llm.clone();
+                    let texts = texts(task);
+                    tokio::spawn(async move {
+                        let vectors = llm.embed(&texts).await.unwrap();
+                        assert_eq!(vectors[7], vector_for(&texts[7]));
+                        llm.complete::<Summary>(&format!("prompt {task}"))
+                            .await
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.await.unwrap(), summary());
+            }
+            llm.stats()
+        };
+
+        let llm = Arc::new(client(&backend, &store, &ollama("chat")));
+        let cold = run(llm).await;
+        assert_eq!(cold.chat_calls, TASKS);
+        assert_eq!(cold.embed_texts, TASKS * TEXTS);
+        assert_eq!(
+            count(&store, "embedding_cache").await,
+            (TASKS * TEXTS) as i64
+        );
+        assert_eq!(count(&store, "llm_cache").await, TASKS as i64);
+
+        let warm = run(Arc::new(client(&backend, &store, &ollama("chat")))).await;
+        assert_eq!(warm.chat_calls, 0);
+        assert_eq!(warm.embed_calls, 0);
+        assert_eq!(warm.chat_hits, TASKS);
+        assert_eq!(warm.embed_hits, TASKS * TEXTS);
+    }
+
+    #[tokio::test]
+    async fn client_writes_survive_a_rollback_on_the_shared_connection() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[SUMMARY]);
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        let transaction = store.cache().transaction().await.unwrap();
+        llm.complete::<Summary>("prompt").await.unwrap();
+        llm.embed(&["alpha", "beta"]).await.unwrap();
+        transaction.rollback().await.unwrap();
+
+        assert_eq!(count(&store, "llm_cache").await, 1);
+        assert_eq!(count(&store, "embedding_cache").await, 2);
+    }
+
     #[tokio::test]
     async fn embed_caches_per_text_and_sends_only_misses() {
         let (_dir, store) = store().await;
@@ -1037,6 +1412,165 @@ mod tests {
         assert_eq!(sizes, vec![EMBED_BATCH, 1]);
     }
 
+    #[tokio::test]
+    async fn cached_embedding_with_a_wrong_dim_is_a_miss() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.embed(&["alpha"]).await.unwrap();
+        store
+            .cache()
+            .execute("UPDATE embedding_cache SET dim = 5", ())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            llm.embed(&["alpha"]).await.unwrap(),
+            vec![vector_for("alpha")]
+        );
+        assert_eq!(backend.batches().len(), 2);
+        llm.embed(&["alpha"]).await.unwrap();
+        assert_eq!(backend.batches().len(), 2, "the bad row was rewritten");
+    }
+
+    #[tokio::test]
+    async fn embedding_lengths_must_agree() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.embed(&["alpha"]).await.unwrap();
+        backend.short("beta");
+        backend.short("gamma");
+
+        let err = llm.embed(&["alpha", "beta"]).await.unwrap_err();
+        assert!(err.to_string().contains("differ in length"), "{err}");
+        let err = llm.embed(&["delta", "gamma"]).await.unwrap_err();
+        assert!(err.to_string().contains("differ in length"), "{err}");
+        assert_eq!(
+            count(&store, "embedding_cache").await,
+            1,
+            "nothing mixed is cached"
+        );
+    }
+
+    #[test]
+    fn schema_key_ignores_key_order_and_dialect() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"why": {"type": "string"}, "what": {"type": "string"}},
+            "required": ["what", "why"]
+        });
+        let reordered = json!({
+            "required": ["what", "why"],
+            "properties": {"what": {"type": "string"}, "why": {"type": "string"}},
+            "type": "object",
+            "$schema": "http://json-schema.org/draft-07/schema#"
+        });
+        assert_eq!(canonical_schema(&schema), canonical_schema(&reordered));
+        assert_eq!(
+            canonical_schema(&schema),
+            r#"{"properties":{"what":{"type":"string"},"why":{"type":"string"}},"required":["what","why"],"type":"object"}"#
+        );
+    }
+
+    /// A one-shot HTTP server on localhost answering one connection per
+    /// `(status, body)`; returns its URL and the number of requests served.
+    fn serve(responses: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, served)
+    }
+
+    fn quick_backend(url: &str) -> OllamaBackend {
+        let mut backend = OllamaBackend::new(url).unwrap();
+        backend.retry_backoff = Duration::ZERO;
+        backend
+    }
+
+    const BUSY: &str = r#"{"error": {"message": "server busy"}}"#;
+    const EMBEDDED: &str = r#"{"data": [{"embedding": [0.5], "index": 0}]}"#;
+
+    #[tokio::test]
+    async fn backend_retries_a_503_once() {
+        let texts = ["x".to_string()];
+        let (url, served) = serve(vec![(503, BUSY), (200, EMBEDDED)]);
+        let vectors = quick_backend(&url).embed("m", &texts).await.unwrap();
+        assert_eq!(vectors, vec![vec![0.5]]);
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+
+        let (url, served) = serve(vec![(503, BUSY), (503, BUSY), (200, EMBEDDED)]);
+        let err = quick_backend(&url).embed("m", &texts).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("HTTP 503: server busy"),
+            "{err:#}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn backend_does_not_retry_client_errors() {
+        let texts = ["x".to_string()];
+        let missing = r#"{"error": {"message": "model 'm' not found"}}"#;
+        let (url, served) = serve(vec![(404, missing), (200, EMBEDDED)]);
+        let err = quick_backend(&url).embed("m", &texts).await.unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP 404"), "{err:#}");
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert!(!transient_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!transient_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(transient_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[tokio::test]
+    async fn backend_retries_a_refused_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let backend = quick_backend(&url);
+        let err = backend
+            .post_once(&backend.url("embeddings"), &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.1, "a refused connection is transient: {:#}", err.0);
+        let err = backend.embed("m", &["x".to_string()]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("calling"), "{err:#}");
+    }
+
     #[test]
     fn vectors_round_trip_as_little_endian_f32() {
         let vector = vec![1.5, -0.25, f32::MIN_POSITIVE];
@@ -1084,8 +1618,17 @@ mod tests {
         });
         assert_eq!(
             parse_chat_response(&response).unwrap(),
-            "{\n  \"sentence\": \"The sky is blue.\"\n}"
+            ChatReply {
+                content: "{\n  \"sentence\": \"The sky is blue.\"\n}".to_string(),
+                finish_reason: Some("stop".to_string()),
+                prompt_tokens: Some(21),
+                completion_tokens: Some(82),
+            }
         );
+        let cut = json!({"choices": [{"message": {"content": "{"}, "finish_reason": "length"}]});
+        let cut = parse_chat_response(&cut).unwrap();
+        assert!(cut.truncated());
+        assert_eq!(cut.prompt_tokens, None);
         assert!(parse_chat_response(&json!({"choices": []})).is_err());
         assert!(parse_chat_response(&json!({"choices": [{"message": {}}]})).is_err());
     }
@@ -1189,7 +1732,7 @@ mod tests {
     async fn completes_a_real_struct_and_caches_it() {
         let config = live_config();
         let (_dir, store) = store().await;
-        let llm = LlmClient::from_config(&config, store.cache().clone()).unwrap();
+        let llm = LlmClient::from_config(&config, store.connect_cache().unwrap()).unwrap();
         let prompt = "Summarise this Java class for a code index.\n\n\
             @Repository\npublic interface UserRepository extends JpaRepository<User, Long> {\n\
             \x20   Optional<User> findByEmail(String email);\n}";
@@ -1218,7 +1761,7 @@ mod tests {
     async fn embeds_real_texts_and_caches_them() {
         let config = live_config();
         let (_dir, store) = store().await;
-        let llm = LlmClient::from_config(&config, store.cache().clone()).unwrap();
+        let llm = LlmClient::from_config(&config, store.connect_cache().unwrap()).unwrap();
         let texts = ["Loads a user by email.", "Sends the invoice by mail.", ""];
 
         let start = Instant::now();
