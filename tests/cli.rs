@@ -291,56 +291,71 @@ fn embedding_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>
     (url, served)
 }
 
-#[tokio::test]
-async fn eval_scores_a_golden_set_through_search() {
-    let dir = workspace();
-    let index = annatar(dir.path(), &["index", "--no-llm"]);
-    assert!(index.status.success(), "{}", text(&index.stderr));
+/// Point `dir`'s config at a fresh [`embedding_server`] and give every
+/// symbol n of its index the vector [1, n, 0], so against the server's
+/// query vector [1, 0, 0] the symbols rank in id order. Returns the
+/// server's request counter and every symbol's fqn and file in id order.
+async fn with_vectors(
+    dir: &Path,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    Vec<(String, String)>,
+) {
     let (url, served) = embedding_server();
     std::fs::write(
-        dir.path().join("annatar.toml"),
+        dir.join("annatar.toml"),
         format!(
             "repo = \"repo\"\ndata_dir = \"data\"\n\n[ollama]\nurl = \"{url}\"\nchat_model = \"chat\"\nembedding_model = \"embed\"\n"
         ),
     )
     .unwrap();
-    // Symbol n gets [1, n, 0]: against the query [1, 0, 0] the symbols rank
-    // in id order.
-    let order = {
-        let db = libsql::Builder::new_local(dir.path().join("data").join(annatar::store::INDEX_DB))
-            .build()
-            .await
-            .unwrap();
-        let conn = db.connect().unwrap();
-        annatar::schema::create_vectors(&conn, 3).await.unwrap();
+    let db = libsql::Builder::new_local(dir.join("data").join(annatar::store::INDEX_DB))
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    annatar::schema::create_vectors(&conn, 3).await.unwrap();
+    conn.execute(
+        "INSERT INTO symbol_vectors (symbol_id, embedding) SELECT id, vector32('[1, ' || id || ', 0]') FROM symbols",
+        (),
+    )
+    .await
+    .unwrap();
+    for (key, value) in [
+        (annatar::schema::META_EMBEDDING_MODEL, "embed"),
+        (annatar::schema::META_EMBEDDING_DIM, "3"),
+        (annatar::schema::META_EMBEDDING_PARENT_DESCRIPTION, "false"),
+    ] {
         conn.execute(
-            "INSERT INTO symbol_vectors (symbol_id, embedding) SELECT id, vector32('[1, ' || id || ', 0]') FROM symbols",
-            (),
+            "INSERT INTO index_meta (key, value) VALUES (?1, ?2)",
+            libsql::params![key, value],
         )
         .await
         .unwrap();
-        for (key, value) in [
-            (annatar::schema::META_EMBEDDING_MODEL, "embed"),
-            (annatar::schema::META_EMBEDDING_DIM, "3"),
-            (annatar::schema::META_EMBEDDING_PARENT_DESCRIPTION, "false"),
-        ] {
-            conn.execute(
-                "INSERT INTO index_meta (key, value) VALUES (?1, ?2)",
-                libsql::params![key, value],
-            )
-            .await
-            .unwrap();
+    }
+    let mut rows = conn
+        .query("SELECT fqn, file FROM symbols ORDER BY id", ())
+        .await
+        .unwrap();
+    let mut order = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        order.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+    }
+    (served, order)
+}
+
+#[tokio::test]
+async fn eval_scores_a_golden_set_through_search() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    let (served, order) = with_vectors(dir.path()).await;
+    let mut files: Vec<&str> = Vec::new();
+    for (_, file) in &order {
+        if !files.contains(&file.as_str()) {
+            files.push(file);
         }
-        let mut rows = conn
-            .query("SELECT fqn FROM symbols ORDER BY id", ())
-            .await
-            .unwrap();
-        let mut order = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            order.push(row.get::<String>(0).unwrap());
-        }
-        order
-    };
+    }
     let golden =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/sample.toml");
     let set = annatar::golden::GoldenSet::load(&golden).unwrap();
@@ -348,24 +363,35 @@ async fn eval_scores_a_golden_set_through_search() {
     let eval = annatar(dir.path(), &["eval", "-k", "20", golden.to_str().unwrap()]);
 
     assert!(eval.status.success(), "{}", text(&eval.stderr));
-    let rank = |fqn: &str| order.iter().position(|other| other == fqn).unwrap() + 1;
+    let rank = |fqn: &str| order.iter().position(|(other, _)| other == fqn).unwrap() + 1;
+    let file_rank = |fqn: &str| {
+        let file = &order.iter().find(|(other, _)| other == fqn).unwrap().1;
+        files.iter().position(|other| other == file).unwrap() + 1
+    };
     let mut expected =
         "eval: embedding_model=embed dim=3 parent_description=false k=20\n".to_string();
     for (number, question) in set.questions().iter().enumerate() {
         let primary = rank(question.primary());
         let any = question.expect().iter().map(|fqn| rank(fqn)).min().unwrap();
+        let primary_file = file_rank(question.primary());
+        let any_file = question
+            .expect()
+            .iter()
+            .map(|fqn| file_rank(fqn))
+            .min()
+            .unwrap();
         let group = if question.primary().contains('#') {
             "members"
         } else {
             "types"
         };
         expected.push_str(&format!(
-            "{}. {primary} {any} [{group}] {}",
+            "{}. {primary} {any} file {primary_file} {any_file} [{group}] {}",
             number + 1,
             question.primary()
         ));
         if primary != 1 {
-            expected.push_str(&format!(" top={}", order[0]));
+            expected.push_str(&format!(" top={}", order[0].0));
         }
         expected.push('\n');
     }
@@ -375,13 +401,17 @@ async fn eval_scores_a_golden_set_through_search() {
         "{stdout}\nexpected:\n{expected}"
     );
     let summaries: Vec<&str> = stdout.lines().skip(set.questions().len() + 1).collect();
-    assert_eq!(summaries.len(), 3, "{stdout}");
+    assert_eq!(summaries.len(), 6, "{stdout}");
     assert!(
         summaries[0].starts_with("all 5: primary top-1 "),
         "{stdout}"
     );
     assert!(summaries[1].starts_with("types 2: "), "{stdout}");
     assert!(summaries[2].starts_with("members 3: "), "{stdout}");
+    assert!(
+        summaries[3].starts_with("files all 5: primary top-1 "),
+        "{stdout}"
+    );
     assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 5);
 }
 
@@ -435,4 +465,54 @@ fn eval_takes_no_path() {
         text(&eval.stderr),
         "error: eval scores the whole index and takes no --path\n"
     );
+}
+
+#[tokio::test]
+async fn search_prints_files_by_default_and_symbols_on_request() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    let (served, _) = with_vectors(dir.path()).await;
+
+    let files = annatar(dir.path(), &["search", "-k", "2", "users"]);
+    let symbols = annatar(dir.path(), &["search", "--symbols", "-k", "3", "users"]);
+
+    assert!(files.status.success(), "{}", text(&files.stderr));
+    assert_eq!(
+        text(&files.stdout),
+        "\
+1. 0.707 src/main/java/com/acme/sample/User.java
+   class com.acme.sample.User [entity] :10-25 *0.707
+     #getId() :18-20 *0.447
+     #getName() :22-24 *0.316
+2. 0.243 src/main/java/com/acme/sample/UserController.java
+   class com.acme.sample.UserController [controller] :13-41 *0.243
+     #<init>(UserService) :18-20 *0.196
+     #list() :25-28 *0.164
+     #get(Long) :30-33 *0.141
+     class ErrorResponse :38-40 *0.124
+"
+    );
+    assert!(symbols.status.success(), "{}", text(&symbols.stderr));
+    assert_eq!(
+        text(&symbols.stdout),
+        "\
+1. 0.707 com.acme.sample.User [class] role=entity src/main/java/com/acme/sample/User.java:10-25
+2. 0.447 com.acme.sample.User#getId() [method] src/main/java/com/acme/sample/User.java:18-20
+3. 0.316 com.acme.sample.User#getName() [method] src/main/java/com/acme/sample/User.java:22-24
+"
+    );
+
+    let many = annatar(dir.path(), &["search", "-k", "21", "users"]);
+    assert_eq!(many.status.code(), Some(2));
+    assert_eq!(text(&many.stdout), "");
+    assert!(
+        text(&many.stderr).contains("search prints at most 20 files; use --symbols"),
+        "{}",
+        text(&many.stderr)
+    );
+    let many = annatar(dir.path(), &["search", "--symbols", "-k", "21", "users"]);
+    assert!(many.status.success(), "{}", text(&many.stderr));
+    assert_eq!(text(&many.stdout).lines().count(), 14);
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
 }

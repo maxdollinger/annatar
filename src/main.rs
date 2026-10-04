@@ -4,7 +4,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::builder::PossibleValuesParser;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
 use annatar::config::Config;
 use annatar::golden::GoldenSet;
@@ -60,9 +61,11 @@ enum Command {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
         fqn: String,
     },
-    /// Search symbol descriptions by meaning: the most similar symbols, each
-    /// as `rank. score fqn [kind] role=… file:start-end` with its description
-    /// on the next line.
+    /// Search symbol descriptions by meaning and print the files of the
+    /// best matches: per file `rank. score path`, its top-level type as
+    /// `kind fqn [role] :start-end` with its description, then its members
+    /// and nested types with their lines; matching symbols end with
+    /// `*score`. `--symbols` prints the matching symbols instead.
     Search {
         /// Plain-language query.
         query: String,
@@ -73,14 +76,20 @@ enum Command {
         /// constructors (repeatable).
         #[arg(long, value_name = "ROLE", value_parser = PossibleValuesParser::new(Role::ALL.map(|role| role.as_str())))]
         role: Vec<String>,
-        /// Number of results.
-        #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_limit)]
-        limit: usize,
+        /// Number of results: files (default 5, at most 20), or symbols
+        /// with `--symbols` (default 10, at most 100).
+        #[arg(short = 'k', long, value_name = "N", value_parser = parse_limit)]
+        limit: Option<usize>,
+        /// Print the most similar symbols, each as `rank. score fqn [kind]
+        /// role=… file:start-end` with its description on the next line.
+        #[arg(long)]
+        symbols: bool,
     },
     /// Score retrieval against a golden set: every question runs through
-    /// `search`; prints per question the rank of its first expected fqn and
-    /// the best rank of any (`-` = not in the top N), then top-1, top-5 and
-    /// MRR for all questions, types and members.
+    /// `search --symbols` and `search`; prints per question the rank of its
+    /// first expected fqn and the best rank of any (`-` = not in the top N),
+    /// the same for their files, then top-1, top-5 and MRR for all
+    /// questions, types and members, by symbol and by file.
     Eval {
         /// The golden set (TOML, see `golden`).
         golden: PathBuf,
@@ -111,6 +120,24 @@ fn parse_limit_from(text: &str, min: usize) -> Result<usize, String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Search {
+        limit: Some(limit),
+        symbols: false,
+        ..
+    } = cli.command
+        && limit > search::MAX_FILES
+    {
+        Cli::command()
+            .error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "-k {limit}: search prints at most {} files; use --symbols for up to {} symbols",
+                    search::MAX_FILES,
+                    search::MAX_LIMIT
+                ),
+            )
+            .exit();
+    }
     init_logging(cli.verbose);
     match run(&cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -233,6 +260,7 @@ async fn run(cli: &Cli) -> Result<()> {
             kind,
             role,
             limit,
+            symbols,
         } => {
             let ollama = config
                 .ollama
@@ -251,12 +279,28 @@ async fn run(cli: &Cli) -> Result<()> {
             };
             let reader = IndexReader::open(&config.data_dir).await?;
             let embedder = QueryEmbedder::from_config(ollama).await?;
-            let hits =
-                search::search(reader.connection(), &embedder, query, &filter, *limit).await?;
-            if hits.is_empty() {
-                eprintln!("no symbol matches the filter");
+            if *symbols {
+                let limit = limit.unwrap_or(search::DEFAULT_LIMIT);
+                let hits =
+                    search::search(reader.connection(), &embedder, query, &filter, limit).await?;
+                if hits.is_empty() {
+                    eprintln!("no symbol matches the filter");
+                }
+                print!("{}", search::format_hits(&hits));
+            } else {
+                let limit = limit.unwrap_or(search::DEFAULT_FILES);
+                let groups =
+                    search::search_files(reader.connection(), &embedder, query, &filter, limit)
+                        .await?;
+                let symbols = search::group_symbols(reader.connection(), &groups).await?;
+                if groups.is_empty() {
+                    eprintln!("no symbol matches the filter");
+                }
+                print!(
+                    "{}",
+                    search::format_files(&groups, &symbols, search::MEMBER_LINES)
+                );
             }
-            print!("{}", search::format_hits(&hits));
         }
         Command::Eval { golden, limit } => {
             if cli.path.is_some() {

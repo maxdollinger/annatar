@@ -29,15 +29,35 @@ annatar index --path src/main/java/com/acme   # only part of the repo
 annatar index --offline                   # no Jira requests; cached tickets only
 annatar index --no-llm                    # no chat or embedding calls; cached summaries, descriptions and embeddings only
 annatar show com.acme.user.UserRepository     # a symbol, its children (with descriptions), commits and tickets (with summaries)
-annatar search "who deletes expired tokens"   # the 10 symbols whose descriptions match best
-annatar search -k 5 --kind method --role repository "delete expired tokens"
+annatar search "who deletes expired tokens"   # the 5 files whose symbols match best, with their outline
+annatar search --symbols "who deletes expired tokens"   # the 10 symbols whose descriptions match best
+annatar search -k 3 --kind method --role repository "delete expired tokens"
 annatar --path src/main/java/com/acme/token search "delete expired tokens"   # only symbols in files under the prefix
 annatar eval golden.toml                  # retrieval quality: top-1 / top-5 / MRR of a golden set
 ```
 
 Results go to stdout, logs (`-v`, `RUST_LOG`) to stderr, without colours unless stderr is a terminal. A failing command prints one line, `error: …`, on stderr and exits with 1 (2 for a usage error such as an unknown `--kind`); warnings logged on the way (e.g. a retried request) may come before it.
 
-`search` embeds the query with `ollama.embedding_model` and prints the most similar symbols, most similar first, two lines each:
+`search` embeds the query with `ollama.embedding_model`, finds the most similar symbols and prints the files they are in, best file first:
+
+```text
+1. 0.770 src/main/java/com/acme/token/TokenCleanup.java
+   class com.acme.token.TokenCleanup [service] :18-48 *0.758
+     Deletes expired user tokens from the database periodically.
+     #<init>(TokenRepository) :24-27
+     #deleteExpiredTokens() :32-37 *0.770
+     enum Mode :40-47
+       #isStrict() :44-46
+2. 0.701 src/main/java/com/acme/token/TokenRepository.java
+   interface com.acme.token.TokenRepository [repository] :9-20
+     Reads and deletes stored user tokens.
+     #deleteByExpirationDateBefore(ZonedDateTime) :15-15 *0.701
+     #findByUserId(UUID) :17-17
+```
+
+Per file: its rank, its best symbol's cosine similarity (1 = identical) and its path; then each top-level type of the file in source order as `kind fqn [role] :start-end` (the role only when the type has a Spring role) with its description on the next line; under it every member (methods, constructors) and nested type of the file in source order, one line each without a description: the part of the fqn after its enclosing type (`#name(params)`, a constructor `#<init>(params)`, a nested type `kind Name [role]`) and its lines, indented two more spaces per nesting level. A symbol that matched the query ends with `*score`: the hits that rank above the best hit of the first file not shown, so every file has at least one. A file with more than 40 member and nested-type lines shows its matching symbols and the first lines in source order up to 40, then `… N more` (`show` on the type lists all). Files are ranked from the 100 most similar symbols by their best one. `-k/--limit` sets the number of files (default 5, at most 20).
+
+`--symbols` prints the most similar symbols instead, two lines each:
 
 ```text
 1. 0.770 com.acme.token.TokenCleanup#deleteExpiredTokens() [method] src/main/java/com/acme/token/TokenCleanup.java:32-37
@@ -46,7 +66,9 @@ Results go to stdout, logs (`-v`, `RUST_LOG`) to stderr, without colours unless 
    Deletes expired user tokens from the database periodically.
 ```
 
-rank, cosine similarity (1 = identical), fqn, `[kind]`, `role=<role>` when the symbol has a Spring role, `file:start-end`; the fqn is the third space-separated field, and the location is everything after the `[kind]` and `role=` tokens (a path may contain spaces); then the description on one line, indented by three spaces. `-k/--limit` sets the number of results (default 10, at most 100). `--kind` (`class`, `interface`, `enum`, `record`, `annotation`, `method`, `constructor`) and `--role` (`controller`, `service`, `repository`, `component`, `configuration`, `entity`; a method or constructor matches by its enclosing type's own role, so members of a nested type match by the nested type's role) filter the results and may be repeated. The global `--path <PREFIX>` applies to `search` too: only symbols in files at or under the prefix (whole path components; relative to the repository or absolute inside it; `.` or the repository itself means no filter; a prefix outside the repository, also by `..`, is an error). A filter that matches nothing prints nothing on stdout and a note on stderr. `search` needs the `[ollama]` section and a reachable server; it reads only `index.db` (the query's vector is not cached) and refuses an index without vectors, or one embedded with another `embedding_model` or dimension. Use `show <fqn>` on a result for the detail view (description, parent, children, file and lines, commits, tickets).
+rank, cosine similarity, fqn, `[kind]`, `role=<role>` when the symbol has a Spring role, `file:start-end`; the fqn is the third space-separated field, and the location is everything after the `[kind]` and `role=` tokens (a path may contain spaces); then the description on one line, indented by three spaces. With `--symbols`, `-k` is the number of symbols (default 10, at most 100).
+
+`--kind` (`class`, `interface`, `enum`, `record`, `annotation`, `method`, `constructor`) and `--role` (`controller`, `service`, `repository`, `component`, `configuration`, `entity`; a method or constructor matches by its enclosing type's own role, so members of a nested type match by the nested type's role) filter which symbols can match and may be repeated; in the file output they decide which files rank and which symbols are marked, while each file is still shown whole. The global `--path <PREFIX>` applies to `search` too: only symbols in files at or under the prefix (whole path components; relative to the repository or absolute inside it; `.` or the repository itself means no filter; a prefix outside the repository, also by `..`, is an error). A filter that matches nothing prints nothing on stdout and a note on stderr. `search` needs the `[ollama]` section and a reachable server; it reads only `index.db` (the query's vector is not cached) and refuses an index without vectors, or one embedded with another `embedding_model` or dimension. Use `show <fqn>` on a type or member for the detail view (description, parent, children, file and lines, commits, tickets).
 
 `index` fetches every ticket key found in the history from Jira once and caches it in `cache.db` (403/404 and other permanent failures — another 4xx except 408/425/429, an issue that does not parse — are cached as unavailable; 5xx, timeouts, 429 and non-JSON answers are retried next run), so later runs make no Jira requests for known keys; the `tickets:` line of its output counts cached, fetched, unavailable and failed keys and the Jira requests made. Without a `[jira]` section or without `ANNATAR_JIRA_TOKEN` it warns once and uses cached tickets only; `--offline` does the same on purpose. Before fetching, `index` checks the credentials once (`/rest/api/2/myself`, retried on 429 like fetches); rejected credentials fail the run and nothing is cached. If Jira is unreachable or still rate limiting after retries, `index` stops fetching for that run with one warning, counts the remaining keys as not fetched and retries them next run. `show` lists each ticket with its type and summary, or `(unavailable)`.
 
@@ -54,19 +76,22 @@ rank, cosine similarity (1 = identical), fqn, `[kind]`, `role=<role>` when the s
 
 A golden set (questions with the fqns that answer them, the benchmark retrieval is measured against) is a TOML file of `[[question]]` tables (`text`, `expect` = the fqn the question is about first, then acceptable alternates, optional `kind` and `note`; see `src/golden.rs` and `tests/fixtures/golden/sample.toml`). A real set names a private repository's symbols and stays out of git (`.annatar-local/` is ignored). Check it against a full index (a run without `--path`) with `ANNATAR_GOLDEN_SET=<set.toml> ANNATAR_GOLDEN_DATA_DIR=<data dir holding index.db> cargo test real_golden_set -- --ignored`: it fails on any expected fqn the index does not hold and on a first fqn of another kind.
 
-`annatar eval <golden.toml>` measures retrieval against a golden set: it runs that check first (any problem is the error, nothing is searched), then searches every question exactly like `annatar search "<question>"` (no filter, `-k` hits, default 10, at least 5 because the summary counts top-5) and prints one line per question and three summary lines:
+`annatar eval <golden.toml>` measures retrieval against a golden set: it runs that check first (any problem is the error, nothing is searched), then searches every question exactly like `annatar search --symbols "<question>"` (no filter, `-k` hits, default 10, at least 5 because the summary counts top-5) and like `annatar search "<question>"` (the same number of files) and prints one line per question and six summary lines:
 
 ```text
 eval: embedding_model=bge-m3:latest dim=1024 parent_description=false k=10
-1. 1 1 [members] com.acme.token.TokenCleanup#deleteExpiredTokens()
-2. 3 1 [types] com.acme.token.TokenCleanup top=com.acme.token.TokenCleanup#deleteExpiredTokens()
-3. - - [types] com.acme.user.User top=com.acme.user.UserService
+1. 1 1 file 1 1 [members] com.acme.token.TokenCleanup#deleteExpiredTokens()
+2. 3 1 file 1 1 [types] com.acme.token.TokenCleanup top=com.acme.token.TokenCleanup#deleteExpiredTokens()
+3. - - file 4 2 [types] com.acme.user.User top=com.acme.user.UserService
 all 3: primary top-1 1 top-5 2 mrr 0.444; any top-1 2 top-5 2 mrr 0.667
 types 2: primary top-1 0 top-5 1 mrr 0.167; any top-1 1 top-5 1 mrr 0.500
 members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
+files all 3: primary top-1 2 top-5 3 mrr 0.750; any top-1 2 top-5 3 mrr 0.833
+files types 2: primary top-1 1 top-5 2 mrr 0.625; any top-1 1 top-5 2 mrr 0.750
+files members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
 ```
 
-the index's embedding settings and `k`; per question its number, the rank of the first expected fqn (primary), the best rank of any expected fqn (`-` = not in the top `k`), `types` or `members` (by the primary fqn), the primary fqn and, when it is not first, the first hit; then for all questions, types and members the number of questions, top-1 and top-5 counts and the mean reciprocal rank (a miss counts 0, so MRR depends on `k`), for the primary and for any expected fqn. It needs the `[ollama]` section like `search` and takes no `--path`.
+the index's embedding settings and `k`; per question its number, the rank of the first expected fqn (primary), the best rank of any expected fqn (`-` = not in the top `k`), after `file` the rank of the primary's file and the best rank of a file holding any expected fqn among the `k` files of the file output, `types` or `members` (by the primary fqn), the primary fqn and, when it is not first, the first hit; then for all questions, types and members the number of questions, top-1 and top-5 counts and the mean reciprocal rank (a miss counts 0, so MRR depends on `k`), for the primary and for any expected fqn, first by symbol, then (`files …`) by file. It needs the `[ollama]` section like `search` and takes no `--path`.
 
 `--path <PREFIX>` is for fast iteration on part of the repo, not for refreshing a slice: a `--path` run still replaces the whole `index.db`, which then holds only that prefix (empty if the prefix matches nothing). The run logs a warning saying so; run `annatar index` without `--path` to get the full index back.
 

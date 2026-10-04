@@ -8,9 +8,14 @@
 //! types and members (methods, constructors) apart. [`golden::check_index`]
 //! runs first, so an expected symbol the index does not hold fails the
 //! evaluation instead of counting as a miss.
+//!
+//! 5.5 adds file-level scores: every question also runs through
+//! [`search::search_files`], the ranking of `annatar search`'s default
+//! output, and is scored by the rank of the file holding its first expected
+//! fqn and the best rank of a file holding any expected fqn.
 
-use anyhow::{Result, bail};
-use libsql::Connection;
+use anyhow::{Context, Result, bail};
+use libsql::{Connection, params};
 
 use crate::golden::{self, GoldenSet, Question};
 use crate::schema;
@@ -53,20 +58,40 @@ pub struct Outcome {
     pub primary_rank: Option<usize>,
     /// Best rank of any expected fqn.
     pub any_rank: Option<usize>,
+    /// Rank of the file holding the first expected fqn.
+    pub primary_file_rank: Option<usize>,
+    /// Best rank of a file holding any expected fqn.
+    pub any_file_rank: Option<usize>,
     /// The first hit, when it is not the primary.
     pub top: Option<String>,
 }
 
-/// Score `question` against `hits`, the fqns in rank order.
-pub fn score(question: &Question, hits: &[String]) -> Outcome {
-    let rank = |fqn: &str| hits.iter().position(|hit| hit == fqn).map(|i| i + 1);
-    let primary_rank = rank(question.primary());
-    let any_rank = question.expect().iter().filter_map(|fqn| rank(fqn)).min();
+/// Score `question` against `hits`, the fqns in rank order, and `files`,
+/// the files of a file-level search in rank order; `expect_files` are the
+/// files of the question's expected fqns, in `expect` order.
+pub fn score(
+    question: &Question,
+    hits: &[String],
+    files: &[String],
+    expect_files: &[String],
+) -> Outcome {
+    let rank = |list: &[String], item: &str| list.iter().position(|hit| hit == item).map(|i| i + 1);
+    let primary_rank = rank(hits, question.primary());
+    let any_rank = question
+        .expect()
+        .iter()
+        .filter_map(|fqn| rank(hits, fqn))
+        .min();
     Outcome {
         group: Group::of(question),
         primary: question.primary().to_string(),
         primary_rank,
         any_rank,
+        primary_file_rank: expect_files.first().and_then(|file| rank(files, file)),
+        any_file_rank: expect_files
+            .iter()
+            .filter_map(|file| rank(files, file))
+            .min(),
         top: hits
             .first()
             .filter(|top| top.as_str() != question.primary())
@@ -111,6 +136,10 @@ pub struct Summary {
     pub questions: usize,
     pub primary: Scores,
     pub any: Scores,
+    /// File-level scores of the primary's file.
+    pub primary_file: Scores,
+    /// File-level scores of any expected fqn's file.
+    pub any_file: Scores,
 }
 
 /// One summary for all outcomes, then one for types and one for members.
@@ -131,6 +160,8 @@ pub fn summarize(outcomes: &[Outcome]) -> Vec<Summary> {
             questions: chosen.len(),
             primary: Scores::of(&ranks(|outcome| outcome.primary_rank)),
             any: Scores::of(&ranks(|outcome| outcome.any_rank)),
+            primary_file: Scores::of(&ranks(|outcome| outcome.primary_file_rank)),
+            any_file: Scores::of(&ranks(|outcome| outcome.any_file_rank)),
         }
     };
     vec![
@@ -141,8 +172,9 @@ pub fn summarize(outcomes: &[Outcome]) -> Vec<Summary> {
 }
 
 /// Check `set` against the index on `conn`, then search every question with
-/// `limit` hits and score it. Any [`golden::IndexProblem`] fails before the
-/// first search.
+/// `limit` hits and `limit` files and score it. Any [`golden::IndexProblem`]
+/// fails before the first search. The query is embedded once per question
+/// (the embedder caches it for the file-level search).
 pub async fn evaluate(
     conn: &Connection,
     embedder: &QueryEmbedder,
@@ -167,9 +199,33 @@ pub async fn evaluate(
             .into_iter()
             .map(|hit| hit.fqn)
             .collect::<Vec<_>>();
-        outcomes.push(score(question, &hits));
+        let files =
+            search::search_files(conn, embedder, question.text(), &Filter::default(), limit)
+                .await?
+                .into_iter()
+                .map(|group| group.file)
+                .collect::<Vec<_>>();
+        let mut expect_files = Vec::with_capacity(question.expect().len());
+        for fqn in question.expect() {
+            expect_files.push(file_of(conn, fqn).await?);
+        }
+        outcomes.push(score(question, &hits, &files, &expect_files));
     }
     Ok(outcomes)
+}
+
+/// The file of the symbol `fqn`, which the index holds.
+async fn file_of(conn: &Connection, fqn: &str) -> Result<String> {
+    let mut rows = conn
+        .query("SELECT file FROM symbols WHERE fqn = ?1", params![fqn])
+        .await
+        .with_context(|| format!("reading the file of {fqn}"))?;
+    let row = rows
+        .next()
+        .await
+        .context("reading symbols row")?
+        .with_context(|| format!("{fqn} is not in the index"))?;
+    row.get(0).context("reading symbols.file")
 }
 
 /// The index's embedding settings and the hits searched per question as one
@@ -190,26 +246,32 @@ pub async fn settings_line(conn: &Connection, limit: usize) -> Result<String> {
 /// The outcomes, one line per question in set order, then the summaries:
 ///
 /// ```text
-/// 1. 1 1 [members] com.acme.UserService#find(Long)
-/// 2. 3 1 [types] com.acme.UserService top=com.acme.UserController
-/// 3. - - [types] com.acme.User top=com.acme.UserService
+/// 1. 1 1 file 1 1 [members] com.acme.UserService#find(Long)
+/// 2. 3 1 file 1 1 [types] com.acme.UserService top=com.acme.UserController
+/// 3. - - file 4 2 [types] com.acme.User top=com.acme.UserService
 /// all 3: primary top-1 1 top-5 2 mrr 0.444; any top-1 2 top-5 2 mrr 0.667
 /// types 2: …
 /// members 1: …
+/// files all 3: primary top-1 2 top-5 3 mrr 0.750; any …
+/// files types 2: …
+/// files members 1: …
 /// ```
 ///
 /// question number, primary rank, best rank of any expected fqn (`-` when
-/// not within the hits), the group, the primary fqn and, when it is not
-/// first, the first hit.
+/// not within the hits), the same two ranks for their files among the
+/// file-level results, the group, the primary fqn and, when it is not
+/// first, the first hit; then the symbol summaries and the file summaries.
 pub fn format_report(outcomes: &[Outcome]) -> String {
     let rank = |rank: Option<usize>| rank.map_or("-".to_string(), |rank| rank.to_string());
     let mut out = String::new();
     for (number, outcome) in outcomes.iter().enumerate() {
         out.push_str(&format!(
-            "{}. {} {} [{}] {}",
+            "{}. {} {} file {} {} [{}] {}",
             number + 1,
             rank(outcome.primary_rank),
             rank(outcome.any_rank),
+            rank(outcome.primary_file_rank),
+            rank(outcome.any_file_rank),
             outcome.group.as_str(),
             outcome.primary
         ));
@@ -218,19 +280,29 @@ pub fn format_report(outcomes: &[Outcome]) -> String {
         }
         out.push('\n');
     }
-    for summary in summarize(outcomes) {
-        let scores = |scores: Scores| {
-            format!(
-                "top-1 {} top-5 {} mrr {:.3}",
-                scores.top1, scores.top5, scores.mrr
-            )
-        };
+    let scores = |scores: Scores| {
+        format!(
+            "top-1 {} top-5 {} mrr {:.3}",
+            scores.top1, scores.top5, scores.mrr
+        )
+    };
+    let summaries = summarize(outcomes);
+    for summary in &summaries {
         out.push_str(&format!(
             "{} {}: primary {}; any {}\n",
             summary.label,
             summary.questions,
             scores(summary.primary),
             scores(summary.any)
+        ));
+    }
+    for summary in &summaries {
+        out.push_str(&format!(
+            "files {} {}: primary {}; any {}\n",
+            summary.label,
+            summary.questions,
+            scores(summary.primary_file),
+            scores(summary.any_file)
         ));
     }
     out
@@ -278,28 +350,55 @@ expect = ["a.E"]
         };
 
         assert_eq!(
-            score(first, &hits(&["a.B#find(Long)", "a.B"])),
+            score(
+                first,
+                &hits(&["a.B#find(Long)", "a.B"]),
+                &hits(&["B.java"]),
+                &hits(&["B.java", "B.java"])
+            ),
             Outcome {
                 group: Group::Members,
                 primary: "a.B#find(Long)".to_string(),
                 primary_rank: Some(1),
                 any_rank: Some(1),
+                primary_file_rank: Some(1),
+                any_file_rank: Some(1),
                 top: None,
             }
         );
         assert_eq!(
-            score(second, &hits(&["a.X", "a.D", "a.C#run()", "a.Y", "a.C"])),
+            score(
+                second,
+                &hits(&["a.X", "a.D", "a.C#run()", "a.Y", "a.C"]),
+                &hits(&["X.java", "D.java", "C.java"]),
+                &hits(&["C.java", "C.java", "D.java"])
+            ),
             Outcome {
                 group: Group::Types,
                 primary: "a.C".to_string(),
                 primary_rank: Some(5),
                 any_rank: Some(2),
+                primary_file_rank: Some(3),
+                any_file_rank: Some(2),
                 top: Some("a.X".to_string()),
             }
         );
-        let miss = score(third, &hits(&["a.X"]));
-        assert_eq!((miss.primary_rank, miss.any_rank), (None, None));
-        assert_eq!(score(third, &[]).top, None);
+        let miss = score(
+            third,
+            &hits(&["a.X"]),
+            &hits(&["X.java"]),
+            &hits(&["E.java"]),
+        );
+        assert_eq!(
+            (
+                miss.primary_rank,
+                miss.any_rank,
+                miss.primary_file_rank,
+                miss.any_file_rank
+            ),
+            (None, None, None, None)
+        );
+        assert_eq!(score(third, &[], &[], &hits(&["E.java"])).top, None);
     }
 
     fn outcome(group: Group, primary: Option<usize>, any: Option<usize>) -> Outcome {
@@ -308,6 +407,8 @@ expect = ["a.E"]
             primary: "a.B".to_string(),
             primary_rank: primary,
             any_rank: any,
+            primary_file_rank: primary.map(|rank| rank.div_ceil(2)),
+            any_file_rank: any,
             top: None,
         }
     }
@@ -337,6 +438,9 @@ expect = ["a.E"]
         assert!((all.any.mrr - 2.5 / 4.0).abs() < 1e-9);
         assert_eq!((summaries[1].primary.top1, summaries[1].any.top5), (1, 2));
         assert_eq!((summaries[2].primary.top5, summaries[2].any.top1), (1, 1));
+        assert_eq!((all.primary_file.top1, all.primary_file.top5), (1, 3));
+        assert!((all.primary_file.mrr - (1.0 + 1.0 / 3.0 + 0.5) / 4.0).abs() < 1e-9);
+        assert_eq!(all.any_file, all.any);
         assert_eq!(summarize(&[])[1].primary, Scores::default());
     }
 
@@ -354,17 +458,22 @@ expect = ["a.E"]
         assert_eq!(
             format_report(&outcomes),
             "\
-1. 1 1 [members] a.B#find(Long)
-2. 3 1 [types] a.B top=a.X
-3. - - [types] a.B top=a.Y
+1. 1 1 file 1 1 [members] a.B#find(Long)
+2. 3 1 file 2 1 [types] a.B top=a.X
+3. - - file - - [types] a.B top=a.Y
 all 3: primary top-1 1 top-5 2 mrr 0.444; any top-1 2 top-5 2 mrr 0.667
 types 2: primary top-1 0 top-5 1 mrr 0.167; any top-1 1 top-5 1 mrr 0.500
 members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
+files all 3: primary top-1 1 top-5 2 mrr 0.500; any top-1 2 top-5 2 mrr 0.667
+files types 2: primary top-1 0 top-5 1 mrr 0.250; any top-1 1 top-5 1 mrr 0.500
+files members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
 "
         );
     }
 
-    /// An index of `rows` (fqn, kind, vector) with 3-dimensional vectors.
+    /// An index of `rows` (fqn, kind, vector) with 3-dimensional vectors,
+    /// each in the file named by its fqn's type (`a.Near#run()` in
+    /// `Near.java`).
     async fn index(rows: &[(&str, &str, [f32; 3])]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
@@ -374,8 +483,13 @@ members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
         for (id, (fqn, kind, vector)) in rows.iter().enumerate() {
             conn.execute(
                 "INSERT INTO symbols (id, kind, fqn, file, start_line, end_line, signature, content_hash)
-                 VALUES (?1, ?2, ?3, 'A.java', 1, 1, '', '')",
-                params![id as i64 + 1, *kind, *fqn],
+                 VALUES (?1, ?2, ?3, ?4, 1, 1, '', '')",
+                params![
+                    id as i64 + 1,
+                    *kind,
+                    *fqn,
+                    format!("{}.java", fqn.split(['.', '#']).nth(1).unwrap())
+                ],
             )
             .await
             .unwrap();
@@ -433,6 +547,7 @@ members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
             ("a.Near", "class", [2.0, 97.0, 1.0]),
             ("a.Near#run()", "method", [2.0, 90.0, 1.0]),
             ("a.Far", "class", [90.0, 2.0, 1.0]),
+            ("a.Mid", "class", [10.0, 97.0, 1.0]),
         ])
         .await;
         let reader = IndexReader::open(data.path()).await.unwrap();
@@ -464,6 +579,15 @@ expect = ["a.Far"]
             [(Some(2), Some(1)), (None, None)]
         );
         assert_eq!(outcomes[0].top.as_deref(), Some("a.Near"));
+        // Two files each: Near.java and Mid.java for "aa", Mid.java and
+        // Near.java for "bbbbbbbbbb", whose Far.java misses.
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| (outcome.primary_file_rank, outcome.any_file_rank))
+                .collect::<Vec<_>>(),
+            [(Some(1), Some(1)), (None, None)]
+        );
     }
 
     #[tokio::test]
