@@ -84,7 +84,8 @@ For a coding agent, add this to the repository's `AGENTS.md` / `CLAUDE.md`:
 
 `annatar` is an index of this repository: what each class and method does and why (from Jira tickets and commits).
 - `annatar search "<question>"` finds the relevant files. Use it before grepping.
-- `annatar show '<fqn>'` explains one symbol with its tickets and commits.
+- `annatar show '<fqn>'` explains one symbol with its tickets and commits, who uses it (`used by`) and what it uses.
+- `annatar trace '<fqn>'` lists its callers transitively, up to the entry points (`@Scheduled`, HTTP mappings, …).
 Descriptions can be wrong; the code is the source of truth.
 ```
 
@@ -92,11 +93,11 @@ Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only
 
 ## POC findings
 
-Measured on one Java/Spring repository (654 symbols, 69 tickets); details in [`md/state.md`](./md/state.md).
+Measured on one Java/Spring repository (654 symbols, 69 tickets); details in [`md/state.md`](./md/state.md) and, for usages, [`md/usages_state.md`](./md/usages_state.md).
 
 - **Descriptions:** generated for every class and method with no invalid replies. A full cold run takes about 20 minutes, and a rerun with a warm cache makes 0 LLM calls (about 2 s).
 - **Retrieval** (24 golden questions, `annatar eval`): search finds the right **file**, not the exact symbol. The expected file ranks first for 11 of 24 questions and is in the top 5 for 17 (20 counting alternates); the exact symbol ranks first for only 4. That is why `search` returns files.
-- **Agents** (4 tasks × 5 runs, Claude Code via the CLI): with Annatar, agents used about 40–45 % fewer tokens and tool calls, cost about 25–30 % less and were as correct or slightly more (37 vs 35 of 40). Reasons that live only in tickets were found only with Annatar (5/5 vs 0/5). The weak spot is tracing a call chain across files, where search can skip a step.
+- **Agents** (4 tasks × 5 runs, Claude Code via the CLI): with Annatar, agents used about 40–45 % fewer tokens and tool calls, cost about 25–30 % less and were as correct or slightly more (37 vs 35 of 40). Reasons that live only in tickets were found only with Annatar (5/5 vs 0/5). Tracing a call chain across files was the weak spot (search can skip a step). In a re-run of that task (5 runs) with `used by` in `show`, all 5 agents found the missing step (3 of 5 before) and got full marks, at about the same cost (+7 %, within the noise of 5 runs).
 - **Caveats:** small samples, one repository, tasks and questions written by the same author.
 
 ## Goals
