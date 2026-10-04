@@ -17,16 +17,11 @@ use ignore::{DirEntry, WalkBuilder};
 /// `com.acme.build` under `src/main/java` is still indexed.
 const SKIP_DIRS: &[&str] = &["build", "target", "generated", "generated-sources"];
 
-/// The directory pair that roots test code: `src/test`, at the repository
-/// root or in a module (`backend/src/test`).
-const TEST_DIRS: [&str; 2] = ["src", "test"];
-
 /// Every production `.java` file under `repo`, as paths relative to `repo`,
 /// sorted lexicographically.
 ///
 /// `.gitignore` is honoured (the `ignore` crate's standard filters), and the
-/// [`SKIP_DIRS`] and `src/test` trees (at any depth outside a source root)
-/// are excluded. `path_prefix`, when given,
+/// [`SKIP_DIRS`] trees and test source sets (see [`is_test`]) are excluded. `path_prefix`, when given,
 /// limits the result to files under that prefix; it may be relative to `repo`
 /// or an absolute path inside it. A prefix outside the repository, or one that
 /// matches nothing, yields an empty list rather than an error.
@@ -91,19 +86,41 @@ fn is_java(path: &Path) -> bool {
         .is_some_and(|extension| extension == "java")
 }
 
-/// Whether `path` lies in a `src/test` tree: a `src` directory directly
-/// followed by `test`, before any source root (a component named `java`), so
-/// a package `com.acme.src.test` under `src/main/java` is still production
-/// code.
+/// Whether `path` lies in a test source set.
+///
+/// The source set is the `<set>` of the first `src/<set>/java` directory
+/// triple (the source root), at the repository root or in a module
+/// (`backend/src/test/java`); without one, the first `src/<set>` pair
+/// (`src/test/kotlin`, `src/test/resources`). Only that set counts, so a
+/// package `com.acme.src.test` under `src/main/java` stays production code,
+/// and a module directory named `java` (`java/src/test/java`) does not hide
+/// the set. See [`is_test_set`] for the names.
 fn is_test(path: &Path) -> bool {
-    let names: Vec<_> = path
-        .components()
+    let dirs: Vec<_> = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
         .map(|component| component.as_os_str())
-        .take_while(|name| *name != "java")
         .collect();
-    names
-        .windows(2)
-        .any(|pair| pair[0] == TEST_DIRS[0] && pair[1] == TEST_DIRS[1])
+    dirs.windows(3)
+        .find(|triple| triple[0] == "src" && triple[2] == "java")
+        .or_else(|| dirs.windows(2).find(|pair| pair[0] == "src"))
+        .is_some_and(|window| is_test_set(&window[1].to_string_lossy()))
+}
+
+/// Whether a source set named `set` holds tests: `test`, or `test` as the
+/// first or last word of a camelCase, kebab or snake name (Gradle's
+/// `testFixtures`, `integrationTest`, `androidTest`; `test-fixtures`,
+/// `integration_test`). `testing`, `testng` and `contest` are not.
+fn is_test_set(set: &str) -> bool {
+    let starts = set
+        .strip_prefix("test")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|next| !next.is_ascii_lowercase());
+    let ends = ["Test", "-test", "_test"]
+        .iter()
+        .any(|suffix| set.len() > suffix.len() && set.ends_with(suffix));
+    set == "test" || starts || ends
 }
 
 /// Whether `entry` is a directory to prune from the walk.
@@ -409,6 +426,73 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a prefix matching nothing should be empty"
+        );
+    }
+
+    #[test]
+    fn test_source_sets_are_found_by_their_source_root() {
+        for test in [
+            "src/test/java/A.java",
+            "java/src/test/java/A.java",
+            "backend/src/test/resources/A.java",
+            "src/test/kotlin/A.java",
+            "src/integrationTest/java/A.java",
+            "src/testFixtures/java/A.java",
+            "app/src/androidTest/java/A.java",
+            "src/test-fixtures/java/A.java",
+            "src/integration_test/java/A.java",
+            "src/backend/src/test/java/A.java",
+        ] {
+            assert!(is_test(Path::new(test)), "{test} is test code");
+        }
+        for production in [
+            "src/main/java/A.java",
+            "java/src/main/java/A.java",
+            "src/main/java/com/acme/src/test/Foo.java",
+            "src/main/java/com/acme/test/Foo.java",
+            "src/main/java/com/acme/src/integrationTest/java/Foo.java",
+            "src/main/kotlin/com/acme/src/test/Foo.java",
+            "src/testing/java/A.java",
+            "src/testng/java/A.java",
+            "src/contest/java/A.java",
+            "src/main/javatest/src/test/A.java",
+            "test/src/main/java/A.java",
+            "src/test.java",
+            "A.java",
+        ] {
+            assert!(
+                !is_test(Path::new(production)),
+                "{production} is production"
+            );
+        }
+    }
+
+    #[test]
+    fn path_prefix_and_test_sets_combine() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "java/src/main/java/com/acme/App.java");
+        write_file(root, "java/src/test/java/com/acme/AppTest.java");
+        write_file(root, "java/src/integrationTest/java/com/acme/AppIT.java");
+        write_file(root, "java/src/main/java/com/acme/src/test/Keep.java");
+
+        assert_eq!(
+            java_files(root, None).unwrap(),
+            paths(&[
+                "java/src/main/java/com/acme/App.java",
+                "java/src/main/java/com/acme/src/test/Keep.java",
+            ])
+        );
+        assert!(
+            java_files(root, Some(Path::new("java/src/test")))
+                .unwrap()
+                .is_empty(),
+            "a prefix inside a test set yields nothing"
+        );
+        assert_eq!(
+            java_files(root, Some(Path::new("java/src/main/java/com/acme/src"))).unwrap(),
+            paths(&["java/src/main/java/com/acme/src/test/Keep.java"]),
+            "a prefix down to a package named src/test keeps it"
         );
     }
 }

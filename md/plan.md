@@ -42,7 +42,7 @@ Each later phase adds its own tables. Index tables are created on the temp file;
 
 **1.1 File walker**
 *Goal:* the list of production Java files to index, relative to the repo root.
-Use the `ignore` crate, respecting `.gitignore`, skipping `build/`, `target/`, `generated/`/`generated-sources/` (when not under a source root) and `src/test/` (also a module's, e.g. `backend/src/test/`; `state.md` D-bd). Apply `--path`.
+Use the `ignore` crate, respecting `.gitignore`, skipping `build/`, `target/`, `generated/`/`generated-sources/` (when not under a source root) and test source sets: the `<set>` of the first `src/<set>/java` (else `src/<set>`) is `test`, starts with `test` as a word (`testFixtures`) or ends with `Test` (`integrationTest`, `androidTest`), in the repository or a module (`backend/src/test/`); `src/test` deeper inside a source root is a package (`state.md` D-bd). Apply `--path`.
 *Done when:* a temp-directory test returns exactly the expected files.
 
 **1.2 Parse types**
