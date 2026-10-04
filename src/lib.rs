@@ -1,5 +1,6 @@
 pub mod config;
 pub mod describe;
+pub mod golden;
 pub mod history;
 pub mod indexer;
 pub mod jira;
