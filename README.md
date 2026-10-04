@@ -5,6 +5,14 @@
 
 Annatar maps a codebase by **intent**: what each class, method and function does, why it exists, and where it is used. The "why" comes from the tickets and commits that shaped the code.
 
+## Goals
+
+- **Faster onboarding** for new engineers
+- **Better decisions** by showing the original requirement and what depends on it
+- **Self-service answers** for non-technical roles like product, support and QA
+- **Fewer tokens** for coding agents, which find relevant code directly
+- **Better agentic coding**, with changes that respect intent and don't break callers
+
 ## POC scope
 
 For this proof of concept, Annatar targets:
@@ -12,12 +20,6 @@ For this proof of concept, Annatar targets:
 - **Language:** Java
 - **Ticket system:** Jira
 - **LLM inference and embeddings:** Ollama, for local inference
-
-## Status
-
-- **Done:** the POC (Phases 0–5: index, descriptions from code, tickets and commits, search, `show`, agent trial) and Phase 6, **usages**: which symbol uses which, as `used by` / `uses` in `show` and `annatar trace`. Usages come from the parsed source and Java's name rules, without a build and without the LLM.
-- **Not built:** everything under *Later* in [`md/plan.md`](./md/plan.md), e.g. multi-module repositories, test code, SCIP for compiler-exact usages, a central build, `annatar module`.
-- **Progress, decisions and open questions:** [`md/state.md`](./md/state.md) (Phases 0–5) and [`md/usages_state.md`](./md/usages_state.md) (Phase 6).
 
 ## Install
 
@@ -99,27 +101,12 @@ Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only
 
 ## POC findings
 
-Measured on one Java/Spring repository (654 symbols, 69 tickets); details in [`md/state.md`](./md/state.md) and, for usages, [`md/usages_state.md`](./md/usages_state.md).
+On one Java/Spring repository (654 symbols, 69 tickets); details in [`md/state.md`](./md/state.md) and [`md/usages_state.md`](./md/usages_state.md).
 
-- **Descriptions:** generated for every class and method with no invalid replies. A full cold run takes about 20 minutes, and a rerun with a warm cache makes 0 LLM calls (about 2 s).
-- **Retrieval** (24 golden questions, `annatar eval`): search finds the right **file**, not the exact symbol. The expected file ranks first for 11 of 24 questions and is in the top 5 for 17 (20 counting alternates); the exact symbol ranks first for only 4. That is why `search` returns files.
-- **Agents** (4 tasks × 5 runs, Claude Code via the CLI): with Annatar, agents used about 40–45 % fewer tokens and tool calls, cost about 25–30 % less and were as correct or slightly more (37 vs 35 of 40). Reasons that live only in tickets were found only with Annatar (5/5 vs 0/5). Tracing a call chain across files was the weak spot (search can skip a step).
-- **Usages** (54 symbols with hand-checked users, `annatar eval-usages`): precision 1.000, recall 0.972 (104 of 107 users); the 3 misses are calls inside lambdas. Of all call sites, 31 % resolve to a method in the repository; most of the rest are calls into the JDK and libraries, which are not indexed.
-- **Agents on usages** (the call-chain task re-run, 5 runs): all 5 agents found the missing step (3 of 5 before) and got full marks (2 of 5 before). Tokens (−10 %) and cost (+7 % mean, −8 % median) did not change measurably: agents read fewer files but called `show` more, and its output is larger. No agent called `trace`; it is untested by agents so far.
-- **Agents, full re-run** (4 tasks × 5 runs × with / without, `show` without history by default): with Annatar about 48 % fewer tokens and tool calls and 26 % lower cost than a fresh run without it (per task, cost was significantly lower only on one of four), and 39 vs 34 of 40 correct. The ticket reason was still found 5/5 (0/5 without), but it was also in the descriptions Annatar prints by default, so this run did not test a reason that lives only in tickets. On the call-chain task all runs found the missing step; full marks 4/5 with vs 5/5 without (not significant). On the calls agents made, the shorter `show` cut its output by about a fifth, half of what it could, since agents added `--history` to half their `show` calls. Without Annatar, agents used about a third fewer tokens on two tasks than in the first trial (not significant), so the gaps between the arms vary between runs.
-- **Caveats:** small samples, one repository, tasks and questions written by the same author. Usages miss what the source does not show: reflection, YAML wiring, message brokers, callers in test code.
-
-## Goals
-
-- **Faster onboarding** for new engineers
-- **Better decisions** by showing the original requirement and what depends on it
-- **Self-service answers** for non-technical roles like product, support and QA
-- **Fewer tokens** for coding agents, which find relevant code directly
-- **Better agentic coding**, with changes that respect intent and don't break callers
-
-## Where it fits
-
-Long-lived codebases where the reasoning lives in old tickets and people's heads, teams that onboard often, and teams using coding agents on real repositories.
+- **Search** finds the right file (top 5 for 17 of 24 questions), rarely the exact symbol, so it returns files.
+- **Usages** are precise: precision 1.000, recall 0.972 on 54 hand-checked symbols; calls inside lambdas and into libraries stay unresolved.
+- **Agents** (Claude Code, 4 tasks × 5 runs, with vs without): about half the tokens and tool calls, a quarter lower cost (significant on one task of four), 39 vs 34 of 40 correct. Reasons that live in tickets were found only with Annatar (5/5 vs 0/5). With `used by`, all agents found the step in a call chain that search had made them skip before (5/5, earlier 1–3/5). Agents never called `trace`.
+- **Caveats:** small samples, one repository, tasks written by the same author; usages miss reflection, configuration wiring, message brokers and test callers.
 
 ## Releasing
 
