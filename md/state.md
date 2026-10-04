@@ -11,11 +11,90 @@ the decisions taken, and the tradeoffs behind them.
 | | |
 | --- | --- |
 | Phase | 4 — LLM summaries, in progress (Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
-| Step | 4.2 Ticket summaries — **done** (fakes + live Ollama on `argus`; full 79-ticket real run pending, Jira gateway blocked from the agent container, open #27); next 4.3 Method and constructor what/why |
+| Step | 4.2 Ticket summaries — **done**, review fixes done (full real run on `argus`: 79/79 tickets summarised, rerun 0 chat calls); next 4.3 Method and constructor what/why |
 | Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **4.2 review fixes: model check, shared breaker, run-independent prompt,
+  purpose rework.** *Real run (product owner opened `api.atlassian.com`;
+  orchestrator, release build of 6e8713b, `argus`, fresh data dir):* run 1
+  194 s wall, 217 files, 960 symbols, 2920 commits, 1821 ticket rows; 79
+  keys, 79 fetched, 0 unavailable, 80 Jira requests; 79 summarised, 0
+  invalid/failed, 79 chat calls, 0 retries (~2.4 s/ticket incl. fetching).
+  Run 2: 2 s, 79 cached, 0 Jira requests, 79 summaries from the cache, **0
+  chat calls**, 79 hits. Closes open #27 and replaces the seeded-fixture
+  deviation (D-aq). *Missing model (medium):* Ollama answers an unknown chat
+  model with HTTP 404, which tripped the breaker and the run exited 0 with no
+  summaries, forever. New `LlmBackend::has_model` (`OllamaBackend`: native
+  `POST /api/show`, 404 → missing; accepts names with `/`, unlike
+  `/v1/models/{id}`) and `LlmClient::check_chat_model`, run once by
+  `build_index` before the index build starts: a missing model fails the run
+  (`the chat model "x" does not exist on the Ollama server; pull it …`), an
+  unreachable server or other error trips the breaker and the run goes on
+  cache-only; skipped when cache-only (`--no-llm`) (D-ar). *Breaker on the
+  client (medium):* the tripped state was a local of the stage, so 4.3/4.4
+  would have called a dead model again. `LlmClient` now holds `cache_only`
+  (`AtomicBool`): `set_cache_only` (`--no-llm`, `Summarizer::new`), tripped
+  on a chat backend failure or after `MAX_CONSECUTIVE_INVALID` (5)
+  `InvalidOutput`s in a row (a valid reply resets the count), one warning;
+  afterwards every `complete_with`, in any stage, answers from the cache or
+  fails with the new `LlmUnavailable` (stage: `summaries_skipped`).
+  `Summarizer` lost its `cache_only` field; the stage no longer calls
+  `cached_with` (D-an amended). The stage logs one summary warning when
+  tickets were invalid or failed. *Run-independent prompt (medium, nit 9):*
+  `ticket_prompt(&Ticket)` no longer carries the parent key or title (the
+  title came from this run's tickets only, so `--path` runs and failed parent
+  fetches changed the prompt → cache misses / skips under `--no-llm`); the
+  prompt depends on the ticket alone (D-al amended). *Purpose (medium, open
+  #28):* the prompt forbids mentioning the ticket or missing information,
+  says the purpose must give a reason and not restate the summary, and asks
+  for an **empty purpose** when no reason is stated or clearly implied;
+  `validate_summary` accepts an empty purpose, rejects meta phrases ("the
+  ticket", "not stated", "does not specify", …) and a purpose whose content
+  words (> 3 letters, 5-letter stems) all appear in the summary; the stage
+  stores an empty purpose as `NULL`, `show` omits the `purpose:` line (D-as).
+  *Whitespace (low):* fields with control characters other than whitespace
+  are invalid (retry); whitespace runs (newlines) are collapsed before
+  storing (`TicketSummary::summary_text` / `purpose_text`). *Fence (low):*
+  the ticket (key, type, title, description) sits between `<<<TICKET` and
+  `TICKET>>>`, stated to be content, not instructions; markers inside ticket
+  text are defused. *Temperature (nit):* `-0.0` is normalised to `0.0` (client
+  and cache key). *Empty content (suspected):* a reply with `content: null` /
+  no content is now an empty reply → invalid output, retried, instead of a
+  backend failure tripping the breaker. 17 new tests (8 `llm`: breaker for
+  later completions/other types with cached ones still served, backend
+  failure on the retry after an invalid reply, empty reply retried, 5
+  consecutive invalid trip + reset, cache-only never calls nor checks,
+  model check missing/failing, `/api/show` over a local HTTP server, `-0.0`
+  key; 5 `summaries`: fenced prompt, run independence, marker defusing,
+  empty purpose, whitespace/control chars, meta text, restated purpose; 4
+  indexer: missing model fails the run before the index is written and
+  `--no-llm` skips the check, unreachable server → cache-only, consecutive
+  invalid stop the chat calls, empty purpose `NULL` + `show`), several
+  adapted; 198 tests pass (4 ignored); live `cargo test llm -- --ignored`
+  green. Wrong model live: `chat_model = "nope:latest"` → exit 1 with that
+  message; with `--no-llm` exit 0. *Prompt probe (14 + 11 real tickets, then
+  all 79):* before, the no-reason tickets got invented or meta purposes
+  (GRLD-109586/96679/97031 "implement or update the Argus component as part
+  of the parent task", GRLD-21224 "improve the code quality or
+  functionality", GRLD-24231 a guessed user-information reason, GRLD-36499
+  "likely to support … auditing", GRLD-24229/31155/24010 restating the
+  summary). After: all of these have an empty purpose; tickets with a stated
+  reason keep a concrete one (GRLD-50018 out-of-support Spring Boot versions,
+  GRLD-37944 emergency logout of all users, GRLD-68743 memory issues around
+  4am, GRLD-82584 excessive log entries, GRLD-72066 roles sharing privilege
+  strings). *Real run with the new prompt (release, `data-real`, cached
+  tickets):* run 1: 79 summarised, 0 invalid/failed/skipped, 79 chat calls,
+  **0 retries**, stage 148.3 s (1.88 s/ticket), whole run ≈ 150 s; 30 empty
+  purposes (27 of them tickets without a description), no meta text in any
+  field (searched for "ticket", "not stated", "unclear", "likely", "parent
+  task"). Run 2: 2.1 s, **0 chat calls**, 79 hits. Remaining weak spot: a
+  few title-only tickets still get a purpose that paraphrases the summary
+  with synonyms the word check cannot see (GRLD-20961 "secure … using a
+  System Token", GRLD-35843, GRLD-88420, GRLD-90364 "resolve" vs "fixes")
+  (open #28).
 
 - **4.2 Ticket summaries.** New `summaries` module: `TicketSummary {
   summary, purpose }` (`deny_unknown_fields`), the pure `ticket_prompt(&Ticket,
@@ -894,6 +973,7 @@ the decisions taken, and the tradeoffs behind them.
 | Phase 3 PO checks review fixes | done | `rich_description.json` scrub finished (`com/acme`, neutral repo/module names); security write-ups in `bug.json` (incl. summary) and `rich_description.json` reworded to neutral text, same markup (PM decision); attachment id `1`; whitespace-only summary = missing (D-ae); `html_table_keeps_cells_without_borders` (D-x); doc/plan wording; 136 tests |
 | 4.1 review fixes | done | own cache connection (`Store::connect_cache`, busy timeout) + write mutex + no explicit transactions (D-ai); `complete_with` validation hook, `deny_unknown_fields` convention (D-aj); `ChatReply` with finish reason + usage, truncation warned and named in `InvalidOutput`; canonical schema in the key (D-ag); embedding dim checks; one retry for 503 / refused connection (D-ak); README env var; open #23–#26; 167 tests |
 | 4.2 Ticket summaries | done | `summaries` module (`TicketSummary`, pure `ticket_prompt`, `validate_summary`, `Summarizer`); `index_summaries` stage after tickets → index `tickets.llm_summary`/`llm_purpose`; sequential, breaker on the first backend failure (then cache only), invalid skipped; `--no-llm`; `ollama.temperature` (default 0, in the cache key); `LlmClient::cached_with`; `IndexStats` summary buckets + `llm`; `show` prints summary/purpose; live: sequential ≈ parallel on the host Ollama; `argus` (seeded with 4 real fixture tickets, Jira gateway blocked): 4 summarised in 15.2 s, rerun 0 chat calls; D-al–D-aq; 181 tests |
+| 4.2 review fixes | done | chat-model check before the build (`/api/show`; missing → run fails, unreachable → cache-only) (D-ar); breaker state on `LlmClient` (`cache_only`, trips on a backend failure or 5 invalid in a row, `LlmUnavailable`), shared by later stages (D-an); prompt without parent key/title (D-al); purpose may be empty (→ `NULL`), meta text and restated purpose invalid, ticket fenced as data, whitespace collapsed, control chars invalid (D-as); `-0.0` temperature normalised; null content = invalid output; real run (79 tickets: 79 summarised, rerun 0 chat calls) closes open #27; new prompt on `argus`: 79/79, 0 retries, 148 s, 30 empty purposes, no meta text, rerun 0 chat calls; 198 tests |
 | 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
 
 ## Decisions and tradeoffs
@@ -980,12 +1060,14 @@ the decisions taken, and the tradeoffs behind them.
 | D-ai (4.1 review) | `LlmClient` gets its own `cache.db` connection (`Store::connect_cache`, 30 s busy timeout), serialises its writes behind a `tokio::sync::Mutex`, and writes single statements only (one multi-row `INSERT` per embedding batch of ≤ 64 rows) | Keep the shared `Store::cache()` clone and only add the mutex; a dedicated writer task | libsql `Connection` clones share one SQLite connection and its transaction state, so an explicit transaction on it collides with other tasks' and the client's writes would join (and roll back with) the history stage's per-file transactions. A separate connection isolates transaction state; the mutex plus single statements keep concurrent tasks from interleaving on it. Cost: cross-connection writes now take SQLite file locks, so a writer waits for another connection's open write transaction (bounded by the busy timeout); stages run sequentially today. `cache.db` stays in rollback-journal mode (WAL is open #5) |
 | D-aj (4.1 review) | Validation hook: `complete_with(prompt, validate: Fn(&T) -> Result<(), String>)`, run after serde inside the retry loop and on cache hits; convention that response types use `#[serde(deny_unknown_fields)]` (schemars then emits `additionalProperties: false`) | A `Validate` trait every `T` implements; validation in each stage after `complete` | A closure needs no impl for types without checks and keeps the check next to the prompt in 4.2+; running it inside the loop means a blank/overlong field triggers the error-carrying retry and is never cached, and a tightened check re-asks for already-cached rows. `deny_unknown_fields` is the caller's choice per struct, documented in the module docs |
 | D-ak (4.1 review) | `OllamaBackend` retries once, after 2 s, on HTTP 503 or a failed connection (`reqwest` `is_connect`); 4xx, other 5xx and timeouts are returned at once. A run-level circuit breaker is the job of the stage that loops (4.2+), not the client | No retry (D-ah); retry all 5xx and timeouts; backoff with several attempts in the client | Ollama answers 503 while overloaded/loading and a restarting server refuses connections briefly; both often clear in seconds. A 4xx (unknown model, bad request) won't, and a timeout already spent up to 600 s. One bounded retry keeps a dead server from stalling each call for long; the stage sees repeated failures and stops (open #25) |
-| D-al (4.2) | Ticket summaries are a fourth `build_index` stage after tickets that reads the available tickets from the in-progress index `tickets` table and writes `llm_summary` / `llm_purpose` columns there (index only; the LLM cache is the persistence). Output language **English** (tickets are mostly German); `TicketSummary { summary, purpose }` with `deny_unknown_fields`; prompt from a pure `ticket_prompt`: key, type, parent key **plus the parent's title when the parent is itself an indexed ticket**, title, description capped at 4000 chars (real max 3593); validation rejects blank fields and > 400 / > 300 chars (the prompt asks for 300 / 200, so a slightly long reply is not retried) | German output; a separate cache table keyed by ticket key; parent key only; no cap | English matches code identifiers and later English questions/embeddings; ticket text never repeats in the prompt beyond the cap; the parent title (often an epic name) is cheap "why" context, but it makes a child's prompt depend on whether its parent is referenced (a new commit mentioning the epic misses the child's cache once). Column names keep `summary` = Jira title |
+| D-al (4.2) | Ticket summaries are a fourth `build_index` stage after tickets that reads the available tickets from the in-progress index `tickets` table and writes `llm_summary` / `llm_purpose` columns there (index only; the LLM cache is the persistence). Output language **English** (tickets are mostly German); `TicketSummary { summary, purpose }` with `deny_unknown_fields`; prompt from a pure `ticket_prompt(&Ticket)`: key, type, title, description capped at 4000 chars (real max 3593), fenced as data (D-as); validation rejects a blank summary and > 400 / > 300 chars (the prompt asks for 300 / 200, so a slightly long reply is not retried). **Amended (4.2 review):** no parent key and no parent title — the prompt depends on the ticket alone | German output; a separate cache table keyed by ticket key; parent key only; no cap; parent title from `ticket_cache` independent of the run | English matches code identifiers and later English questions/embeddings; ticket text never repeats in the prompt beyond the cap. The parent title came from this run's tickets only, so `--path` runs, a failed parent fetch or a new commit mentioning the epic changed a child's prompt (cache miss, or skipped under `--no-llm`); sourcing it from `ticket_cache` would still miss once whenever the parent is first fetched or refetched. A bare parent key tells the model nothing. Dropping both is the only fully run-independent option; epic context can come back in 4.3/4.4 from the indexed parent's own summary. Column names keep `summary` = Jira title |
 | D-am (4.2, open #22) | New `ollama.temperature` (default `0.0`, validated 0–2), always sent and part of the `llm_cache` key; supersedes D-ah's "no temperature" | Model default (no field); no option | Reproducible records: dropping `llm_cache` (or a cache miss on another machine) regenerates the same text; live, 4/4 identical replies at 0. Existing 4.1 cache rows miss once (key changed); the option lets 4.5 try another value |
-| D-an (4.2, open #25) | Summaries circuit breaker trips on the **first** backend failure (the client already retried a 503/refused connection once, D-ak): one warning, no further chat call this run, remaining tickets still get summaries the LLM cache holds (`cached_with`), the rest are `summaries_skipped`. A reply still invalid after the client's retry is per-ticket: warning, `summaries_invalid`, next ticket. LLM problems never fail the run | N consecutive failures; classify connect/timeout errors | Same reasoning as the Jira breaker (D-ac): a down or hung server would otherwise cost every ticket the connect retry or the 600 s timeout; a one-off failure only defers the rest to the next run, which hits the cache for everything done |
+| D-an (4.2, open #25) | Summaries circuit breaker trips on the **first** backend failure (the client already retried a 503/refused connection once, D-ak): one warning, no further chat call this run, remaining tickets still get summaries the LLM cache holds, the rest are `summaries_skipped`. A reply still invalid after the client's retry is per-ticket: warning, `summaries_invalid`, next ticket. LLM problems never fail the run (except a missing chat model, D-ar). **Amended (4.2 review):** the breaker is state of the shared `LlmClient` (`cache_only: AtomicBool`), not a local of the stage: `--no-llm` sets it, a chat backend failure or `MAX_CONSECUTIVE_INVALID` (5) invalid completions in a row trip it (one warning); after that every `complete_with` in every stage answers from the cache or returns `LlmUnavailable`. A reply with no/`null` content is invalid output (retried), not a backend failure | N consecutive failures; classify connect/timeout errors | Same reasoning as the Jira breaker (D-ac): a down or hung server would otherwise cost every ticket the connect retry or the 600 s timeout; a one-off failure only defers the rest to the next run, which hits the cache for everything done |
 | D-ao (4.2) | `annatar index --no-llm`: cache-only summaries (0 chat calls, cached ones still reach the index, misses skipped). `--offline` stays Jira-only. No `[ollama]` → one warning, every ticket `summaries_skipped` | `--offline` also disables the LLM; no flag | Ollama is local, so "offline" (no Jira) and "no LLM" are different needs; a run without the model must not drop already-paid-for summaries from the rebuilt index. Without `[ollama]` there is no model name, hence no cache key, so nothing can be reused |
 | D-ap (4.2, open #23) | Chat calls in the stage are sequential; no concurrency option | Bounded concurrency (`ollama.concurrency`) | Measured on the host Ollama: 4 summary-sized requests sequential 7.56 s vs 4 in parallel 7.03 s — it serves one at a time, so concurrency only queues and adds the no-dedup issue. Revisit if `OLLAMA_NUM_PARALLEL` > 1 or for 4.3's larger volume |
-| D-aq (4.2 real run) | Deviation: the agent's real run seeded `ticket_cache` with the 6 scrubbed real fixture tickets (via `parse_issue` + `TicketCache`, scratch data dir) and ran with `--offline`, because the container's proxy allowlist blocks `api.atlassian.com` | Skip the real run | Exercises the real pipeline, model and prompts on real (scrubbed) ticket text; only 4 of the 6 keys are referenced by `argus` symbols. The full 79-ticket run is the product owner's check (open #27) |
+| D-aq (4.2 real run) | **Superseded (4.2 review):** the product owner opened `api.atlassian.com` and the full run happened (79 tickets fetched and summarised, rerun 0 chat calls; see Done). Original deviation: the agent's real run seeded `ticket_cache` with the 6 scrubbed real fixture tickets (via `parse_issue` + `TicketCache`, scratch data dir) and ran with `--offline`, because the container's proxy allowlist blocks `api.atlassian.com` | Skip the real run | Exercises the real pipeline, model and prompts on real (scrubbed) ticket text; only 4 of the 6 keys are referenced by `argus` symbols. The full 79-ticket run is the product owner's check (open #27) |
+| D-ar (4.2 review) | Before the index build, `build_index` checks once that the server has the chat model (`LlmBackend::has_model`, Ollama `POST /api/show`): missing (404) → the run fails with a "pull it or fix `ollama.chat_model`" message; unreachable/other error → the breaker trips and the run is cache-only; no check when cache-only (`--no-llm`). The check is not a chat call (`chat_calls` stays 0 on a cached rerun) | Treat a chat 404 as fatal; `GET /v1/models/{id}`; no check | Consistent with rejected Jira credentials being fatal: a typo in the model name otherwise exits 0 with no summaries on every run. Failing before the build keeps the previous index and needs no chat request; `/api/show` accepts every model name (a `/` in `hf.co/...` names breaks the `/v1/models/{id}` route) and is the same server the backend already targets |
+| D-as (4.2 review, open #28) | Purpose may be **empty** (stored `NULL`, `show` omits it) when the ticket states or clearly implies no reason; the prompt forbids talking about the ticket or missing information and restating the summary; the ticket is fenced between `<<<TICKET` / `TICKET>>>` as content, not instructions (markers inside defused). Validation: blank summary, overlong fields, control characters other than whitespace, meta phrases ("the ticket", "not stated", "does not specify", …) and a purpose whose content words all appear in the summary are invalid (→ retry); whitespace runs are collapsed before storing. `purpose` stays a required `String` | `Option<String>` / an explicit "unknown" value; reject newlines (retry) instead of collapsing; fuzzy/LLM-judged restatement check | An empty purpose tells 4.3 there is no "why" instead of a made-up one; a required string keeps the strict schema simple (an optional field may be omitted under `json_schema`). Collapsing whitespace costs no call. The word check is cheap and catches literal restatements; synonym paraphrases slip through (open #28). Real run: 30/79 empty purposes (27 without description), no meta text, 0 retries |
 
 ## Open questions
 
@@ -1017,5 +1099,6 @@ the decisions taken, and the tradeoffs behind them.
 | 24 | `reasoning_effort: "none"` (the default, D-af) is only tested against thinking models; every chat model on the host thinks. Does a non-thinking model accept or reject it on `/v1`? Workaround if it errors: `reasoning_effort = ""` (not sent). | 4.1 review | open — check when a non-thinking model is tried (4.5) |
 | 25 | `OllamaBackend` retries a transient failure once (D-ak), but a down server still costs every call that attempt. The looping stage (4.2+) needs a circuit breaker like the Jira one: stop after N consecutive backend failures and leave the rest for the next run. | 4.1 review | **resolved (4.2, D-an)** — the summaries stage trips on the first backend failure, then serves cached summaries only; 4.3/4.4 reuse the pattern |
 | 26 | A small Ollama `num_ctx` silently truncates a long prompt (the model sees only part of it). The client does not send `num_ctx`; detection is the debug-logged `prompt_tokens` (close to the context size = suspect). Check in 4.3 with the longest real prompts; send `options.num_ctx` (config option) if needed. | 4.1 review | open — check in 4.3 |
-| 27 | The agent container cannot reach the Jira gateway `api.atlassian.com` (proxy allowlist: `CONNECT tunnel failed, response 403`; only `blueocean.jira.com` is allowed, where the scoped token gets 404), so 4.2's real run used 4 seeded fixture tickets (D-aq). Run `annatar index` twice on `argus` with the token from the host (or add `api.atlassian.com` to the allowlist): how many of the 79 tickets are summarised / invalid, time per ticket, and does run 2 print `0 chat calls`? | 4.2 | open — product owner |
-| 28 | When a ticket states no reason (e.g. only an "Out of scope" list), the `purpose` restates the summary ("To enable SMS sending ..."). Allow an explicit "unknown" purpose, or let 4.3 fall back to commit subjects then? | 4.2 | open — review in 4.5 with more tickets |
+| 27 | The agent container cannot reach the Jira gateway `api.atlassian.com` (proxy allowlist: `CONNECT tunnel failed, response 403`; only `blueocean.jira.com` is allowed, where the scoped token gets 404), so 4.2's real run used 4 seeded fixture tickets (D-aq). Run `annatar index` twice on `argus` with the token from the host (or add `api.atlassian.com` to the allowlist): how many of the 79 tickets are summarised / invalid, time per ticket, and does run 2 print `0 chat calls`? | 4.2 | **resolved (4.2 review)** — gateway opened; run 1: 79 fetched, 79 summarised, 0 invalid/failed, 79 chat calls, ~2.4 s/ticket incl. fetching, 194 s; run 2: 2 s, 0 Jira requests, **0 chat calls** |
+| 28 | When a ticket states no reason (e.g. only an "Out of scope" list), the `purpose` restates the summary ("To enable SMS sending ..."). Allow an explicit "unknown" purpose, or let 4.3 fall back to commit subjects then? | 4.2 | **mostly resolved (4.2 review, D-as)** — empty purpose (`NULL`) when no reason: 30/79 on `argus`, no invented "parent task" or meta reasons. Still open for 4.5: a few title-only tickets get a synonym paraphrase of the summary (GRLD-20961, GRLD-35843, GRLD-88420, GRLD-90364); 4.3 treats a `NULL` purpose as "no why" (commit subjects may help) |
+| 29 | `init_logging` uses `tracing_subscriber::fmt()` defaults, which write logs to **stdout**, mixed with the `index` result lines (seen in the 4.2 review real run with `-v`). Send logs to stderr? | 4.2 review | open — small fix, before the MCP server (6.1) at the latest, where stdout is the protocol channel |

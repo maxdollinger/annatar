@@ -110,11 +110,11 @@ Runs as a stage of the index build (after history, on the build's transaction, b
 **4.2 Ticket summaries**
 *Goal:* every available ticket has a one- to two-sentence summary and a purpose (why).
 *Done when:* all available tickets have a summary; a rerun makes no LLM calls.
-*Note:* a stage after tickets writes English `llm_summary` / `llm_purpose` to the index `tickets` table; sequential calls, a circuit breaker on the first model failure, `--no-llm` for cache-only runs, `temperature` 0 by default (`state.md` D-al–D-ap). *Deviation:* the agent's real run covered 4 real (scrubbed fixture) tickets because the Jira gateway is blocked from its container; the full `argus` run is the product owner's check (`state.md` D-aq, open #27).
+*Note:* a stage after tickets writes English `llm_summary` / `llm_purpose` to the index `tickets` table; the prompt depends on the ticket alone (no parent), and `purpose` is empty (`NULL`) when the ticket gives no reason; sequential calls; the chat model is checked once before the build (missing → the run fails); the circuit breaker (first model failure or 5 invalid replies in a row) lives on the shared LLM client, so later stages honour it; `--no-llm` for cache-only runs, `temperature` 0 by default (`state.md` D-al–D-ap, D-ar, D-as). Verified on the full `argus` run: 79/79 tickets summarised, a rerun makes 0 chat calls (D-aq, open #27 closed).
 
 **4.3 Method and constructor what/why**
 *Goal:* every method and constructor has a one-line `what` and a `why`, stored by symbol in `index.db`.
-Input, built by a pure, tested function: signature, Javadoc, parent class name and role, and ticket summaries (the first ticket plus the most recent few, capped). If all its tickets are unavailable, use commit subjects instead. Try it on one package with `--path` first and note time per symbol.
+Input, built by a pure, tested function: signature, Javadoc, parent class name and role, and ticket summaries (the first ticket plus the most recent few, capped). If all its tickets are unavailable, use commit subjects instead. A method whose available ticket has no summary this run (invalid, failed, or skipped after the breaker tripped) is skipped this run rather than generated without it, so the cache never holds a what/why built from incomplete input; a `NULL` purpose is valid input and means the ticket gives no "why". Try it on one package with `--path` first and note time per symbol.
 *Done when:* `show` prints what/why for methods.
 
 **4.4 Type what/why, bottom-up**

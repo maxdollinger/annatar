@@ -56,7 +56,8 @@ pub const INDEX_TABLES: &[&str] = &[
     // and MCP never open `cache.db`. Content columns are NULL when
     // `unavailable = 1`. `summary` is the Jira title; 4.2 adds the chat
     // model's English `llm_summary` and `llm_purpose` (NULL when the ticket
-    // is unavailable or was not summarised this run).
+    // is unavailable or was not summarised this run; `llm_purpose` is also
+    // NULL when the ticket gives no reason).
     "CREATE TABLE tickets (
         key TEXT PRIMARY KEY,
         unavailable INTEGER NOT NULL,
