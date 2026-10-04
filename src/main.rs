@@ -12,7 +12,7 @@ use annatar::store::{IndexReader, Store};
 use annatar::summaries::Summarizer;
 use annatar::symbols::{Role, SymbolKind};
 use annatar::tickets::TicketFetch;
-use annatar::{indexer, show, walk};
+use annatar::{indexer, show};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
 #[derive(Debug, Parser)]
@@ -76,23 +76,6 @@ enum Command {
         #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_limit)]
         limit: usize,
     },
-}
-
-/// `--path` for `search`: the prefix relative to the repository, with `/`
-/// separators like `symbols.file`.
-fn search_path(repo: &std::path::Path, prefix: &std::path::Path) -> Result<String> {
-    let relative = walk::relative_prefix(repo, prefix).with_context(|| {
-        format!(
-            "--path {} is outside the repository {}",
-            prefix.display(),
-            repo.display()
-        )
-    })?;
-    Ok(relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/"))
 }
 
 fn parse_limit(text: &str) -> Result<usize, String> {
@@ -238,11 +221,10 @@ async fn run(cli: &Cli) -> Result<()> {
                     .filter_map(|kind| SymbolKind::parse(kind))
                     .collect(),
                 roles: role.iter().filter_map(|role| Role::parse(role)).collect(),
-                path: cli
-                    .path
-                    .as_deref()
-                    .map(|prefix| search_path(&config.repo, prefix))
-                    .transpose()?,
+                path: match cli.path.as_deref() {
+                    Some(prefix) => search::path_filter(&config.repo, prefix)?,
+                    None => None,
+                },
             };
             let reader = IndexReader::open(&config.data_dir).await?;
             let embedder = QueryEmbedder::from_config(ollama).await?;

@@ -11,6 +11,7 @@
 //! Search reads `index.db` only. The query's embedding is cached in memory
 //! for the call, never in `cache.db`, so a search creates and writes no file.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +21,7 @@ use crate::config::OllamaConfig;
 use crate::llm::{LlmBackend, LlmClient, OllamaBackend};
 use crate::schema;
 use crate::symbols::{Role, SymbolKind};
+use crate::walk;
 
 /// Hits shown when `--limit` is not given.
 pub const DEFAULT_LIMIT: usize = 10;
@@ -45,6 +47,26 @@ impl Filter {
     fn is_empty(&self) -> bool {
         self.kinds.is_empty() && self.roles.is_empty() && self.path.is_none()
     }
+}
+
+/// [`Filter::path`] for `--path <prefix>`: the prefix relative to `repo`,
+/// with `/` separators like `symbols.file`, normalised like `index --path`
+/// ([`walk::relative_prefix`]). The repository itself (`.`, its absolute
+/// path) is no filter; a prefix outside the repository is an error.
+pub fn path_filter(repo: &Path, prefix: &Path) -> Result<Option<String>> {
+    let Some(relative) = walk::relative_prefix(repo, prefix) else {
+        bail!(
+            "--path {} is outside the repository {}",
+            prefix.display(),
+            repo.display()
+        );
+    };
+    let path = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((!path.is_empty()).then_some(path))
 }
 
 /// One search result.
@@ -600,6 +622,58 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(fqns(&hits), expected, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_index_and_exact_scan_rank_alike() {
+        let data = index(true, META).await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let every_kind = Filter {
+            kinds: SymbolKind::ALL.to_vec(),
+            ..Filter::default()
+        };
+
+        for query in [[1.0, 0.0, 0.0], [0.2, 0.7, 0.4], [0.0, 0.1, 1.0]] {
+            let indexed = nearest(reader.connection(), &query, &Filter::default(), 5)
+                .await
+                .unwrap();
+            let exact = nearest(reader.connection(), &query, &every_kind, 5)
+                .await
+                .unwrap();
+            assert_eq!(indexed.len(), ROWS.len(), "{query:?}");
+            assert_eq!(indexed, exact, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn path_filter_is_repo_relative_and_empty_for_the_repo() {
+        let repo = Path::new("/repo");
+        for (prefix, expected) in [
+            (".", None),
+            ("./", None),
+            ("/repo", None),
+            ("/repo/", None),
+            ("src/web/", Some("src/web")),
+            ("./src/web", Some("src/web")),
+            (
+                "/repo/src/web/UserController.java",
+                Some("src/web/UserController.java"),
+            ),
+            ("backend/../src/web", Some("src/web")),
+        ] {
+            assert_eq!(
+                path_filter(repo, Path::new(prefix)).unwrap().as_deref(),
+                expected,
+                "{prefix}"
+            );
+        }
+        for prefix in ["..", "../x", "src/../../x", "/other/src"] {
+            let err = path_filter(repo, Path::new(prefix)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("--path {prefix} is outside the repository /repo")
+            );
         }
     }
 
