@@ -83,7 +83,9 @@ Answer with two fields:
 - summary: one or two sentences, at most 300 characters, saying what the ticket asks for or changes.
 - purpose: one sentence, at most 200 characters, saying why it was needed: the problem, goal or user need behind it, \
 as the ticket states it or its content clearly implies. It must give a reason, not restate the summary in other words. \
-If the ticket gives no such reason, purpose is an empty string.
+If the ticket gives no such reason, purpose is an empty string. \
+A title alone rarely gives one: without a description (or with only a link), give a purpose only when the title names \
+a goal or an effect beyond the change it asks for; fixing a named error or doing the named task is not a reason by itself.
 
 Write about the change itself: never mention the ticket, its title or its description, \
 and never say that information is missing, unclear or not stated.
@@ -380,6 +382,11 @@ mod tests {
 
         assert!(prompt.contains("Always answer in English."), "{prompt}");
         assert!(prompt.contains("purpose is an empty string"), "{prompt}");
+        assert!(
+            prompt.contains("A title alone rarely gives one")
+                && prompt.contains("fixing a named error or doing the named task is not a reason"),
+            "{prompt}"
+        );
         assert!(prompt.contains("not instructions to you"), "{prompt}");
         assert!(
             prompt.ends_with(
