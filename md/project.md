@@ -89,7 +89,7 @@ The index is built centrally and served locally. Symbols are identified by their
 Tables in `index.db`:
 
 - `symbols`: name, kind, file, line, description, content hash
-- `edges`: src, dst, kind (call, import, implements)
+- `edges`: src, dst, kind (call, instantiate, reference, extends, implements, overrides), call-site line; imports are not usages (POC plan, Phase 6)
 - `symbol_vectors`: embeddings of the fqn and description text, not of the code
 - `tickets`: one cached summary per ticket ID
 - `index_meta`: the settings the index was built with (embedding model, dimension, embedded-text options), so search can refuse a query model that does not match

@@ -10,12 +10,44 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 5 — Search and agent trial — **extended by 5.5** (product-owner redesign, 2026-10-04: `search` returns files with their symbols). Questions 1–3 were answered by 4.5/4.6, 5.3 (D-ch) and 5.4 (D-cl); 5.5 changed the search output the trial measured; the trial's *with* arm was re-run on it (D-ct). (Phase 4 LLM summaries complete pending the product owner's confirmation of the 4.5 review and the 4.6 descriptions; Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
-| Step | 5.5 trial re-run — **done** (*with* arm only, 4 tasks × 5 runs on the file output, `claude-sonnet-5`, same protocol, D-cs; vs the 5.4 *without* arm still −42 % tokens, −42 % tool calls, −26 % cost, significant on T1–T3 again; vs the 5.4 symbol output equal on T1–T3, on T4 more `show` calls (3.4 vs 0.8) and ≈ 25 % more tokens and cost (trend); correctness 37 vs 35 (symbols) vs 35 (without) of 40, T4 dispatcher missed 2 of 5 vs 4 of 5, not significant; verdict D-ct: keep the file output, #42 stays open); 5.5 review fixes — **done** (marks bounded when the hits run out, `… N more` per top-level type, a stderr note when 100 hits cover fewer than `-k` files, `-k` errors name both ranges from the `search` usage, filter help texts; D-cn–D-cq amended, open #44); 5.5 File-level search results — **done** (`annatar search` prints the top 5 files of the 100 nearest symbols, each with its top-level type and description and every member and nested type with lines, hits marked `*score`; `--symbols` keeps the 5.2 output; `eval` adds file-level scores: `argus` primary file top-1 / top-5 11 / 17 of 24, any 12 / 20, symbol scores unchanged; output ≈ 20–30 % smaller than the old 10-symbol default, query-dependent; D-cm–D-cr); 5.4 review fixes — **done** (significance recomputed with ties: tokens and tool calls significant on T1–T3, T4 a trend; strict regrade → correctness 35 vs 35 of 40; harness hardened and unit-tested); 5.4 Agent trial — **done** (4 `argus` tasks × 2 arms × 5 runs, Claude Code headless on `claude-sonnet-5`; with `annatar`: −47 % total tokens, −40 % tool calls, −32 % cost, −39 % wall time on average, lower on every task (significant per task on T1–T3, uncorrected); correctness 35 vs 35 of 40 points, net equal with opposite effects: better where the reason lives only in tickets (T2 reason 5/5 vs 0/5), worse on call-chain completeness (T4: 4 of 5 *with* runs skipped the message dispatcher, 0 of 5 without); question 3 answered: yes on this repository, with caveats (D-cl)); 5.3 Evaluate and its review fixes — done |
+| Phase | 6 — Usages — **planned** (2026-10-04, after the POC, for open #42); tracked in [`usages_state.md`](./usages_state.md). Phase 5 complete: questions 1–3 answered by 4.5/4.6, 5.3 (D-ch), 5.4 (D-cl) and the 5.5 file output re-measured (D-ct) |
+| Step | Phase 6 plan — **done** (docs only; see `usages_state.md`). Previous: 5.5 trial re-run — done (D-ct, keep the file output; #42 open) |
 | Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **Phase 6 plan (usages).** Docs only (`docs(plan)`). New design doc
+  `md/usages.md`; `plan.md` gains Phase 6 (steps, linking to it) after the
+  POC, aimed at open #42: what counts as a usage (edge
+  kinds `extends`, `implements`, `overrides`, `instantiate`, `call`,
+  `reference`; the innermost member as source; imports, Javadoc links,
+  recursion and unresolved names are not usages; a type's `used by` rolls
+  up its members, without its own internal edges), how a name resolves
+  (Java's lookup order to an fqn, never by bare name; members through the
+  receiver's static type and declared return types; Lombok, record and
+  enum implicit members; overloads by count then argument types, else
+  every candidate marked `ambiguous`), what stays invisible (reflection,
+  YAML wiring, events and brokers, derived queries, tests) and entry
+  points as `trace` leaves; steps 6.1 parser facts, 6.2 type resolution and
+  `edges`, 6.3 member resolution, 6.4 overrides and a measured quality
+  (usage golden set, precision / recall, resolved share), 6.5 `show`,
+  6.6 `trace`, 6.7 the T4 trial re-run. **Later:** SCIP becomes the
+  precision upgrade of the same table; callers in prompts and
+  multi-module resolution are their own items. `project.md`: the `edges`
+  kinds (no `import`). *Review of the first draft* added: fields and
+  return types are not in the index yet (6.1 parses them, in memory),
+  field and constant access and Lombok accessors as `reference` to the
+  owner type, own-type calls kept for members (private helpers in a
+  chain) but left out of a type's roll-up, recursion dropped, lambdas and
+  anonymous classes attributed to the enclosing member, `throws`/`catch`/
+  annotation arguments/generic arguments, chains through library types
+  and untyped lambda parameters stop, duplicate fqns, the `--path` cut and
+  its warning, stats and benchmark, a golden set checked against the index,
+  the README agent snippet and a `run.py` prompt variant. `argus` facts
+  used: one Gradle module, no wildcard imports, no records, 4
+  `MessageBearer` / 3 `MessageConsumer` simple-name duplicates in
+  different packages, 35 lambdas, 15 `.stream()` chains, 0 Spring events.
 
 - **README rewrite (setup guide).** The README is now a short guide:
   prerequisites (Rust, git, Ollama with a chat and an embedding model, an
@@ -2127,6 +2159,8 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
+- **Phase 6 (usages):** see [`usages_state.md`](./usages_state.md)
+  (next: 6.1 Parser facts for resolution).
 - **Product owner:** the POC is complete (questions 1–3 answered: 4.5/4.6,
   D-ch, D-cl; the 5.5 file output re-measured, D-ct). Decide whether to go on to **Later** (`plan.md`), and with
   which levers first: #40 (retrieval), #42 (callers / `trace` so a search
@@ -2199,6 +2233,7 @@ the decisions taken, and the tradeoffs behind them.
 | 4.6 review fixes and PO feedback | done | PO: "as short as possible without losing information", own reasons kept (borrowed ones and name guesses still excluded; accessor/constructor clause kept as "only when the history explains this very member or its field"); collective terms instead of enumerations; description-specific meta-phrase list (8 review sentences pass); `ollama.max_tokens` 1024 safety cap, `length` reply invalid, not in the cache key; per-stage peak prompt/completion tokens in the stats; "Merged " subjects dropped too; tests (commit order, type commit subjects); `argus` 19 min 21 s, 654 calls, 0 invalid/retries, rerun 0 calls; members with a reason 34 → 62, median 105 → 126 chars, max 489 → 334; spot check 6 C / 4 V / 4 B / 1 W of 15; 264 tests |
 | 4.6 Symbol descriptions (PO redesign) | done | one `description` (members `Description`, types `TypeDescription`) replaces `what`/`why`, `symbols.description` column; commit subjects always in the prompt (`History { tickets, commits }`); "as short as possible", no length limit; validation: blank, control chars, ticket key, openers, source phrases (no "the commit"); `show` prints `- description:`; `argus` 15 min 29 s, 541 chat calls, 0 invalid/retries, rerun 0 calls; median 105 (members) / 147 (types) chars, 99 % one sentence; spot check 15 C / 5 V / 0 W of 20; D-bm–D-bp; 262 tests |
 | 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
+| Phase 6 plan | done | docs only; Phase 6 steps are logged in `usages_state.md` |
 | 5.5 trial re-run | done | *with* arm only on the file output (D-cs): 20 runs, `claude-sonnet-5`, `run.py --with-prompt files` (+3 tests); vs 5.4 without −42 % tokens / −42 % tool calls / −26 % cost (T1–T3 significant); vs 5.4 symbols equal on T1–T3, T4 `show` 3.4 vs 0.8, +25 % tokens (trend); score 37 vs 35 vs 35 / 40, T4 dispatcher missed 2/5 vs 4/5 (n.s.); blind regrade of the 40 old answers 40/40 agree; $1.97; D-ct, #42/#43 |
 | 5.5 review fixes | done | run-out marks: a file's best hit + the overall top 10 (D-co); `… N more` per top-level type (D-cp); stderr note when 100 hits cover fewer than `-k` files (open #44); `-k` errors name both ranges, `-k 21` with the `search` usage; `--kind`/`--role`/`--path` help (D-cq); size "≈ 20–30 %, query-dependent"; `:19-19` kept (D-cn); 314 tests; no reindex |
 | 5.5 File-level search results | done | product-owner redesign: `search` default = top 5 files (of the 100 nearest symbols, by best hit) with top-level type + description and every member / nested type with lines, hits `*score`, 40-line cap; `--symbols` = old output; filters choose hits only; `eval` file-level scores (`argus`: primary file 11 / 17 of 24 top-1 / top-5, any 12 / 20; symbol scores unchanged); output mean ≈ 3.1k chars vs ≈ 4.4k, ≈ 50 ms; 311 tests; no reindex (D-cm–D-cr) |
@@ -2212,6 +2247,8 @@ the decisions taken, and the tradeoffs behind them.
 | 5.1 Embeddings | done | `index_embeddings` stage after types: `fqn\ndescription` (pure `embeddings::embedding_text`, `[embedding] parent_description` off by default) through the embedding cache; `symbol_vectors` `F32_BLOB(<dim>)` + cosine `libsql_vector_idx` (`compress_neighbors=float8`) created by the stage from the first vector's length; `PRAGMA cache_size` 256 MiB for the inserts; `--no-llm`/breaker → cached embeddings only, failed request → cache fallback; embedding model checked with the chat model; `embeddings:` line; 273 tests; `argus`: 654/654 vectors, dim 1024, 11 calls cold (run 10.1 s), rerun 0 calls (2.5 s), index.db 75 MB, ANN recall 1.0 (D-br–D-bv) |
 
 ## Decisions and tradeoffs
+
+Phase 6 decisions (D-cu onward) are in [`usages_state.md`](./usages_state.md).
 
 | # | Decision | Alternatives | Rationale / consequence |
 | --- | --- | --- | --- |
@@ -2359,6 +2396,8 @@ the decisions taken, and the tradeoffs behind them.
 
 ## Open questions
 
+Questions opened by Phase 6 (#45 onward) are in [`usages_state.md`](./usages_state.md).
+
 | # | Question | Raised at | Status |
 | --- | --- | --- | --- |
 | 1 | Jira auth scheme: Cloud uses email + API token (basic auth), Server/DC often uses a personal access token (bearer). Assume Cloud for now? | 0.1 | resolved (3.1, D-w) — email set → basic, else bearer PAT; PM default, product owner may override |
@@ -2402,6 +2441,6 @@ the decisions taken, and the tradeoffs behind them.
 | 39 | `describe.body_chars` (1500) cuts the source of the 2 longest of 479 `argus` members (`AuthDataService#getAuthData(UUID)` ≈ 1964 chars, `RoleRelationsUpdatedMessageConsumer#perform(…)` ≈ 1751, measured on the dedented source the cap applies to; 2046 / 1825 raw, corrected in the 5.3 review fixes), and in both the behaviour a golden question asks about (the logout in the error branch, the role-cache refresh) is after the cut, so their descriptions omit it and they rank 45th and 7th. Raise the default (e.g. 2500) or make the cut keep the tail? | 5.3 | open — product owner: changing it re-describes only those 2 members and their 2 enclosing types (≈ 4 chat calls; prompts of the other members are unchanged), but it changes a default and a prompt input, which this step must not do (D-ch); the prompt tokens grow only for long members |
 | 40 | Retrieval levers after the POC (5.3 misses, D-ch): group a type with its members in `search` output (a class and its main method tie within 0.01–0.03 in 7 of 20 misses); down-weight or tag data carriers (request TOs, response DTOs) that restate the behaviour they carry (3); a lexical or synonym channel for domain words absent from descriptions (5: "second factor" vs security method, "login cookie" vs JWT); fewer shared initiative reasons on sibling classes (open #30). Pursue any? | 5.3 | open — after the POC. The 5.4 trial (D-cl) adds evidence for grouping a type with its members and for callers: its one correctness loss (T4) came from a search hit standing in for its caller (#42); no task missed for vocabulary, so the lexical channel has no new evidence. Decide with #42 **5.5:** the first lever is built as the file view (the product owner's redesign): ties between a class and its member no longer matter at file level (primary file first for 11 of 24 vs the symbol 4); DTOs, vocabulary and the shared initiative reasons remain |
 | 41 | The agent trial (D-cl) is small: 4 tasks × 5 runs per arm on one ≈ 7k-line repository, one model (`claude-sonnet-5`), tasks and answer key by the author who built the index, graded by an LLM. Repeat on a larger repository (where grep is costlier) with tasks written by someone else (product owner, team) and a second model before generalising the −47 % tokens / equal correctness? `scripts/agent_trial/run.py` takes any private task file | 5.4 | open — product owner (after the POC) |
-| 42 | Search can shortcut a call chain: on the flow-trace task (T4) 4 of 5 agents with `annatar` started at the consumer search returned and left out the queue dispatcher that calls it (all 5 without it traced from the queue; Fisher p ≈ 0.05), and none of the 5 got full marks on T4 against 5 of 5 without (p ≈ 0.008) — the one task where `annatar` made answers worse, which cancels the T2 gain in the total (35 vs 35, D-cl). Levers: callers in `show` or the `trace` command of `project.md`; a hint in the agent prompt to check who calls a hit; group a type with its members (#40) | 5.4 | open — after the POC (with #40) **5.5:** the file view lists every member of the hit's file, not its callers in other files, so it may not fix T4; the trial re-run (Next) measures it. **5.5 trial (D-ct):** with the file output the dispatcher was missed in 2 of 5 T4 runs (4 of 5 with symbols, 0 of 5 without; Fisher p = 0.52 vs symbols) and 2 of 5 got full marks; in two runs its file showed up in a search result — better odds, not a fix; T4 also cost ≈ 25 % more (more `show` calls) |
+| 42 | Search can shortcut a call chain: on the flow-trace task (T4) 4 of 5 agents with `annatar` started at the consumer search returned and left out the queue dispatcher that calls it (all 5 without it traced from the queue; Fisher p ≈ 0.05), and none of the 5 got full marks on T4 against 5 of 5 without (p ≈ 0.008) — the one task where `annatar` made answers worse, which cancels the T2 gain in the total (35 vs 35, D-cl). Levers: callers in `show` or the `trace` command of `project.md`; a hint in the agent prompt to check who calls a hit; group a type with its members (#40) | 5.4 | open — after the POC (with #40) **5.5:** the file view lists every member of the hit's file, not its callers in other files, so it may not fix T4; the trial re-run (Next) measures it. **5.5 trial (D-ct):** with the file output the dispatcher was missed in 2 of 5 T4 runs (4 of 5 with symbols, 0 of 5 without; Fisher p = 0.52 vs symbols) and 2 of 5 got full marks; in two runs its file showed up in a search result — better odds, not a fix; T4 also cost ≈ 25 % more (more `show` calls) **Phase 6 plan:** usages (`used by`, `trace`) planned as the lever, measured by the T4 re-run in 6.7 |
 | 43 | The file view ranks a file by its single best symbol (D-cm). A file whose many members all match moderately ranks below a file with one strong lookalike (a DTO or a sibling consumer); the reverse risk of a sum is promoting DTOs full of accessors. Try the mean of a file's top 2–3 hits, or the type's own score plus its best member, once the trial re-run or a larger golden set shows file misses that ranking would fix? | 5.5 | open — on `argus` the primary's file misses the top 5 for 7 of 24, mostly vocabulary (5.3 causes), not ranking. **5.5 trial:** no task missed a file for ranking; on the first T4 query ("subscription booked additional product feature") the feature consumer's file ranks 6th, behind its message DTO's file (2nd, through a nested accessor), where the symbol list had the consumer 9th — a lookalike ahead of the real file, but the agents found the consumer with their second query in every run, so the trial gives no evidence that a different file score would change the answers |
 | 44 | The file view groups the 100 nearest symbols (`MAX_LIMIT`); when they cover fewer than `-k` files, `search` prints fewer files and a note on stderr (5.5 review). Fetch more? Unfiltered queries go through `vector_top_k`, which returns at most ≈ 200 rows (open #36), so more would need an exact `vector_distance_cos` scan as the fallback (like filtered queries), or repeated fetches until k files | 5.5 review | open — on `argus` 100 hits span 33–54 files, so the note has not fired unfiltered; it can fire on a large file-heavy hit list or a filter matching many symbols in few files |
