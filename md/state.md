@@ -17,6 +17,12 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Done
 
+- **PO decision D-bq: member reasons are optional.** A method without its
+  own reason is good enough when its class has one. All 654 `argus`
+  symbols have a description (checked on `data-real`); the reason counts
+  in the 4.6 entries count only descriptions that also say why. No code
+  rule for member reasons; Next and open #34 updated.
+
 - **4.6 review fixes and PO feedback (keep reasons).** One commit. *PO
   feedback (verbatim), after seeing that "as short as possible" dropped
   `UserTokenService#removeAllTokens(List<UUID>)`'s emergency-logout reason
@@ -1508,19 +1514,16 @@ the decisions taken, and the tradeoffs behind them.
 ### Next
 
 - **Agent:** 5.1 Embeddings (embed `fqn + description` through the
-  embedding cache; 4.6 replaced `fqn + what + why`). Open #29 (logs on
+  embedding cache; 4.6 replaced `fqn + what + why`; per D-bq consider
+  adding the parent type's description to a member's embedded text and
+  let 5.3 decide). Open #29 (logs on
   stdout) must be fixed before or with 5.2, since the CLI is the agents'
   interface (D-ax).
-- **Product owner:** confirm the reworded 4.6 descriptions (D-bm amended):
-  own reasons are kept now (members with a reason 34 → 62, e.g. the
-  emergency logout of `removeAllTokens(List<UUID>)`), at the cost of more
-  borrowed ones (upgrade/initiative themes on `Privilege`, `TokenType`,
-  accessors and constructors; 4 of 15 spot-checked) and one wrong reason
-  that came back (`OAuth2RequestCacheService`). Is that trade-off right,
-  or should a code rule skip reasons for detected accessors and
-  field-storing constructors (D-bj fallback)? Also still open: the 4.5
-  review verdicts and golden questions (open #34) and the backup of
-  `.annatar-local/golden-argus.toml`.
+- **Product owner:** the 4.6 trade-off is settled (D-bq: a member without
+  a reason is fine when its class has one). Still open: the 4.5 review
+  verdicts and golden questions (open #34), the borrowed reasons on
+  `Privilege`/`TokenType` and the wrong one on `OAuth2RequestCacheService`
+  (open #30), and the backup of `.annatar-local/golden-argus.toml`.
 - **Product owner:** confirm or override the PM defaults for J1, J2, J4,
   J9 (D-w–D-y, D-aa), the open #19 decision (D-ab) and J5–J8 (D-ac, D-ad);
   D-w and D-y are now backed by the real Jira (see their notes).
@@ -1696,6 +1699,7 @@ the decisions taken, and the tradeoffs behind them.
 | D-bn (4.6) | Context: members send the capped source (`body_chars`), types the outline and their listed children's **full** descriptions (no per-child cap); tickets as before (first + `recent_tickets`, 4.2 summary + `Reason:` purpose, Jira title only as the D-ba fallback — **no raw title next to the summary**); **commit subjects always** (newest `commit_subjects` = 5 distinct, merges and blanks left out), for members and types, also when tickets are available. `History` is a struct `{ tickets, commits }`; the prompt shows `Tickets:` and `Commits:` sections, each `(none)` when empty | Raw title too; commits only as a fallback (4.3); cap child descriptions in type prompts | The PO named the commit history as context. Titles are mostly German and already condensed by the summary (which saw title + description), so they would add tokens, not facts. Commit subjects often carry the ticket key; 0 replies named a key on `argus` (D-bh still rejects them). Children are listed in full because descriptions are short (p90 193 chars) and capped at 30 per type; the longest type prompt was 1425 tokens on `argus` (corrected in the 4.6 review fixes: annatar has no input-truncation check, so "no truncation warning" meant nothing; the stats now print the per-stage peak prompt and completion tokens, to compare against the model's context size). Commit subjects are per symbol, so prompts stay independent of `--path` **Amended (4.6 review fixes):** merge subjects are those starting with "Merge " or "Merged " (Bitbucket "Merged in …", "Merged master into …"). A parent count (`%P`) would be exact but needs a new history cache table, a `symbol_commits` column and a cold history run; `git log -L` on `argus` lists only 5 merge commits among 272 distinct commits, all "Merge …", so the prefix list is enough |
 | D-bo (4.6) | Validation of a description: non-blank, no control characters, no ticket key (D-bh), no opener "This method/constructor/function" (members) or "This class/interface/enum/record/annotation/type" (types), no source or missing-information phrase (`summaries::source_meta_phrase` = D-bb's `REASON_META_PHRASES` **without "the commit"**, plus "commit history", plus a whole reply "Not specified"/"Unknown"/"None"/…); whitespace collapsed before storing. Dropped: length caps (`MAX_WHAT_CHARS`/`MAX_WHY_CHARS`), why-restates-what (D-av), "this method" anywhere and "this <kind> exists/is/was" (D-bi), which were `why`-specific. `finish_reason=length` detection (4.1) stays | Keep a generous cap (e.g. 1000); keep the full D-bb list | PO: no length limit. "the commit" is domain text in a description of behaviour ("publishes the event after the commit"); "this class is required" in the middle of a description is harmless once the opener is caught. Ticket summaries keep their own caps and checks (4.2 unchanged) **Amended (4.6 review fixes):** the meta check is description-specific (`describe::description_meta_phrase`): only clearly meta phrases, built from sources (ticket(s), commit(s), commit message(s), commit/change history, history, Javadoc) × "according to the …", "the … says/states/shows/mentions/explains", "the … does not / don't say/state/mention/specify/explain/give", "not stated/specified/mentioned/given/provided in the …", plus "no reason (is) given/stated/provided" and the bare stand-in replies; D-bb's list stays for the 4.2 purpose only. It rejected behaviour descriptions ("Returns null when the request does not specify a locale", "Records the change history of an order", "Closes this ticket …"). **Safety cap:** `ollama.max_tokens` (default 1024, `0` = not sent) bounds a looping reply, which would otherwise run to Ollama's limits or the 600 s timeout and trip the breaker for the whole run; it is not a length limit (the prompt mentions none; peak completion on `argus` 84 tokens, so the default is 12× above any real reply). A `length` reply is invalid even when it parses (retried once, never cached). Not in the LLM cache key: only complete replies are cached and a cap does not change a complete reply, so keying it would only re-ask cached summaries. With reasoning on, reasoning tokens count against the cap (probed), so raise it then |
 | D-bp (4.6) | `show` prints `- description:` for the symbol and every child in full; no display truncation. Stats lines and counters keep their names (`describe:`/`types:`, `described`, …) | First sentence or a truncated line for children | 99 % of descriptions are one sentence and p90 is ≈ 200 chars, so truncation would save little and `show` is the detail view; storage is never truncated |
+| D-bq (PO, after 4.6) | **Product-owner decision:** a member whose description carries no reason is fine as long as its enclosing type's description has one ("a method on a class that has a reason is good enough"). Every symbol keeps a code-based description (all 654 on `argus`); reasons are required only where the history explains the symbol, and the type level is where they are expected. No code rule to force or suppress member reasons (the D-bj fallback is not taken). | Push for a reason on every member; or a code rule that strips reasons from accessors/field-storing constructors | Asked after the PO read "62 of 479 members with a reason" as missing descriptions: the gap is reasons, not descriptions, and the class reason covers its members. Consequence for 5.1/5.3: a member's own embedding text lacks the class reason, so evaluate whether adding the parent type's description to a member's embedded text helps the golden set. |
 
 ## Open questions
 
