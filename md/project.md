@@ -92,6 +92,7 @@ Tables in `index.db`:
 - `edges`: src, dst, kind (call, import, implements)
 - `symbol_vectors`: embeddings of the fqn and description text, not of the code
 - `tickets`: one cached summary per ticket ID
+- `index_meta`: the settings the index was built with (embedding model, dimension, embedded-text options), so search can refuse a query model that does not match
 
 Vector search finds candidate symbols; plain joins and recursive CTEs over `edges` answer usage and blast-radius questions. No separate graph database is needed.
 

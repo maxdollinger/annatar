@@ -37,7 +37,7 @@
 //! [`LlmClient::check_models`] fails a run whose chat or embedding model does
 //! not exist.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -840,9 +840,12 @@ impl LlmClient {
 
     /// One vector per text, in input order. Cached texts are not sent;
     /// repeated texts are sent once; the rest go out in batches of
-    /// [`EMBED_BATCH`]. Vectors of different lengths (a changed model behind
-    /// the same name, a bad cache row) are an error, and such a batch is not
-    /// cached.
+    /// [`EMBED_BATCH`]. The first response sets the dimension: cached vectors
+    /// of another length (the model behind the name changed) are stale and
+    /// re-embedded, with one warning; when the cached vectors differ among
+    /// themselves and nothing else is sent, all of them are. Responses of
+    /// different lengths (or an empty vector) are an error, and such a batch
+    /// is not cached.
     pub async fn embed<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
         self.embed_with(texts, true)
             .await?
@@ -854,12 +857,18 @@ impl LlmClient {
     /// The cached vector of each text, in input order, `None` for a miss,
     /// without ever calling the backend: the cache-only half of
     /// [`LlmClient::embed`]. Hits count in `embed_hits`; cached vectors of
-    /// different lengths are an error.
+    /// different lengths are an error (only a run that may call the model
+    /// can tell which are stale).
     pub async fn cached_embeddings<S: AsRef<str>>(
         &self,
         texts: &[S],
     ) -> Result<Vec<Option<Vec<f32>>>> {
         self.embed_with(texts, false).await
+    }
+
+    /// The embedding model's name, as configured.
+    pub fn embedding_model(&self) -> &str {
+        &self.embedding_model
     }
 
     /// [`LlmClient::embed`], sending the misses only when `send` is set.
@@ -869,7 +878,7 @@ impl LlmClient {
         send: bool,
     ) -> Result<Vec<Option<Vec<f32>>>> {
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        let mut dim: Option<usize> = None;
+        let mut cached: Vec<(&str, String)> = Vec::new();
         let mut missing: Vec<(&str, String)> = Vec::new();
         let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
         for (position, text) in texts.iter().enumerate() {
@@ -882,8 +891,8 @@ impl LlmClient {
             let key = embedding_key(&self.embedding_model, text);
             match self.cached_embedding(&key).await {
                 Ok(Some(vector)) => {
-                    check_dim(&mut dim, vector.len())?;
                     vectors[position] = Some(vector);
+                    cached.push((text, key));
                 }
                 Ok(None) => missing.push((text, key)),
                 Err(err) => {
@@ -893,10 +902,83 @@ impl LlmClient {
             }
         }
 
+        let lengths: Vec<usize> = cached
+            .iter()
+            .filter_map(|(text, _)| vectors[positions[text][0]].as_ref().map(Vec::len))
+            .collect();
+        let mixed = lengths.iter().find(|&&len| len != lengths[0]);
+        if let Some(&other) = mixed {
+            if !send {
+                bail!(
+                    "cached embeddings differ in length ({} and {other}); did the embedding model {:?} change? A run that may call the model re-embeds them",
+                    lengths[0],
+                    self.embedding_model
+                );
+            }
+            if missing.is_empty() {
+                tracing::warn!(
+                    model = self.embedding_model.as_str(),
+                    cached = cached.len(),
+                    "cached embeddings differ in length ({} and {other}); re-embedding all of them",
+                    lengths[0]
+                );
+                for (text, _) in &cached {
+                    vectors[positions[text][0]] = None;
+                }
+                missing.append(&mut cached);
+            }
+        }
+
         if !send {
             missing.clear();
         }
-        for batch in missing.chunks(EMBED_BATCH) {
+        let mut dim: Option<usize> = None;
+        self.embed_batches(&missing, &positions, &mut vectors, &mut dim)
+            .await?;
+        if let Some(live) = dim {
+            let stale: Vec<(&str, String)> = cached
+                .extract_if(.., |(text, _)| {
+                    vectors[positions[text][0]]
+                        .as_ref()
+                        .is_some_and(|vector| vector.len() != live)
+                })
+                .collect();
+            if let Some((text, _)) = stale.first() {
+                tracing::warn!(
+                    model = self.embedding_model.as_str(),
+                    stale = stale.len(),
+                    "cached embeddings have {} values but the model now returns {live}; re-embedding them",
+                    vectors[positions[text][0]].as_ref().map_or(0, Vec::len)
+                );
+                self.embed_batches(&stale, &positions, &mut vectors, &mut dim)
+                    .await?;
+            }
+        }
+
+        let mut hits = 0;
+        for (text, _) in &cached {
+            hits += positions[text].len();
+        }
+        for seen in positions.values() {
+            for &position in &seen[1..] {
+                vectors[position] = vectors[seen[0]].clone();
+            }
+        }
+        self.counters.embed_hits.fetch_add(hits, Ordering::Relaxed);
+        Ok(vectors)
+    }
+
+    /// Send `texts` to the embedding model in batches of [`EMBED_BATCH`],
+    /// cache each batch and put its vectors at the texts' first `positions`.
+    /// `dim` is the length every response must have (set by the first one).
+    async fn embed_batches(
+        &self,
+        texts: &[(&str, String)],
+        positions: &HashMap<&str, Vec<usize>>,
+        vectors: &mut [Option<Vec<f32>>],
+        dim: &mut Option<usize>,
+    ) -> Result<()> {
+        for batch in texts.chunks(EMBED_BATCH) {
             let inputs: Vec<String> = batch.iter().map(|(text, _)| text.to_string()).collect();
             self.counters.embed_calls.fetch_add(1, Ordering::Relaxed);
             self.counters
@@ -915,7 +997,10 @@ impl LlmClient {
                 );
             }
             for vector in &embedded {
-                check_dim(&mut dim, vector.len())?;
+                if vector.is_empty() {
+                    bail!("the embedding backend returned an empty vector");
+                }
+                check_dim(dim, vector.len())?;
             }
             let rows: Vec<(&str, &[f32])> = batch
                 .iter()
@@ -929,19 +1014,7 @@ impl LlmClient {
                 vectors[positions[text][0]] = Some(vector);
             }
         }
-
-        let missed: HashSet<&str> = missing.iter().map(|(text, _)| *text).collect();
-        let mut hits = 0;
-        for (text, seen) in &positions {
-            if !missed.contains(text) && vectors[seen[0]].is_some() {
-                hits += seen.len();
-            }
-            for &position in &seen[1..] {
-                vectors[position] = vectors[seen[0]].clone();
-            }
-        }
-        self.counters.embed_hits.fetch_add(hits, Ordering::Relaxed);
-        Ok(vectors)
+        Ok(())
     }
 
     async fn cached_completion(&self, key: &str) -> Result<Option<String>> {
@@ -1028,11 +1101,12 @@ fn accept<T>(_: &T) -> Result<(), String> {
     Ok(())
 }
 
-/// Record the first vector length seen in `dim`; a different one is an error.
+/// Record the first response's vector length in `dim`; a different one is
+/// an error.
 fn check_dim(dim: &mut Option<usize>, len: usize) -> Result<()> {
     match *dim {
         Some(expected) if expected != len => bail!(
-            "embedding vectors differ in length ({expected} and {len}); did the embedding model change?"
+            "the embedding model returned vectors of different lengths ({expected} and {len})"
         ),
         Some(_) => Ok(()),
         None => {
@@ -1165,7 +1239,8 @@ pub(crate) mod fake {
     /// A [`LlmBackend`] that answers chats from a script (in order; an empty
     /// script is an error; a standing reply for a response type comes
     /// first) and embeds a text as `[chars, first byte, 1.0]` (without the
-    /// `1.0` for a text marked [`FakeBackend::short`]).
+    /// `1.0` for a text marked [`FakeBackend::short`], with a trailing `0.5`
+    /// after [`FakeBackend::widen`]).
     /// It records every chat request and embedding batch.
     #[derive(Default)]
     pub struct FakeBackend {
@@ -1178,6 +1253,8 @@ pub(crate) mod fake {
         short: Mutex<Vec<String>>,
         lacks: Mutex<Vec<String>>,
         embed_fails: AtomicBool,
+        fail_from: Mutex<Option<usize>>,
+        wide: AtomicBool,
     }
 
     /// How [`FakeBackend::has_model`] answers.
@@ -1207,6 +1284,18 @@ pub(crate) mod fake {
         /// Fail every embedding request from now on (recorded first).
         pub fn fail_embeddings(&self) {
             self.embed_fails.store(true, Ordering::Relaxed);
+        }
+
+        /// Fail every embedding request from the `n`th one on (counting all
+        /// requests so far, from 1; recorded first).
+        pub fn fail_embeddings_from(&self, n: usize) {
+            *self.fail_from.lock().unwrap() = Some(n);
+        }
+
+        /// Embed every text with one more value (`0.5`) from now on, like a
+        /// different model behind the same name.
+        pub fn widen(&self) {
+            self.wide.store(true, Ordering::Relaxed);
         }
 
         /// The model names checked so far.
@@ -1248,6 +1337,33 @@ pub(crate) mod fake {
         }
     }
 
+    /// `future`'s output and the warnings it logged, as plain text.
+    pub async fn with_warnings<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let output = future.with_subscriber(subscriber).await;
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        (output, logs)
+    }
+
     pub fn vector_for(text: &str) -> Vec<f32> {
         vec![
             text.chars().count() as f32,
@@ -1278,17 +1394,26 @@ pub(crate) mod fake {
         ) -> BackendFuture<'a, Vec<Vec<f32>>> {
             Box::pin(async move {
                 assert!(!texts.is_empty(), "the client never sends an empty batch");
-                self.batches.lock().unwrap().push(texts.to_vec());
-                if self.embed_fails.load(Ordering::Relaxed) {
+                let request = {
+                    let mut batches = self.batches.lock().unwrap();
+                    batches.push(texts.to_vec());
+                    batches.len()
+                };
+                let fails_from = self.fail_from.lock().unwrap().is_some_and(|n| request >= n);
+                if self.embed_fails.load(Ordering::Relaxed) || fails_from {
                     return Err(anyhow!("embedding server down"));
                 }
                 let short = self.short.lock().unwrap();
+                let wide = self.wide.load(Ordering::Relaxed);
                 Ok(texts
                     .iter()
                     .map(|text| {
                         let mut vector = vector_for(text);
                         if short.contains(text) {
                             vector.pop();
+                        }
+                        if wide {
+                            vector.push(0.5);
                         }
                         vector
                     })
@@ -1324,7 +1449,7 @@ mod tests {
 
     use serde::Deserialize;
 
-    use super::fake::{FakeBackend, ModelCheck, vector_for};
+    use super::fake::{FakeBackend, ModelCheck, vector_for, with_warnings};
     use super::*;
     use crate::config::Config;
     use crate::store::Store;
@@ -2170,18 +2295,83 @@ mod tests {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
         let llm = client(&backend, &store, &ollama("chat"));
-        llm.embed(&["alpha"]).await.unwrap();
         backend.short("beta");
         backend.short("gamma");
 
-        let err = llm.embed(&["alpha", "beta"]).await.unwrap_err();
-        assert!(err.to_string().contains("differ in length"), "{err}");
         let err = llm.embed(&["delta", "gamma"]).await.unwrap_err();
-        assert!(err.to_string().contains("differ in length"), "{err}");
+        assert!(err.to_string().contains("different lengths"), "{err}");
         assert_eq!(
             count(&store, "embedding_cache").await,
-            1,
-            "nothing mixed is cached"
+            0,
+            "a mixed batch is not cached"
+        );
+
+        llm.embed(&["alpha"]).await.unwrap();
+        let err = llm.embed(&["alpha", "beta"]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("different lengths"),
+            "the stale alpha is re-embedded with the old length: {err}"
+        );
+        let err = llm.cached_embeddings(&["alpha", "beta"]).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cached embeddings differ in length (3 and 2)")
+                && format!("{err:#}").contains("\"embed\""),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_embeddings_of_another_length_are_re_embedded() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.embed(&["alpha", "beta"]).await.unwrap();
+        backend.widen();
+        let wide = |text: &str| {
+            let mut vector = vector_for(text);
+            vector.push(0.5);
+            vector
+        };
+
+        let (vectors, logs) = with_warnings(llm.embed(&["gamma", "alpha", "alpha"])).await;
+        assert_eq!(
+            vectors.unwrap(),
+            vec![wide("gamma"), wide("alpha"), wide("alpha")]
+        );
+        assert!(
+            logs.contains("cached embeddings have 3 values but the model now returns 4"),
+            "{logs}"
+        );
+        assert_eq!(
+            backend.batches()[1..],
+            [vec!["gamma".to_string()], vec!["alpha".to_string()]]
+        );
+
+        let before = llm.stats();
+        let (vectors, logs) = with_warnings(llm.embed(&["alpha", "beta"])).await;
+        assert_eq!(vectors.unwrap(), vec![wide("alpha"), wide("beta")]);
+        assert!(
+            logs.contains("cached embeddings differ in length (4 and 3); re-embedding all of them"),
+            "{logs}"
+        );
+        assert_eq!(
+            backend.batches().last().unwrap(),
+            &vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(llm.stats().since(&before).embed_hits, 0);
+
+        let calls = backend.batches().len();
+        let before = llm.stats();
+        assert_eq!(
+            llm.embed(&["alpha", "beta", "gamma"]).await.unwrap(),
+            vec![wide("alpha"), wide("beta"), wide("gamma")]
+        );
+        assert_eq!(backend.batches().len(), calls, "the cache was rewritten");
+        assert_eq!(llm.stats().since(&before).embed_hits, 3);
+        assert_eq!(
+            count(&store, "llm_cache").await,
+            0,
+            "re-embedding never touches the chat cache"
         );
     }
 
