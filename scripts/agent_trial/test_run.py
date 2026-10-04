@@ -1,0 +1,106 @@
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+import run
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class AnnatarCallsTest(unittest.TestCase):
+    def test_plain_and_chained(self):
+        self.assertEqual(run.annatar_calls('annatar search "a b" && annatar show \'x.Y\''), ["search", "show"])
+        self.assertEqual(run.annatar_calls("annatar search a; annatar search b | head -20"), ["search", "search"])
+        self.assertEqual(run.annatar_calls("annatar search a\nannatar show b"), ["search", "show"])
+
+    def test_path_and_no_call(self):
+        self.assertEqual(run.annatar_calls("/opt/bin/annatar show x"), ["show"])
+        self.assertEqual(run.annatar_calls("grep -rn annatar src"), [])
+        self.assertEqual(run.annatar_calls('echo "annatar search x"'), [])
+
+    def test_env_assignments_and_subshells(self):
+        self.assertEqual(run.annatar_calls("RUST_LOG=off A=1 annatar search q"), ["search"])
+        self.assertEqual(run.annatar_calls('echo "$(annatar search q)"'), ["search"])
+        self.assertEqual(run.annatar_calls("x=$(annatar show a)"), ["show"])
+        self.assertEqual(run.annatar_calls("(cd /r && annatar search q)"), ["search"])
+        self.assertEqual(run.annatar_calls("x=`annatar show a`"), ["show"])
+
+    def test_global_options_before_subcommand(self):
+        self.assertEqual(run.annatar_calls("annatar -k 5 search q"), ["search"])
+        self.assertEqual(run.annatar_calls("annatar --config a.toml -v search q"), ["search"])
+        self.assertEqual(run.annatar_calls("annatar --path=src show x"), ["show"])
+        self.assertEqual(run.annatar_calls("annatar --help"), ["?"])
+
+    def test_query_with_separators_stays_one_call(self):
+        self.assertEqual(run.annatar_calls('annatar search "a; annatar show b"'), ["search"])
+
+    def test_unbalanced_quotes_fall_back(self):
+        self.assertEqual(run.annatar_calls("annatar search 'q && annatar show x"), ["search", "show"])
+
+
+class StreamTest(unittest.TestCase):
+    def test_parse_stream(self):
+        tools, annatar, result, final = run.parse_stream(FIXTURES / "raw" / "T1-with-1.jsonl")
+        self.assertEqual(tools, {"Bash": 2, "Read": 1})
+        self.assertEqual(annatar, {"search": 2, "show": 1, "other": 0})
+        self.assertEqual(result["subtype"], "success")
+        self.assertEqual(final, "The cap is in TokenStore.")
+
+    def test_parse_stream_without_result(self):
+        tools, annatar, result, final = run.parse_stream(FIXTURES / "raw" / "T1-with-2.jsonl")
+        self.assertEqual(tools, {"Bash": 1})
+        self.assertIsNone(result)
+        self.assertEqual(final, "")
+
+    def test_rows_and_problems(self):
+        data, problems = run.rows(FIXTURES)
+        self.assertEqual([r["run"] for r in data], ["T1-with-1", "T1-without-1"])
+        first = data[0]
+        self.assertEqual((first["task"], first["arm"], first["rep"]), ("T1", "with", 1))
+        self.assertEqual(first["tokens_total"], 6 + 1000 + 200 + 50)
+        self.assertEqual(first["tool_calls"], 3)
+        self.assertEqual((first["annatar_search"], first["annatar_show"]), (2, 1))
+        self.assertIsNone(first["returncode"])
+        self.assertEqual(data[1]["returncode"], 1)
+        self.assertEqual((data[1]["grep"], data[1]["glob"]), (1, 1))
+        self.assertEqual(problems, [
+            "T1-with-2: timed out",
+            "T1-with-2: no result event, left out",
+            "T1-without-1: exit 1",
+            "T1-without-1: subtype error_max_turns",
+        ])
+
+
+class PathTest(unittest.TestCase):
+    def test_annatar_only_on_the_with_path(self):
+        old = dict(os.environ)
+        with tempfile.TemporaryDirectory() as bin_dir, tempfile.TemporaryDirectory() as other:
+            for d in (bin_dir, other):
+                tool = Path(d) / "annatar"
+                tool.write_text("#!/bin/sh\n")
+                tool.chmod(0o755)
+            try:
+                os.environ["ANNATAR_TRIAL_BIN"] = bin_dir
+                os.environ["PATH"] = f"{bin_dir}:/usr/bin"
+                without, with_ = run.arm_env("without"), run.arm_env("with")
+                self.assertNotIn(bin_dir, without["PATH"].split(":"))
+                self.assertEqual(with_["PATH"].split(":")[0], bin_dir)
+                run.check_path("without", without)
+                run.check_path("with", with_)
+                without["PATH"] = f"{other}:/usr/bin"
+                with self.assertRaises(SystemExit):
+                    run.check_path("without", without)
+                with_["PATH"] = f"{other}:{bin_dir}"
+                with self.assertRaises(SystemExit):
+                    run.check_path("with", with_)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+
+if __name__ == "__main__":
+    unittest.main()

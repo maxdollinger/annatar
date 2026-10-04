@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","model":"test-model"}
+not json
+{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Bash","input":{"command":"annatar search \"session limit\" && annatar -k 5 search \"token cap\""}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"annatar show 'com.example.TokenStore'"}},{"type":"tool_use","name":"Read","input":{"file_path":"src/TokenStore.java"}}]}}
+{"type":"result","subtype":"success","num_turns":4,"duration_ms":12345,"total_cost_usd":0.05,"modelUsage":{"test-model":{}},"usage":{"input_tokens":6,"cache_read_input_tokens":1000,"cache_creation_input_tokens":200,"output_tokens":50},"result":"The cap is in TokenStore."}
