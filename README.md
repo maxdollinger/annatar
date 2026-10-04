@@ -65,7 +65,7 @@ You need:
    chat_model = "qwen3.8:latest"
    embedding_model = "bge-m3:latest"
    ```
-   All options are explained in this repository's [`annatar.toml`](./annatar.toml). For a scoped Jira token, see the [reference](./md/reference.md).
+   All options are explained in this repository's [`annatar.toml`](./annatar.toml).
 2. **Add the data directory to `.gitignore`** (`.annatar/`).
 3. **Run the index:**
    ```sh
@@ -97,11 +97,11 @@ For a coding agent, add this to the repository's `AGENTS.md` / `CLAUDE.md`:
 Descriptions can be wrong; the code is the source of truth.
 ```
 
-Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only), `-v` (logs on stderr). Everything else (output formats, filters, `eval`, `eval-usages`, how each stage works) is in [`md/reference.md`](./md/reference.md).
+Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only), `-v` (logs on stderr).
 
 ## POC findings
 
-On one Java/Spring repository (654 symbols, 69 tickets); details in [`md/state.md`](./md/state.md) and [`md/usages_state.md`](./md/usages_state.md).
+On one Java/Spring repository (654 symbols, 69 tickets).
 
 - **Search** finds the right file (top 5 for 17 of 24 questions), rarely the exact symbol, so it returns files.
 - **Usages** are precise: precision 1.000, recall 0.972 on 54 hand-checked symbols; calls inside lambdas and into libraries stay unresolved.
