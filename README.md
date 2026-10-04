@@ -95,6 +95,15 @@ the index's embedding settings and `k`; per question its number, the rank of the
 
 `--path <PREFIX>` is for fast iteration on part of the repo, not for refreshing a slice: a `--path` run still replaces the whole `index.db`, which then holds only that prefix (empty if the prefix matches nothing). The run logs a warning saying so; run `annatar index` without `--path` to get the full index back.
 
+## POC findings
+
+Measured on one Java/Spring repository (654 symbols, 69 tickets); details in [`md/state.md`](./md/state.md).
+
+- **Descriptions:** generated for every class and method with no invalid replies. A full cold run takes about 20 minutes, and a rerun with a warm cache makes 0 LLM calls (about 2 s).
+- **Retrieval** (24 golden questions, `annatar eval`): search finds the right **file**, not the exact symbol. The expected file ranks first for 11 of 24 questions and is in the top 5 for 17 (20 counting alternates); the exact symbol ranks first for only 4. That is why `search` returns files.
+- **Agents** (4 tasks × 5 runs, Claude Code via the CLI): with Annatar, agents used about 40–45 % fewer tokens and tool calls, cost about 25–30 % less and were as correct or slightly more (37 vs 35 of 40). Reasons that live only in tickets were found only with Annatar (5/5 vs 0/5). The weak spot is tracing a call chain across files, where search can skip a step.
+- **Caveats:** small samples, one repository, tasks and questions written by the same author.
+
 ## Goals
 
 - **Faster onboarding** for new engineers
