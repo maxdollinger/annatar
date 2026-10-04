@@ -31,9 +31,17 @@
 //! none that takes the arguments makes no edge.
 //! Members the compiler or Lombok generates (accessors, builders, record
 //! accessors, enum `values()`) are a `reference` to their type and carry
-//! the chain on. A receiver outside the index (a library type, an untyped
-//! lambda parameter, a type variable) stops it: no edge, counted by
+//! the chain on. A member inherited from a generic super type has, on a
+//! subtype, the type argument the subtype gives its type variable; a
+//! variable typed by a bounded type variable of its method has the bound's
+//! type. A receiver outside the index (a library type, an untyped lambda
+//! parameter, an unbound type variable) stops it: no edge, counted by
 //! `Receiver#name`.
+//!
+//! Last, every method gets an `overrides` edge to each method it overrides
+//! nearest in its indexed super types (same name and parameter count,
+//! parameter types equal once the super types' type arguments are
+//! substituted).
 
 mod expr;
 mod members;
@@ -63,6 +71,8 @@ pub enum EdgeKind {
     /// A method or constructor called: `x.m(..)`, `m(..)`, `super(..)`,
     /// `this(..)`, `x::m`.
     Call,
+    /// A method to the method it overrides in an indexed super type.
+    Overrides,
 }
 
 impl EdgeKind {
@@ -74,6 +84,7 @@ impl EdgeKind {
             EdgeKind::Instantiate => "instantiate",
             EdgeKind::Reference => "reference",
             EdgeKind::Call => "call",
+            EdgeKind::Overrides => "overrides",
         }
     }
 }
@@ -162,6 +173,7 @@ pub fn resolve<'a>(files: &'a [SourceFile<'a>]) -> Usages {
         };
         walk.children(file.tree.root_node(), true);
     }
+    usages.edges.extend(resolver.override_edges());
     usages
 }
 
@@ -276,9 +288,17 @@ mod tests {
                 EdgeKind::Instantiate,
                 EdgeKind::Reference,
                 EdgeKind::Call,
+                EdgeKind::Overrides,
             ]
             .map(EdgeKind::as_str),
-            ["extends", "implements", "instantiate", "reference", "call"]
+            [
+                "extends",
+                "implements",
+                "instantiate",
+                "reference",
+                "call",
+                "overrides"
+            ]
         );
     }
 

@@ -217,6 +217,8 @@ pub struct IndexStats {
     pub edges_reference: usize,
     /// `call` rows written to `edges`.
     pub edges_call: usize,
+    /// `overrides` rows written to `edges`.
+    pub edges_overrides: usize,
     /// Mentions of type names that resolve to no indexed type (JDK,
     /// libraries, names outside a `--path` prefix); no edge.
     pub unresolved_types: usize,
@@ -248,6 +250,7 @@ impl IndexStats {
             + self.edges_instantiate
             + self.edges_reference
             + self.edges_call
+            + self.edges_overrides
     }
 }
 
@@ -446,6 +449,7 @@ pub async fn build_index(
         edges_instantiate = stats.edges_instantiate,
         edges_reference = stats.edges_reference,
         edges_call = stats.edges_call,
+        edges_overrides = stats.edges_overrides,
         calls_resolved = stats.calls_resolved,
         calls_implicit = stats.calls_implicit,
         calls_ambiguous = stats.calls_ambiguous,
@@ -612,6 +616,7 @@ async fn index_edges(
             EdgeKind::Instantiate => stats.edges_instantiate += 1,
             EdgeKind::Reference => stats.edges_reference += 1,
             EdgeKind::Call => stats.edges_call += 1,
+            EdgeKind::Overrides => stats.edges_overrides += 1,
         }
     }
     stats.unresolved_types = found.unresolved.values().sum();
@@ -2535,6 +2540,39 @@ class User {
             (2, 1, 1, 1),
             "x.toString() is outside the index, User's constructor implicit"
         );
+    }
+
+    #[tokio::test]
+    async fn overrides_are_written_and_counted() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Handler.java",
+            "\
+package com.acme;
+interface Handler<T> { void handle(T value); }
+class Mail {}
+class MailHandler implements Handler<Mail> {
+    @Override
+    public void handle(Mail mail) {}
+}
+",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = build(repo.path(), data.path()).await.unwrap();
+        let rows = edge_rows(data.path()).await;
+        let overrides: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.contains("-overrides->"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            overrides,
+            ["com.acme.MailHandler#handle(Mail) -overrides-> com.acme.Handler#handle(T) :6"]
+        );
+        assert_eq!(stats.edges_overrides, 1);
+        assert_eq!(stats.edges(), rows.len());
     }
 
     #[tokio::test]

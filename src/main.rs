@@ -14,6 +14,7 @@ use annatar::store::{IndexReader, Store};
 use annatar::summaries::Summarizer;
 use annatar::symbols::{Role, SymbolKind};
 use annatar::tickets::TicketFetch;
+use annatar::usage_eval::{self, UsageSet};
 use annatar::{eval, indexer, show};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
@@ -98,6 +99,14 @@ enum Command {
         /// Hits searched per question; at least 5, as the report counts top-5.
         #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_eval_limit)]
         limit: usize,
+    },
+    /// Score the usages (`edges`) against a usage golden set: prints per
+    /// symbol the precision and recall of its direct users with the missed
+    /// and extra ones, the overriding methods when the set lists them, then
+    /// precision and recall over all symbols, types and members.
+    EvalUsages {
+        /// The usage golden set (TOML, see `usage_eval`).
+        set: PathBuf,
     },
 }
 
@@ -201,13 +210,14 @@ async fn run(cli: &Cli) -> Result<()> {
                 stats.unreadable
             );
             println!(
-                "edges: {} ({} extends, {} implements, {} instantiate, {} reference, {} call); {} unresolved type mentions ({} names); {} ms",
+                "edges: {} ({} extends, {} implements, {} instantiate, {} reference, {} call, {} overrides); {} unresolved type mentions ({} names); {} ms",
                 stats.edges(),
                 stats.edges_extends,
                 stats.edges_implements,
                 stats.edges_instantiate,
                 stats.edges_reference,
                 stats.edges_call,
+                stats.edges_overrides,
                 stats.unresolved_types,
                 stats.unresolved_type_names,
                 stats.edges_time.as_millis()
@@ -355,6 +365,15 @@ async fn run(cli: &Cli) -> Result<()> {
                 eval::settings_line(reader.connection(), *limit).await?
             );
             print!("{}", eval::format_report(&outcomes));
+        }
+        Command::EvalUsages { set } => {
+            if cli.path.is_some() {
+                anyhow::bail!("eval-usages scores the whole index and takes no --path");
+            }
+            let set = UsageSet::load(set)?;
+            let reader = IndexReader::open(&config.data_dir).await?;
+            let outcomes = usage_eval::evaluate(reader.connection(), &set).await?;
+            print!("{}", usage_eval::format_report(&outcomes));
         }
     }
     Ok(())

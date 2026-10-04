@@ -2,7 +2,7 @@
 //! Java's order, the indexed super types (`lineage`) and fields.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::symbols::{TypeFacts, TypeRef};
 
@@ -70,6 +70,16 @@ pub(super) enum Ty {
     External(String, usize),
     /// The Lombok builder of an indexed type.
     Builder(String),
+}
+
+/// What a type variable of a super type stands for in a subtype
+/// ([`Resolver::type_args`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Arg {
+    Type(Ty),
+    /// A type variable of the subtype, by name, with array dimensions
+    /// (`Pair<Sms, P>` in `class Flipped<P>`).
+    Var(String, usize),
 }
 
 impl Ty {
@@ -300,20 +310,7 @@ impl<'a> Resolver<'a> {
             return (false, Vec::new());
         }
         let facts = entry.facts;
-        let resolve = |ty: &TypeRef| {
-            if facts.type_params.contains(&ty.name) {
-                return None;
-            }
-            let segments: Vec<&str> = ty.name.split('.').collect();
-            match self.resolve_type(
-                entry.file,
-                Scope::around(facts.parent.as_deref()),
-                &segments,
-            ) {
-                Lookup::Found(fqn) => Some(fqn),
-                _ => None,
-            }
-        };
+        let resolve = |ty: &TypeRef| self.super_ref(entry, ty);
         let superclass = facts.superclass.as_ref().and_then(resolve);
         let found = (
             superclass.is_some(),
@@ -327,6 +324,129 @@ impl<'a> Resolver<'a> {
             .borrow_mut()
             .insert(fqn.to_string(), found.clone());
         found
+    }
+
+    /// A super type `ty` as written in the header of `entry`, resolved in
+    /// its file around it; `None` for a type variable or a type outside
+    /// the index.
+    fn super_ref(&self, entry: &TypeEntry<'a>, ty: &TypeRef) -> Option<String> {
+        let facts = entry.facts;
+        if facts.type_params.contains(&ty.name) {
+            return None;
+        }
+        let segments: Vec<&str> = ty.name.split('.').collect();
+        match self.resolve_type(
+            entry.file,
+            Scope::around(facts.parent.as_deref()),
+            &segments,
+        ) {
+            Lookup::Found(fqn) => Some(fqn),
+            _ => None,
+        }
+    }
+
+    /// What `sup`'s type variables stand for in its subtype `sub`: the
+    /// type arguments of each super type on the way from `sub` up,
+    /// resolved in the file of the type that writes them around it, a type
+    /// variable among them replaced by what the type below gives it, one
+    /// of `sub` kept as a variable. A raw super type and a wildcard leave a
+    /// variable out (unknown). `None` when `sup` is not `sub` or one of its
+    /// indexed super types.
+    pub(super) fn type_args(&self, sub: &str, sup: &str) -> Option<HashMap<String, Arg>> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, HashMap<String, Arg>)> = VecDeque::new();
+        queue.push_back((sub.to_string(), HashMap::new()));
+        while let Some((fqn, args)) = queue.pop_front() {
+            if fqn == sup {
+                return Some(args);
+            }
+            if !seen.insert(fqn.clone()) {
+                continue;
+            }
+            let Some(entry) = self.types.get(fqn.as_str()) else {
+                continue;
+            };
+            let facts = entry.facts;
+            for written in facts.superclass.iter().chain(&facts.interfaces) {
+                let Some(next) = self.super_ref(entry, written) else {
+                    continue;
+                };
+                let Some(next_entry) = self.types.get(next.as_str()) else {
+                    continue;
+                };
+                let mut next_args = HashMap::new();
+                for (var, arg) in next_entry.facts.type_params.iter().zip(&written.args) {
+                    let found = if facts.type_params.contains(&arg.name) && arg.args.is_empty() {
+                        if fqn == sub {
+                            Some(Arg::Var(arg.name.clone(), arg.dims))
+                        } else {
+                            args.get(&arg.name).cloned().map(|found| match found {
+                                Arg::Type(ty) => Arg::Type(with_dims(ty, arg.dims)),
+                                Arg::Var(name, dims) => Arg::Var(name, dims + arg.dims),
+                            })
+                        }
+                    } else {
+                        match self.declared_in(&fqn, facts.parent.as_deref(), arg, &[]) {
+                            Ty::Unknown => None,
+                            ty => Some(Arg::Type(ty)),
+                        }
+                    };
+                    if let Some(found) = found {
+                        next_args.insert(var.clone(), found);
+                    }
+                }
+                queue.push_back((next, next_args));
+            }
+        }
+        None
+    }
+
+    /// The type a declared `ty` of a member of `owner` stands for on a
+    /// receiver of the type `receiver`: a type variable of `owner` is the
+    /// type argument `receiver` gives it ([`Resolver::type_args`]), anything
+    /// else as [`Resolver::declared`].
+    pub(super) fn declared_on(
+        &self,
+        receiver: &str,
+        owner: &str,
+        ty: &TypeRef,
+        member_vars: &[String],
+    ) -> Ty {
+        let is_owner_var = !member_vars.contains(&ty.name)
+            && self
+                .types
+                .get(owner)
+                .is_some_and(|entry| entry.facts.type_params.contains(&ty.name));
+        if is_owner_var && ty.args.is_empty() {
+            return self
+                .type_args(receiver, owner)
+                .and_then(|args| args.get(&ty.name).cloned())
+                .map_or(Ty::Unknown, |found| match found {
+                    Arg::Type(found) => with_dims(found, ty.dims),
+                    Arg::Var(..) => Ty::Unknown,
+                });
+        }
+        self.declared(owner, ty, member_vars)
+    }
+
+    /// The type a declared `ty` of a member of `declarer` stands for on a
+    /// receiver of one of the types `owners`: through the first of them
+    /// that is a subtype of `declarer` ([`Resolver::declared_on`]), else as
+    /// declared.
+    pub(super) fn declared_via(
+        &self,
+        owners: &[String],
+        declarer: &str,
+        ty: &TypeRef,
+        member_vars: &[String],
+    ) -> Ty {
+        match owners
+            .iter()
+            .find(|owner| owner.as_str() != declarer && self.is_subtype(owner, declarer))
+        {
+            Some(receiver) => self.declared_on(receiver, declarer, ty, member_vars),
+            None => self.declared(declarer, ty, member_vars),
+        }
     }
 
     /// Whether `owner` or one of its indexed super types has the field (or
@@ -429,6 +549,18 @@ impl<'a> Resolver<'a> {
     /// resolved in `owner`'s file inside it; a type variable (of the member,
     /// `owner` or a type around it) or a wildcard is unknown.
     pub(super) fn declared(&self, owner: &str, ty: &TypeRef, member_vars: &[String]) -> Ty {
+        self.declared_in(owner, Some(owner), ty, member_vars)
+    }
+
+    /// [`Resolver::declared`] with names looked up around `scope`: `owner`
+    /// for a member, the type around it for its header.
+    fn declared_in(
+        &self,
+        owner: &str,
+        scope: Option<&str>,
+        ty: &TypeRef,
+        member_vars: &[String],
+    ) -> Ty {
         if is_primitive(&ty.name) || ty.name == "void" {
             return Ty::External(ty.name.clone(), ty.dims);
         }
@@ -438,19 +570,11 @@ impl<'a> Resolver<'a> {
         let Some(entry) = self.types.get(owner) else {
             return Ty::Unknown;
         };
-        let mut current = Some(entry.facts);
-        while let Some(facts) = current {
-            if facts.type_params.contains(&ty.name) {
-                return Ty::Unknown;
-            }
-            current = facts
-                .parent
-                .as_deref()
-                .and_then(|parent| self.types.get(parent))
-                .map(|entry| entry.facts);
+        if self.is_type_var(owner, &ty.name) {
+            return Ty::Unknown;
         }
         let segments: Vec<&str> = ty.name.split('.').collect();
-        match self.resolve_type(entry.file, Scope::around(Some(owner)), &segments) {
+        match self.resolve_type(entry.file, Scope::around(scope), &segments) {
             Lookup::Found(fqn) => Ty::Indexed(fqn, ty.dims),
             Lookup::Ambiguous(_) => Ty::Unknown,
             Lookup::External | Lookup::Unknown => {
@@ -459,14 +583,43 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Whether `name` is a type variable of `owner` or of a type around it.
+    pub(super) fn is_type_var(&self, owner: &str, name: &str) -> bool {
+        let mut current = self.types.get(owner).map(|entry| entry.facts);
+        while let Some(facts) = current {
+            if facts.type_params.iter().any(|var| var == name) {
+                return true;
+            }
+            current = facts
+                .parent
+                .as_deref()
+                .and_then(|parent| self.types.get(parent))
+                .map(|entry| entry.facts);
+        }
+        false
+    }
+
+    /// The package of the file declaring the indexed type `fqn`.
+    pub(super) fn package(&self, fqn: &str) -> Option<&'a str> {
+        self.types
+            .get(fqn)
+            .map(|entry| self.files[entry.file].package)
+    }
+
     /// The field (or enum constant, or record component) `name` of `owner`
-    /// or its indexed super types: the type declaring it and its type.
+    /// or its indexed super types: the type declaring it and its type, a
+    /// type variable of an inherited field replaced by the type argument
+    /// `owner` gives it.
     pub(super) fn field(&self, owner: &str, name: &str) -> Option<(&'a str, Ty)> {
-        self.lineage(&[owner.to_string()]).iter().find_map(|entry| {
+        let owners = [owner.to_string()];
+        self.lineage(&owners).iter().find_map(|entry| {
             let facts = entry.facts;
             let declarer = facts.fqn.as_str();
             if let Some(field) = facts.fields.iter().find(|field| field.name == name) {
-                return Some((declarer, self.declared(declarer, &field.ty, &[])));
+                return Some((
+                    declarer,
+                    self.declared_via(&owners, declarer, &field.ty, &[]),
+                ));
             }
             if facts.enum_constants.iter().any(|constant| constant == name) {
                 return Some((declarer, Ty::Indexed(declarer.to_string(), 0)));

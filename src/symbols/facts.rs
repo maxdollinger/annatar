@@ -76,8 +76,14 @@ pub struct MethodFacts {
     /// Whether the last parameter is a varargs parameter.
     pub varargs: bool,
     pub is_static: bool,
+    /// Declared `private`: it overrides nothing and is not overridden.
+    pub is_private: bool,
+    /// Declared without `public`, `protected` or `private`: package access
+    /// (public all the same in an interface).
+    pub is_package_private: bool,
     /// The method's own type variables (`<T> T first(List<T>)`).
     pub type_params: Vec<String>,
+    /// The line of its name (after any annotations).
     pub line: usize,
 }
 
@@ -274,8 +280,17 @@ pub(super) fn method_facts(
         params,
         varargs,
         is_static: has_modifier(declaration, "static"),
+        is_private: has_modifier(declaration, "private"),
+        is_package_private: ["public", "protected", "private"]
+            .iter()
+            .all(|modifier| !has_modifier(declaration, modifier)),
         type_params: type_params(declaration, source),
-        line: declaration.start_position().row + 1,
+        line: declaration
+            .child_by_field_name("name")
+            .unwrap_or(declaration)
+            .start_position()
+            .row
+            + 1,
     }
 }
 
@@ -878,7 +893,7 @@ package com.acme.methods;
 class Service {
     Service(Repo repo, @Qualifier(\"x\") Clock clock) {}
     public SecurityDataAddEventConsumer getAddConsumer() { return null; }
-    void dispatch(SecurityDataMessageBearer<?> message) {}
+    private void dispatch(SecurityDataMessageBearer<?> message) {}
     static <T> List<T> wrap(T value) { return null; }
     void log(String format, Object... args) {}
     void log(String[] lines) {}
@@ -922,12 +937,16 @@ class Service {
         );
         assert!(getter.params.is_empty());
         assert!(!getter.is_static);
+        assert!(!getter.is_private);
+        assert!(!getter.is_package_private);
 
         let dispatch = method_of(
             service,
             "com.acme.methods.Service#dispatch(SecurityDataMessageBearer<?>)",
         );
         assert_eq!(dispatch.return_type, Some(named("void", 6)));
+        assert!(dispatch.is_private);
+        assert!(!dispatch.is_package_private);
         assert_eq!(
             dispatch.params[0].ty,
             generic("SecurityDataMessageBearer", vec![named("?", 6)], 6)
@@ -935,6 +954,7 @@ class Service {
 
         let wrap = method_of(service, "com.acme.methods.Service#wrap(T)");
         assert!(wrap.is_static);
+        assert!(wrap.is_package_private);
         assert_eq!(wrap.type_params, ["T"]);
         assert_eq!(
             wrap.return_type,
