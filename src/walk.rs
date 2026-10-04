@@ -17,14 +17,16 @@ use ignore::{DirEntry, WalkBuilder};
 /// `com.acme.build` under `src/main/java` is still indexed.
 const SKIP_DIRS: &[&str] = &["build", "target", "generated", "generated-sources"];
 
-/// Any file under this repository-relative prefix is test code.
-const TEST_PREFIX: &str = "src/test";
+/// The directory pair that roots test code: `src/test`, at the repository
+/// root or in a module (`backend/src/test`).
+const TEST_DIRS: [&str; 2] = ["src", "test"];
 
 /// Every production `.java` file under `repo`, as paths relative to `repo`,
 /// sorted lexicographically.
 ///
 /// `.gitignore` is honoured (the `ignore` crate's standard filters), and the
-/// [`SKIP_DIRS`] and `src/test` trees are excluded. `path_prefix`, when given,
+/// [`SKIP_DIRS`] and `src/test` trees (at any depth outside a source root)
+/// are excluded. `path_prefix`, when given,
 /// limits the result to files under that prefix; it may be relative to `repo`
 /// or an absolute path inside it. A prefix outside the repository, or one that
 /// matches nothing, yields an empty list rather than an error.
@@ -89,8 +91,19 @@ fn is_java(path: &Path) -> bool {
         .is_some_and(|extension| extension == "java")
 }
 
+/// Whether `path` lies in a `src/test` tree: a `src` directory directly
+/// followed by `test`, before any source root (a component named `java`), so
+/// a package `com.acme.src.test` under `src/main/java` is still production
+/// code.
 fn is_test(path: &Path) -> bool {
-    path.starts_with(TEST_PREFIX)
+    let names: Vec<_> = path
+        .components()
+        .map(|component| component.as_os_str())
+        .take_while(|name| *name != "java")
+        .collect();
+    names
+        .windows(2)
+        .any(|pair| pair[0] == TEST_DIRS[0] && pair[1] == TEST_DIRS[1])
 }
 
 /// Whether `entry` is a directory to prune from the walk.
@@ -283,6 +296,31 @@ mod tests {
                 "src/testng/com/acme/NotTest.java",
             ]),
             "only the src/test prefix is test code"
+        );
+    }
+
+    #[test]
+    fn skips_module_src_test_trees_but_not_packages_named_test() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write_file(root, "backend/src/main/java/com/acme/App.java");
+        write_file(root, "backend/src/test/java/com/acme/AppTest.java");
+        write_file(root, "a/b/src/test/java/com/acme/DeepTest.java");
+        write_file(root, "src/main/java/com/acme/src/test/Keep.java");
+        write_file(root, "backend/src/testng/com/acme/NotTest.java");
+        write_file(root, "backend/test/src/com/acme/AlsoKept.java");
+
+        let files = java_files(root, None).unwrap();
+
+        assert_eq!(
+            files,
+            paths(&[
+                "backend/src/main/java/com/acme/App.java",
+                "backend/src/testng/com/acme/NotTest.java",
+                "backend/test/src/com/acme/AlsoKept.java",
+                "src/main/java/com/acme/src/test/Keep.java",
+            ]),
+            "a module's src/test is test code; src/test under a source root is a package"
         );
     }
 
