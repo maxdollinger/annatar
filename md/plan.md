@@ -105,6 +105,7 @@ Runs as a stage of the index build (after history, on the build's transaction, b
 *Goal:* a typed, cached call that turns a prompt into a validated Rust struct.
 `complete<T: DeserializeOwned + JsonSchema>(prompt)` and `embed(texts)` against Ollama's OpenAI-compatible `/v1` endpoint, with the `schemars` schema as structured-output format. Retry once on invalid output. Results go through the LLM cache.
 *Done when:* an `#[ignore]` test returns a valid struct; a repeated call hits the cache.
+*Note:* "validated" is serde plus an optional caller check (`complete_with`, e.g. blank or overlong fields) that also triggers the retry; the client takes its own `cache.db` connection (`Store::connect_cache`) so concurrent stages can share it (`state.md` D-ai, D-aj).
 
 **4.2 Ticket summaries**
 *Goal:* every available ticket has a one- to two-sentence summary and a purpose (why).
