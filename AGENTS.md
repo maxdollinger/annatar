@@ -8,7 +8,11 @@ The work is driven by the plan, not by ad-hoc requests.
 
 1. Read [`md/plan.md`](./md/plan.md) — the POC plan (authoritative for scope).
 2. Read [`md/state.md`](./md/state.md) — current phase/step, decisions and open
-   questions.
+   questions. **Phase 6 (usages)** has its own design,
+   [`md/usages.md`](./md/usages.md), and state file,
+   [`md/usages_state.md`](./md/usages_state.md): while working on Phase 6,
+   read and update that file instead of `state.md` (cross-phase items such
+   as open #42 stay in `state.md`).
 3. [`md/project.md`](./md/project.md) is the long-term target; `plan.md` is the
    POC subset. Don't build "Later" items unless asked.
 

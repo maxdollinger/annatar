@@ -171,16 +171,58 @@ Ranking stays symbol-vector based (the same `search::search` and filters): the 1
 *Done when:* the file output is the default, `--symbols` is unchanged, `eval` reports file-level scores on `argus` with the symbol scores unchanged from 5.3.
 *Built (5.5):* `argus` (24 questions, 10 files): symbol scores unchanged (primary 4 / 14 of 24 top-1 / top-5, any 10 / 17); the primary's file first for 11 and in the top 5 for 17 (MRR 0.582), a file of any expected fqn first for 12 and in the top 5 for 20 (MRR 0.641). Output ≈ 20–30 % smaller than the old 10 symbols, query-dependent (6 own queries: ≈ 3.1k chars, ≈ 770 tokens, vs ≈ 4.4k), ≈ 50 ms per query. *Trial re-run (5.5, `state.md` D-cs, D-ct):* the 5.4 *with* arm repeated on the file output (20 runs, same tasks, model and key; the appended prompt describes the new output). Against no `annatar` (5.4) still −42 % tokens and tool calls, −26 % cost, significant on T1–T3; against the symbol output equal on T1–T3, while on the flow trace agents called `show` on whole classes (3.4 vs 0.8 per run) for ≈ 25 % more tokens (a trend). Correctness 37 vs 35 (symbols) vs 35 (without) of 40: the dispatcher missed in 2 of 5 flow traces instead of 4 of 5 — not significant, open #42 stays. The file view did not reduce `show` calls; it stays the default.
 
+## Phase 6 — Usages (after the POC, planned 2026-10-04)
+
+*Why:* open #42 — in the agent trial a search hit stood in for its caller (T4: the queue dispatcher in front of the consumer was missed in 4 of 5 runs with the symbol output, 2 of 5 with the file output). `project.md` promises `used_by`/`uses` in `show` and `annatar trace`. This phase builds them from the tree-sitter trees, without a build and without the LLM (`usages_state.md` D-cu); progress, decisions and questions of this phase are in [`usages_state.md`](./usages_state.md); SCIP stays in **Later** as a precision upgrade that fills the same `edges` table.
+
+**Design:** [`usages.md`](./usages.md) — what counts as a usage (edge kinds `extends`, `implements`, `overrides`, `instantiate`, `call`, `reference`; imports, Javadoc links, recursion and external symbols are not usages; a type's `used by` rolls up its members), how a name resolves (Java's lookup order to an fqn or no edge, members through the receiver's static type, implicit Lombok/record/enum members, overloads), what stays invisible, entry points, modules, the `edges` table and the output (`usages_state.md` D-cu–D-cx).
+
+**6.1 Parser facts for resolution**
+*Goal:* everything the resolver needs from one file, on the parsed file, nothing stored yet.
+Per file: package, single-type, wildcard and static imports. Per type: superclass and interfaces as written (generic arguments kept apart), fields (name, declared type, static, Lombok accessor annotations on field and type), Lombok type annotations. Per method: the declared return type as written, parameter names and types, varargs. Types inside anonymous or local classes stay ignored as symbols (1.3).
+*Done when:* fixture tests cover each import form, generic super types, fields with and without Lombok, a varargs method, and that the `Symbol` records and fqns are unchanged (no reindex differences).
+
+**6.2 Type resolution and the `edges` table**
+*Goal:* every type-to-type usage in `index.db`.
+`edges(id, src_id, dst_id, kind, line, ambiguous)` in `INDEX_TABLES`, `UNIQUE(src_id, dst_id, kind, line)`, indexes on `dst_id` and `src_id`. A new structure-side pass after all symbols are written (it needs the whole symbol table; files are parsed again, which is cheap next to `git log -L`); kinds `extends`, `implements`, `reference`, `instantiate` (type side). No cache table, no LLM, no prompt change: a warm cache stays warm. `IndexStats` and the `index` summary gain edges by kind and unresolved type names (top unresolved names at `-v`). `--path`: only edges between symbols under the prefix; the existing warning says usages from outside it are missing.
+*Done when:* fixture tests cover each `reference` construct, nested types, a same-package type, the same simple name in two packages chosen by import / same package / nested type (as `argus`'s four `MessageBearer`s), shadowing of a wildcard import, an unresolved external type (counted, no edge), a duplicate fqn, and the `--path` cut; the benchmark reports the pass's time.
+
+**6.3 Member resolution**
+*Goal:* `call` and `instantiate` edges to methods and constructors.
+Receiver typing, chains, implicit members (Lombok, records, enums), method references (`this::dispatch`, `T::m`, `T::new`), static imports, `super.m()`, overload choice with `ambiguous` as described above; needs 6.1's return and field types.
+*Done when:* fixture tests cover each case, including a chain through a getter, a chain cut by an external type, an untyped lambda parameter (no edge), overloads by count and by argument type, and an ambiguous pair; a test on `argus`-shaped fixtures resolves `Dispatcher#dispatch → Config#getAddEventConsumer() → AddEventConsumer#consume(..)`.
+
+**6.4 Overrides and measured quality**
+*Goal:* `overrides` edges and numbers for how complete and how precise the edges are.
+`overrides`: a method to the method with the same name and parameter count (then simple parameter types) in a superclass or interface in the index, through generic interfaces (`MessageConsumer<T>#consume(T)`). The `index` summary reports resolved / unresolved / ambiguous call sites. A usage golden set outside git (`.annatar-local/usages-argus.toml`, like `golden-argus.toml`, D-bl): about 15 `argus` symbols (types, public and private methods, an interface method, a Lombok getter, a consumer) with their true direct users, taken from an IDE's *Find usages* on main sources; checked against the index first so a renamed symbol fails loudly (as `golden::check_index`).
+*Done when:* precision and recall of direct users per symbol and overall, and the share of resolved call sites, are in the PR; every miss is classified (lambda, external chain, generics, other).
+
+**6.5 `show`: `used by` and `uses`**
+*Goal:* the direct usages of a symbol next to its description.
+`used by`: the using symbols grouped by file, `fqn :line[, line…]` (call-site lines), edge kind when it is not `call`, `ambiguous` marked, callers of an overridden method labelled `via I#m`; a type rolls up its members' and nested types' incoming edges, without its own. `uses`: the symbols it uses, grouped the same way. Entry-point annotations are named. Each list is capped (`… N more`); `reference.md` documents it.
+*Done when:* tests cover a type roll-up, `via`, the cap and a symbol without users; on `argus`, `show` of a T4 consumer names the dispatcher config and, through `via` or `call`, the dispatcher.
+
+**6.6 `annatar trace <fqn> [--depth N]`**
+*Goal:* transitive callers, so an agent sees the chain and what a change can break.
+A recursive CTE over incoming `call`, `instantiate` and `reference` edges, through `overrides` (`via`), default depth 4 (at most 10), each symbol once (a repeat prints `(see above)`), cycles safe; leaves are entry points (`[entry: @Scheduled]`) or symbols without callers (`[no callers in main sources]`); output as an indented tree with file:line, capped per level. A type traces its members. Usage errors as `search` (exit 2).
+*Done when:* tests cover depth, a cycle, a diamond, `via`, the entry-point and no-caller leaves; on `argus`, tracing a T4 consumer reaches the dispatcher's `@Scheduled` method.
+
+**6.7 Agent trial (T4) on usages**
+*Goal:* a measured answer to #42.
+Re-run the *with* arm on T4 (5 runs, the D-cs protocol and grading) with `--with-prompt usages` in `scripts/agent_trial/run.py`: the file-output prompt plus one paragraph on `used by` and `trace`; update the agent snippet in the README in the same change. Success: the dispatcher in 5 of 5 answers, no cost increase over the 5.5 runs. Optional: T1–T3 once each to check nothing regressed.
+*Done when:* results are in `usages_state.md`; #42 (`state.md`) closed or narrowed.
+
 ---
 
 ## Later (after the POC proves itself)
 
-- **Usages from SCIP:** scip-java setup, definition mapping, reference edges, interface and override edges (needed for Spring injection), Lombok-generated members, callers in prompts, `annatar trace`.
+- **Usages from SCIP** (precision upgrade of Phase 6, same `edges` table): scip-java inside the real build, so generics, lambda parameters, chains through library types and modules resolve as the compiler does; needs the repository to build on the indexer (`usages_state.md` D-cu).
+- **Callers in description prompts:** a member's callers (and a type's users) in its prompt. Every prompt changes, so the whole LLM cache misses (≈ 20 min of chat calls on `argus`); decide after 6.7 (`usages_state.md` open #47).
 - **Spring entry points:** HTTP handlers with full paths, listeners, `@Scheduled`; an entry-point command.
 - **Incremental indexing:** stable IDs, upserts, incremental history.
 - **Package summaries** and `annatar module`.
 - **Central build and local use:** CI publishing the index per commit, local branch overlay.
-- **Multi-module handling** (Maven/Gradle module per file), test-code indexing.
+- **Multi-module handling** (Maven/Gradle module per file, name resolution limited to the modules a file can see; a prerequisite for usages on a multi-module repository, `usages_state.md` D-cx), test-code indexing.
 - **Analysis:** hotspots from churn and bug tickets, temporal coupling.
 - **Spring configuration:** `application.yml`, `@Value`, `@ConfigurationProperties`.
 - **Human search page** for non-technical roles.
