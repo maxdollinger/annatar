@@ -14,11 +14,19 @@
 //! classes are ignored too: recursion only descends into type containers, so
 //! executable scopes (method bodies, field initializers, lambdas) contribute
 //! nothing.
+//!
+//! Alongside the symbols, the parsed file carries the facts usage resolution
+//! needs (imports, super types, fields, return and parameter types), in
+//! memory only; see [`facts`].
+
+mod facts;
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
+
+pub use facts::{FieldFacts, Import, MethodFacts, Param, TypeFacts, TypeRef};
 
 /// The kind of a named Java symbol: a type or one of its members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,86 +190,136 @@ impl JavaParser {
         let Some(tree) = self.parser.parse(source, None) else {
             tracing::warn!(path = %path.display(), "tree-sitter produced no tree; skipping file");
             return Ok(ParsedFile {
-                symbols: Vec::new(),
                 parse_error: true,
+                ..ParsedFile::default()
             });
         };
         let root = tree.root_node();
         if root.has_error() {
             tracing::warn!(path = %path.display(), "parse errors; skipping file");
             return Ok(ParsedFile {
-                symbols: Vec::new(),
                 parse_error: true,
+                ..ParsedFile::default()
             });
         }
 
         let package = package_name(root, source);
-        let mut symbols = Vec::new();
-        collect_symbols(root, source, &package, None, &mut symbols);
+        let imports = facts::imports(root, source);
+        let mut walk = Walk {
+            source,
+            package: &package,
+            imports: &imports,
+            symbols: Vec::new(),
+            types: Vec::new(),
+        };
+        walk.collect(root, None, None);
+        let Walk { symbols, types, .. } = walk;
         Ok(ParsedFile {
             symbols,
             parse_error: false,
+            package,
+            imports,
+            types,
         })
     }
 }
 
 /// The result of parsing one source file.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ParsedFile {
     /// The symbols found, in source order. Empty when `parse_error` is `true`.
     pub symbols: Vec<Symbol>,
     /// Whether tree-sitter reported errors or produced no tree.
     pub parse_error: bool,
+    /// The declared package, empty for the default package.
+    pub package: String,
+    /// The imports, in source order.
+    pub imports: Vec<Import>,
+    /// The resolution facts of each named type, in the order of its symbol in
+    /// `symbols` (so nested types follow their enclosing type).
+    pub types: Vec<TypeFacts>,
 }
 
-/// Walk a type container (the root `program` or a type body) and record every
-/// named type and member declaration directly inside it, recursing into each
-/// type's own body for nested types and members.
-///
-/// Only type containers are descended into. Executable scopes (method and
-/// constructor bodies, field initializers, lambdas) are not, so method-local
-/// classes — which the grammar also calls `class_declaration` — and anonymous
-/// classes are never visited. `enclosing` is the fqn of the type whose body is
-/// being walked; it is the parent of a nested type and of every member.
-fn collect_symbols(
-    container: Node<'_>,
-    source: &str,
-    package: &str,
-    enclosing: Option<&str>,
-    out: &mut Vec<Symbol>,
-) {
-    let mut cursor = container.walk();
-    for child in container.children(&mut cursor) {
-        if let Some(kind) = type_kind(child.kind()) {
-            let Some(name_node) = child.child_by_field_name("name") else {
-                continue;
-            };
-            let name = text(name_node, source);
-            let fqn = match enclosing {
-                Some(parent) => format!("{parent}.{name}"),
-                None => qualify(package, &name),
-            };
-            let mut symbol = build_symbol(
-                package,
-                name,
-                fqn.clone(),
-                kind,
-                enclosing.map(str::to_string),
-                child,
-                source,
-            );
-            let body = type_body(child);
-            if let Some(body) = body {
-                collect_blocks(body, &mut symbol.blocks);
+/// One walk over a file's tree, collecting its symbols and type facts.
+struct Walk<'a> {
+    source: &'a str,
+    package: &'a str,
+    imports: &'a [Import],
+    symbols: Vec<Symbol>,
+    types: Vec<TypeFacts>,
+}
+
+impl Walk<'_> {
+    /// Walk a type container (the root `program` or a type body) and record
+    /// every named type and member declaration directly inside it, recursing
+    /// into each type's own body for nested types and members.
+    ///
+    /// Only type containers are descended into. Executable scopes (method and
+    /// constructor bodies, field initializers, lambdas) are not, so
+    /// method-local classes — which the grammar also calls
+    /// `class_declaration` — and anonymous classes are never visited.
+    /// `enclosing` is the fqn of the type whose body is being walked; it is
+    /// the parent of a nested type and of every member. `owner` is the index
+    /// of that type's entry in `types`, which receives its fields and members.
+    fn collect(&mut self, container: Node<'_>, enclosing: Option<&str>, owner: Option<usize>) {
+        let source = self.source;
+        let package = self.package;
+        let mut cursor = container.walk();
+        for child in container.children(&mut cursor) {
+            if let Some(kind) = type_kind(child.kind()) {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = text(name_node, source);
+                let fqn = match enclosing {
+                    Some(parent) => format!("{parent}.{name}"),
+                    None => qualify(package, &name),
+                };
+                self.types.push(facts::type_facts(
+                    child,
+                    source,
+                    self.imports,
+                    &fqn,
+                    &name,
+                    kind,
+                    enclosing,
+                ));
+                let own_facts = self.types.len() - 1;
+                let mut symbol = build_symbol(
+                    package,
+                    name,
+                    fqn.clone(),
+                    kind,
+                    enclosing.map(str::to_string),
+                    child,
+                    source,
+                );
+                let body = type_body(child);
+                if let Some(body) = body {
+                    collect_blocks(body, &mut symbol.blocks);
+                }
+                self.symbols.push(symbol);
+                if let Some(body) = body {
+                    self.collect(body, Some(&fqn), Some(own_facts));
+                }
+            } else if let Some(symbol) = member_symbol(child, source, package, enclosing) {
+                if let Some(index) = owner {
+                    self.types[index].methods.push(facts::method_facts(
+                        child,
+                        source,
+                        &symbol.fqn,
+                        &symbol.name,
+                    ));
+                }
+                self.symbols.push(symbol);
+            } else if matches!(child.kind(), "field_declaration" | "constant_declaration") {
+                if let Some(index) = owner {
+                    let fields = facts::field_facts(child, source, self.imports);
+                    self.types[index].fields.extend(fields);
+                }
+            } else if is_type_container(child.kind()) {
+                self.collect(child, enclosing, owner);
             }
-            out.push(symbol);
-            if let Some(body) = body {
-                collect_symbols(body, source, package, Some(&fqn), out);
-            }
-        } else if let Some(symbol) = member_symbol(child, source, package, enclosing) {
-            out.push(symbol);
-        } else if is_type_container(child.kind()) {
-            collect_symbols(child, source, package, enclosing, out);
         }
     }
 }
@@ -697,7 +755,7 @@ fn type_body(declaration: Node<'_>) -> Option<Node<'_>> {
 
 /// Node kinds that hold type and member declarations directly: the bodies of
 /// each type kind, and the declarations section of an enum body. The root
-/// `program` is passed to `collect_symbols` directly and is never discovered
+/// `program` is passed to `Walk::collect` directly and is never discovered
 /// through this predicate.
 fn is_type_container(node_kind: &str) -> bool {
     matches!(
