@@ -16,15 +16,15 @@
 //! nothing.
 //!
 //! Alongside the symbols, the parsed file carries the facts usage resolution
-//! needs (imports, super types, fields, return and parameter types), in
-//! memory only; see [`facts`].
+//! needs (imports, super types, fields, return and parameter types) and its
+//! syntax tree, in memory only; see [`facts`] and [`crate::usages`].
 
 mod facts;
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 pub use facts::{FieldFacts, Import, MethodFacts, Param, TypeFacts, TypeRef};
 
@@ -220,6 +220,7 @@ impl JavaParser {
             package,
             imports,
             types,
+            tree: Some(tree),
         })
     }
 }
@@ -238,6 +239,9 @@ pub struct ParsedFile {
     /// The resolution facts of each named type, in the order of its symbol in
     /// `symbols` (so nested types follow their enclosing type).
     pub types: Vec<TypeFacts>,
+    /// The syntax tree, for the usage pass over the bodies; `None` when
+    /// `parse_error` is `true`.
+    pub tree: Option<Tree>,
 }
 
 /// One walk over a file's tree, collecting its symbols and type facts.
@@ -351,7 +355,7 @@ fn collect_blocks(container: Node<'_>, out: &mut Vec<std::ops::Range<usize>>) {
     }
 }
 
-fn type_kind(node_kind: &str) -> Option<SymbolKind> {
+pub(crate) fn type_kind(node_kind: &str) -> Option<SymbolKind> {
     match node_kind {
         "class_declaration" => Some(SymbolKind::Class),
         "interface_declaration" => Some(SymbolKind::Interface),
@@ -362,7 +366,7 @@ fn type_kind(node_kind: &str) -> Option<SymbolKind> {
     }
 }
 
-fn member_kind(node_kind: &str) -> Option<SymbolKind> {
+pub(crate) fn member_kind(node_kind: &str) -> Option<SymbolKind> {
     match node_kind {
         "method_declaration" => Some(SymbolKind::Method),
         "constructor_declaration" | "compact_constructor_declaration" => {
@@ -757,7 +761,7 @@ fn type_body(declaration: Node<'_>) -> Option<Node<'_>> {
 /// each type kind, and the declarations section of an enum body. The root
 /// `program` is passed to `Walk::collect` directly and is never discovered
 /// through this predicate.
-fn is_type_container(node_kind: &str) -> bool {
+pub(crate) fn is_type_container(node_kind: &str) -> bool {
     matches!(
         node_kind,
         "class_body"
