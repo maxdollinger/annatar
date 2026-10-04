@@ -222,7 +222,8 @@ pub async fn embedding_meta(conn: &Connection) -> Result<EmbeddingMeta> {
     Ok(EmbeddingMeta { model, dim })
 }
 
-async fn meta_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+/// The `index_meta` value of `key`, `None` when the row is missing.
+pub async fn meta_value(conn: &Connection, key: &str) -> Result<Option<String>> {
     let mut rows = conn
         .query("SELECT value FROM index_meta WHERE key = ?1", params![key])
         .await

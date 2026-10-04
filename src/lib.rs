@@ -1,6 +1,7 @@
 pub mod config;
 pub mod describe;
 pub mod embeddings;
+pub mod eval;
 pub mod golden;
 pub mod history;
 pub mod indexer;
