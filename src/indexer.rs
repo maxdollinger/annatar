@@ -24,7 +24,11 @@
 //! 6. **types** (`index_type_descriptions`) gives every type a `description`
 //!    the same way, bottom-up (nested types first), from its declaration, its
 //!    members' and nested types' descriptions and its history; runs after
-//!    describe.
+//!    describe;
+//! 7. **embeddings** (`index_embeddings`) embeds every symbol that has a
+//!    description (its fqn and description, through the embedding cache) and
+//!    writes the vectors to `symbol_vectors`, a table it creates with the
+//!    dimension of the first vector; runs after types.
 //!
 //! A stage never commits: the transaction commits and the temporary file is
 //! atomically renamed over `index.db` exactly once, after the last stage. Any
@@ -52,9 +56,11 @@ use crate::describe::{
     TicketState, TypeChild, TypeContext, TypeDescription, is_public, member_prompt, outline,
     select_children, select_history, type_prompt, validate_description, validate_type_description,
 };
+use crate::embeddings::{EmbeddingInput, embedding_text};
 use crate::history::{self, Commit, HistoryCache};
 use crate::jira::{FetchError, Ticket};
-use crate::llm::{InvalidOutput, LlmStats, LlmUnavailable};
+use crate::llm::{InvalidOutput, LlmStats, LlmUnavailable, encode_vector};
+use crate::schema;
 use crate::store::Store;
 use crate::summaries::{Summarizer, TicketSummary, ticket_prompt, validate_summary};
 use crate::symbols::{JavaParser, Symbol, SymbolKind};
@@ -168,6 +174,26 @@ pub struct IndexStats {
     pub types_skipped: usize,
     /// LLM client counters of the type stage.
     pub type_llm: LlmStats,
+    /// Symbols with a description this run. When an LLM stage runs,
+    /// `embedded + embed_failed + embed_skipped == embed_symbols`.
+    pub embed_symbols: usize,
+    /// Symbols given a vector in `symbol_vectors`, from the embedding cache
+    /// or the embedding model.
+    pub embedded: usize,
+    /// Of `embedded`, those answered from the embedding cache (after a
+    /// failed request this includes the batches embedded before it).
+    pub embedded_cached: usize,
+    /// Symbols left without a vector because the embedding request failed
+    /// and their text was not cached; embedded next run.
+    pub embed_failed: usize,
+    /// Symbols not sent to the embedding model: no `[ollama]` section, or not
+    /// in the embedding cache with `--no-llm` or after the circuit breaker
+    /// tripped.
+    pub embed_skipped: usize,
+    /// Length of every vector, from the first embedding; 0 without vectors.
+    pub embedding_dim: usize,
+    /// LLM client counters of the embeddings stage.
+    pub embed_llm: LlmStats,
     /// LLM client counters for this run (all stages); `llm.chat_calls` is
     /// zero on a fully cached run.
     pub llm: LlmStats,
@@ -209,12 +235,13 @@ pub struct IndexStats {
 /// ones as unavailable). Bad Jira credentials abort the run; see
 /// `index_tickets` for the other outcomes.
 ///
-/// `llm` summarises the available tickets and describes every method,
-/// constructor and type; `None` (no `[ollama]` section) leaves them without
-/// a summary or description. Its chat model is checked once before the
-/// stages run: a model the server does not have fails the run (like rejected
-/// Jira credentials). Other LLM failures never fail the run; see
-/// `index_summaries`, `index_descriptions` and `index_type_descriptions`.
+/// `llm` summarises the available tickets, describes every method,
+/// constructor and type and embeds the descriptions; `None` (no `[ollama]`
+/// section) leaves them without a summary, description or vector. Its chat
+/// and embedding models are checked once before the stages run: a model the
+/// server does not have fails the run (like rejected Jira credentials). Other
+/// LLM failures never fail the run; see `index_summaries`,
+/// `index_descriptions`, `index_type_descriptions` and `index_embeddings`.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
@@ -246,7 +273,7 @@ pub async fn build_index(
     }
 
     if let Some(llm) = llm {
-        llm.client.check_chat_model().await?;
+        llm.client.check_models().await?;
     }
 
     let build = store.begin_index().await?;
@@ -297,6 +324,9 @@ pub async fn build_index(
     let before = stage_start();
     index_type_descriptions(&transaction, &indexed, llm, &inputs, described, &mut stats).await?;
     stats.type_llm = llm_stats().since(&before);
+    let before = stage_start();
+    index_embeddings(&transaction, llm, &mut stats).await?;
+    stats.embed_llm = llm_stats().since(&before);
     stats.llm = llm_stats().since(&run_before);
     let stages = [&stats.summary_llm, &stats.describe_llm, &stats.type_llm];
     stats.llm.peak_prompt_tokens = stages
@@ -349,6 +379,13 @@ pub async fn build_index(
         types_failed = stats.types_failed,
         types_incomplete = stats.types_incomplete,
         types_skipped = stats.types_skipped,
+        embed_symbols = stats.embed_symbols,
+        embedded = stats.embedded,
+        embedded_cached = stats.embedded_cached,
+        embed_failed = stats.embed_failed,
+        embed_skipped = stats.embed_skipped,
+        embedding_dim = stats.embedding_dim,
+        embed_calls = stats.llm.embed_calls,
         chat_calls = stats.llm.chat_calls,
         chat_hits = stats.llm.chat_hits,
         chat_retries = stats.llm.chat_retries,
@@ -1397,6 +1434,159 @@ async fn member_commits(conn: &Connection) -> Result<HashMap<i64, Vec<MemberComm
     Ok(commits)
 }
 
+/// Embeddings stage: give every symbol with a description a vector in
+/// `symbol_vectors`. Runs after the type stage.
+///
+/// The text of a symbol is [`embedding_text`] of its fqn and description
+/// (and, with `embedding.parent_description`, a member's enclosing type's
+/// description). All texts go to [`crate::llm::LlmClient::embed`] at once,
+/// which answers cached ones from the embedding cache and sends the rest in
+/// batches. The first vector's length is the dimension of the
+/// `F32_BLOB(<dim>)` column: the stage creates `symbol_vectors` and its
+/// vector index ([`schema::create_vectors`]) only when at least one symbol
+/// has a vector, so an index without vectors has no such table. A cache-only
+/// client (`--no-llm`, or the breaker tripped in an earlier stage) uses
+/// cached embeddings only; the rest are `embed_skipped`. A failed embedding
+/// request warns once and falls back to the cache, the rest are
+/// `embed_failed`. Without a summarizer no symbol has a description. Only an
+/// index write error fails the stage.
+async fn index_embeddings(
+    transaction: &Transaction,
+    llm: Option<&Summarizer>,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let symbols = described_symbols(transaction).await?;
+    stats.embed_symbols = symbols.len();
+    let Some(llm) = llm else {
+        stats.embed_skipped += symbols.len();
+        return Ok(());
+    };
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    let texts: Vec<String> = symbols
+        .iter()
+        .map(|symbol| {
+            let input = EmbeddingInput {
+                fqn: &symbol.fqn,
+                description: &symbol.description,
+                parent_description: symbol.parent_description.as_deref(),
+            };
+            embedding_text(&input, &llm.embedding)
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let hits = llm.client.stats().embed_hits;
+    let mut failed = false;
+    let vectors = if llm.client.is_cache_only() {
+        cached_vectors(llm, &texts).await
+    } else {
+        match llm.client.embed(&texts).await {
+            Ok(vectors) => vectors.into_iter().map(Some).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = format!("{err:#}"),
+                    "the embedding model failed; symbols use cached embeddings only"
+                );
+                failed = true;
+                cached_vectors(llm, &texts).await
+            }
+        }
+    };
+    let dim = vectors.iter().flatten().map(Vec::len).next().unwrap_or(0);
+    if dim > 0 {
+        schema::create_vectors(transaction, dim).await?;
+    }
+    for (symbol, vector) in symbols.iter().zip(vectors) {
+        match vector {
+            Some(vector) if dim > 0 => {
+                transaction
+                    .execute(
+                        "INSERT INTO symbol_vectors (symbol_id, embedding) VALUES (?1, vector32(?2))",
+                        params![symbol.id, encode_vector(&vector)],
+                    )
+                    .await
+                    .with_context(|| format!("writing the vector of {}", symbol.fqn))?;
+                stats.embedded += 1;
+            }
+            Some(_) => stats.embed_failed += 1,
+            None if failed => stats.embed_failed += 1,
+            None => stats.embed_skipped += 1,
+        }
+    }
+    stats.embedded_cached = (llm.client.stats().embed_hits - hits).min(stats.embedded);
+    stats.embedding_dim = if stats.embedded > 0 { dim } else { 0 };
+    tracing::info!(
+        symbols = symbols.len(),
+        embedded = stats.embedded,
+        cached = stats.embedded_cached,
+        dim = stats.embedding_dim,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "embeddings done"
+    );
+    if stats.embed_failed > 0 {
+        tracing::warn!(
+            symbols = symbols.len(),
+            embedded = stats.embedded,
+            failed = stats.embed_failed,
+            "some symbols got no vector this run; they are embedded next run"
+        );
+    }
+    Ok(())
+}
+
+/// The cached vector of each of `texts`; a cache fault (such as vectors of
+/// different lengths) warns and leaves every text without one.
+async fn cached_vectors(llm: &Summarizer, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+    llm.client
+        .cached_embeddings(texts)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                error = format!("{err:#}"),
+                "reading cached embeddings failed; no vectors this run"
+            );
+            vec![None; texts.len()]
+        })
+}
+
+/// A symbol the embeddings stage embeds.
+struct DescribedSymbol {
+    id: i64,
+    fqn: String,
+    description: String,
+    /// The enclosing type's description, for a method or constructor.
+    parent_description: Option<String>,
+}
+
+/// Every symbol with a description, in id order.
+async fn described_symbols(conn: &Connection) -> Result<Vec<DescribedSymbol>> {
+    let mut rows = conn
+        .query(
+            "SELECT s.id, s.fqn, s.description,
+                    CASE WHEN s.kind IN (?1, ?2) THEN p.description END
+             FROM symbols s LEFT JOIN symbols p ON p.id = s.parent_id
+             WHERE s.description IS NOT NULL
+             ORDER BY s.id",
+            params![
+                SymbolKind::Method.as_str(),
+                SymbolKind::Constructor.as_str()
+            ],
+        )
+        .await
+        .context("reading described symbols")?;
+    let mut symbols = Vec::new();
+    while let Some(row) = rows.next().await? {
+        symbols.push(DescribedSymbol {
+            id: row.get(0)?,
+            fqn: row.get(1)?,
+            description: row.get(2)?,
+            parent_description: row.get(3)?,
+        });
+    }
+    Ok(symbols)
+}
+
 /// Store one symbol's description (whitespace collapsed) on its `symbols`
 /// row.
 async fn write_description(conn: &Connection, id: i64, description: &Description) -> Result<()> {
@@ -1721,10 +1911,10 @@ fn relative_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_TICKET_REGEX, OllamaConfig};
+    use crate::config::{DEFAULT_TICKET_REGEX, EmbeddingConfig, OllamaConfig};
     use crate::llm::LlmClient;
     use crate::llm::MAX_CONSECUTIVE_INVALID;
-    use crate::llm::fake::{FakeBackend, ModelCheck};
+    use crate::llm::fake::{FakeBackend, ModelCheck, vector_for};
     use crate::store::IndexReader;
     use crate::test_support::{commit, init_repo};
     use crate::tickets::fake::{self, Answer, FakeSource};
@@ -3877,6 +4067,242 @@ public class UserService {
             stats.type_symbols,
             "{stats:?}"
         );
+        assert_eq!(
+            stats.embedded + stats.embed_failed + stats.embed_skipped,
+            stats.embed_symbols,
+            "{stats:?}"
+        );
+    }
+
+    /// An index run over `repo` (no Jira) whose members get [`DESCRIBED`]
+    /// and types [`TYPE_DESCRIBED`], with `embedding` as the embedded-text
+    /// settings.
+    async fn embed_with(
+        repo: &Path,
+        data: &Path,
+        backend: &Arc<FakeBackend>,
+        cache_only: bool,
+        embedding: EmbeddingConfig,
+    ) -> Result<IndexStats> {
+        let store = Store::open(data).await.unwrap();
+        let llm = summarizer(&store, backend, cache_only).with_embedding(embedding);
+        let stats = build_index(
+            &store,
+            repo,
+            None,
+            &ticket_regex(),
+            &JiraMode::Disabled,
+            Some(&llm),
+        )
+        .await?;
+        assert_describe_buckets(&stats);
+        Ok(stats)
+    }
+
+    /// The fqns with a vector in the committed index, sorted; `None` when the
+    /// index has no `symbol_vectors` table.
+    async fn vector_fqns(data: &Path) -> Option<Vec<String>> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query(
+                "SELECT s.fqn FROM symbol_vectors v JOIN symbols s ON s.id = v.symbol_id ORDER BY s.fqn",
+                (),
+            )
+            .await
+            .ok()?;
+        let mut fqns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            fqns.push(row.get::<String>(0).unwrap());
+        }
+        Some(fqns)
+    }
+
+    const SERVICE_TEXT: &str = "com.acme.Service\nServes the values.";
+    const VALUE_TEXT: &str = "com.acme.Service#value()\nReturns the value.";
+
+    #[tokio::test]
+    async fn described_symbols_get_vectors_and_a_rerun_makes_no_embedding_calls() {
+        let repo = repo_with_commits(&["Add service"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+
+        let cold = embed_with(
+            repo.path(),
+            data.path(),
+            &backend,
+            false,
+            EmbeddingConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cold.embed_symbols, 2);
+        assert_eq!(cold.embedded, 2);
+        assert_eq!(cold.embedded_cached, 0);
+        assert_eq!(cold.embedding_dim, vector_for(VALUE_TEXT).len());
+        assert_eq!(cold.embed_llm.embed_calls, 1);
+        assert_eq!(cold.embed_llm.embed_texts, 2);
+        assert_eq!(cold.llm.embed_calls, 1);
+        assert_eq!(
+            backend.batches(),
+            vec![vec![SERVICE_TEXT.to_string(), VALUE_TEXT.to_string()]]
+        );
+        assert_eq!(
+            vector_fqns(data.path()).await,
+            Some(vec![
+                "com.acme.Service".to_string(),
+                "com.acme.Service#value()".to_string()
+            ])
+        );
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let query = encode_vector(&vector_for(VALUE_TEXT));
+        let mut rows = reader
+            .connection()
+            .query(
+                &format!(
+                    "SELECT s.fqn FROM vector_top_k('{}', vector32(?1), 1) AS v
+                     JOIN symbols s ON s.id = v.id",
+                    schema::VECTOR_INDEX
+                ),
+                params![query],
+            )
+            .await
+            .unwrap();
+        let top = rows.next().await.unwrap().unwrap();
+        assert_eq!(top.get::<String>(0).unwrap(), "com.acme.Service#value()");
+        drop(rows);
+        drop(reader);
+
+        let quiet = FakeBackend::new();
+        let warm = embed_with(
+            repo.path(),
+            data.path(),
+            &quiet,
+            false,
+            EmbeddingConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(warm.embedded, 2);
+        assert_eq!(warm.embedded_cached, 2);
+        assert_eq!(warm.embedding_dim, cold.embedding_dim);
+        assert_eq!(warm.llm.embed_calls, 0, "a rerun makes no embedding calls");
+        assert!(quiet.batches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_only_run_embeds_from_the_cache_and_parent_description_is_optional() {
+        let repo = repo_with_commits(&["Add service"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        embed_with(
+            repo.path(),
+            data.path(),
+            &backend,
+            false,
+            EmbeddingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let with_parent = EmbeddingConfig {
+            parent_description: true,
+        };
+
+        let quiet = FakeBackend::new();
+        let cached = embed_with(repo.path(), data.path(), &quiet, true, with_parent)
+            .await
+            .unwrap();
+        assert_eq!(cached.embed_symbols, 2);
+        assert_eq!(cached.embedded, 1, "the type's text has no parent part");
+        assert_eq!(cached.embedded_cached, 1);
+        assert_eq!(
+            cached.embed_skipped, 1,
+            "the member's new text is not cached"
+        );
+        assert!(quiet.batches().is_empty(), "--no-llm sends nothing");
+        assert!(quiet.model_checks().is_empty());
+        assert_eq!(
+            vector_fqns(data.path()).await,
+            Some(vec!["com.acme.Service".to_string()])
+        );
+
+        let stats = embed_with(repo.path(), data.path(), &backend, false, with_parent)
+            .await
+            .unwrap();
+        assert_eq!(stats.embedded, 2);
+        assert_eq!(
+            backend.batches().last().unwrap(),
+            &vec![format!("{VALUE_TEXT}\nServes the values.")]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_embedding_request_keeps_the_run_and_cached_vectors() {
+        let repo = repo_with_commits(&["Add service"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.fail_embeddings();
+
+        let (stats, logs) = with_warnings(embed_with(
+            repo.path(),
+            data.path(),
+            &backend,
+            false,
+            EmbeddingConfig::default(),
+        ))
+        .await;
+        let stats = stats.unwrap();
+
+        assert_eq!(stats.embed_symbols, 2);
+        assert_eq!(stats.embedded, 0);
+        assert_eq!(stats.embed_failed, 2);
+        assert_eq!(stats.embedding_dim, 0);
+        assert!(logs.contains("the embedding model failed"), "{logs}");
+        assert_eq!(
+            description_of(data.path(), "com.acme.Service#value()").await,
+            Some("Returns the value.".to_string())
+        );
+        assert_eq!(vector_fqns(data.path()).await, None, "no vector, no table");
+
+        let working = FakeBackend::new();
+        let stats = embed_with(
+            repo.path(),
+            data.path(),
+            &working,
+            false,
+            EmbeddingConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.embedded, 2);
+        assert_eq!(stats.embedded_cached, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_embedding_model_fails_the_run_before_any_chat() {
+        let repo = repo_with_commits(&["Add service"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.lacks("embed");
+
+        let err = embed_with(
+            repo.path(),
+            data.path(),
+            &backend,
+            false,
+            EmbeddingConfig::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("the embedding model \"embed\" does not exist"),
+            "{err:#}"
+        );
+        assert!(backend.chats().is_empty());
+        assert!(backend.batches().is_empty());
     }
 
     /// The description of `fqn` in the committed index.

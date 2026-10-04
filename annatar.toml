@@ -29,10 +29,13 @@ ticket_regex = '\bGRLD-\d+'
 # concurrency = 4
 
 # Ollama connection, used through its OpenAI-compatible /v1 API. Optional:
-# without it `annatar index` warns once and tickets get no summaries;
-# `annatar index --no-llm` makes no chat calls and uses only summaries already
+# without it `annatar index` warns once and tickets get no summaries, symbols
+# no description and no vector; `annatar index --no-llm` makes no chat or
+# embedding calls and uses only summaries, descriptions and embeddings already
 # cached. LLM replies and embeddings are cached in cache.db; changing a model,
-# reasoning_effort or temperature simply misses the cache.
+# reasoning_effort or temperature simply misses the cache. `index` fails when
+# the server lacks chat_model or embedding_model. The vector dimension comes
+# from the embedding model's first response, not from this file.
 # [ollama]
 # Server root (a trailing /v1 is accepted).
 # url = "http://localhost:11434"
@@ -73,3 +76,10 @@ ticket_regex = '\bGRLD-\d+'
 # Most recent tickets shown besides a type's first ticket (default 3). A
 # type's history spans its whole body, so these are about the file's tickets.
 # type_recent_tickets = 3
+
+# What goes into the text embedded for every described symbol. Optional;
+# changing it re-embeds every symbol once (embedding calls only, no chat calls).
+# [embedding]
+# Append the enclosing type's description to a method's or constructor's
+# text, after its fqn and description (default false: fqn and description).
+# parent_description = false

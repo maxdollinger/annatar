@@ -13,15 +13,16 @@
 //! prompts (method and type descriptions) take these summaries as their
 //! ticket context, so they are short and say why the change was needed.
 //!
-//! [`Summarizer`] is the LLM client the stage calls; with `--no-llm` the
-//! client is cache-only and never calls the model.
+//! [`Summarizer`] is the LLM client the stage calls (and the describe, type
+//! and embeddings stages after it); with `--no-llm` the client is cache-only
+//! and never calls a model.
 
 use anyhow::Result;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::config::{DescribeConfig, OllamaConfig};
+use crate::config::{DescribeConfig, EmbeddingConfig, OllamaConfig};
 use crate::jira::Ticket;
 use crate::llm::LlmClient;
 use crate::store::Store;
@@ -313,6 +314,7 @@ pub(crate) fn restates(summary: &str, purpose: &str) -> bool {
 pub struct Summarizer {
     pub(crate) client: LlmClient,
     pub(crate) describe: DescribeConfig,
+    pub(crate) embedding: EmbeddingConfig,
 }
 
 impl Summarizer {
@@ -325,12 +327,18 @@ impl Summarizer {
         Self {
             client,
             describe: DescribeConfig::default(),
+            embedding: EmbeddingConfig::default(),
         }
     }
 
     /// The same summarizer with `describe` as the describe prompt settings.
     pub fn with_describe(self, describe: DescribeConfig) -> Self {
         Self { describe, ..self }
+    }
+
+    /// The same summarizer with `embedding` as the embedded-text settings.
+    pub fn with_embedding(self, embedding: EmbeddingConfig) -> Self {
+        Self { embedding, ..self }
     }
 
     /// The client, e.g. for its [`crate::llm::LlmStats`].
@@ -340,8 +348,9 @@ impl Summarizer {
 
     /// The summarizer for an `index` run, or `None` without an `[ollama]`
     /// section (one warning; tickets get no summary, methods and types no
-    /// description).
-    /// `no_llm` keeps the cached summaries but makes no chat call. The client
+    /// description and no vector).
+    /// `no_llm` keeps the cached summaries, descriptions and embeddings but
+    /// makes no chat or embedding call. The client
     /// gets its own `cache.db` connection.
     pub fn from_config(
         ollama: Option<&OllamaConfig>,
@@ -351,12 +360,14 @@ impl Summarizer {
     ) -> Result<Option<Self>> {
         let Some(ollama) = ollama else {
             tracing::warn!(
-                "no [ollama] section in the config; tickets get no summaries, methods and types no description"
+                "no [ollama] section in the config; tickets get no summaries, methods and types no description and no vector"
             );
             return Ok(None);
         };
         if no_llm {
-            tracing::info!("--no-llm: no chat calls; using cached summaries only");
+            tracing::info!(
+                "--no-llm: no chat or embedding calls; using cached summaries, descriptions and embeddings only"
+            );
         }
         let client = LlmClient::from_config(ollama, store.connect_cache()?)?;
         Ok(Some(Self::new(client, no_llm).with_describe(describe)))

@@ -82,6 +82,20 @@ pub struct Config {
     /// What goes into the method, constructor and type description prompts.
     #[serde(default)]
     pub describe: DescribeConfig,
+    /// What goes into a symbol's embedded text.
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+}
+
+/// What goes into the text embedded for a symbol (see
+/// [`crate::embeddings::embedding_text`]). Every value changes the texts, so
+/// changing one misses the embedding cache (cheap: no chat calls).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmbeddingConfig {
+    /// Append the enclosing type's description to a method's or
+    /// constructor's text (default off: `fqn` and description only).
+    pub parent_description: bool,
 }
 
 /// How much context a method, constructor or type description prompt carries.
@@ -341,6 +355,7 @@ embedding_model = "nomic-embed-text"
         assert_eq!(ollama.temperature, DEFAULT_TEMPERATURE);
         assert_eq!(ollama.max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(config.describe, DescribeConfig::default());
+        assert!(!config.embedding.parent_description);
         assert_eq!(config.describe.recent_tickets, DEFAULT_RECENT_TICKETS);
         assert_eq!(config.describe.commit_subjects, DEFAULT_COMMIT_SUBJECTS);
         assert_eq!(config.describe.body_chars, DEFAULT_BODY_CHARS);
@@ -368,6 +383,23 @@ embedding_model = "nomic-embed-text"
         let err = Config::parse(&format!("{MINIMAL}\n[describe]\nrecent = 2\n"))
             .expect_err("unknown key");
         assert!(format!("{err:#}").contains("recent"), "{err:#}");
+    }
+
+    #[test]
+    fn embedding_settings_are_optional_and_strict() {
+        let config = Config::parse(&format!(
+            "{MINIMAL}\n[embedding]\nparent_description = true\n"
+        ))
+        .expect("config should parse");
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig {
+                parent_description: true
+            }
+        );
+        let err = Config::parse(&format!("{MINIMAL}\n[embedding]\nparent = true\n"))
+            .expect_err("unknown key");
+        assert!(format!("{err:#}").contains("parent"), "{err:#}");
     }
 
     #[test]

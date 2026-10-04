@@ -10,12 +10,64 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 4 — LLM summaries, **complete pending the product owner's confirmation of the 4.5 review and the 4.6 descriptions** (Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
-| Step | 4.6 Symbol descriptions — **done, with review fixes and the product owner's follow-up** ("as short as possible without losing information": reasons the code, tickets or commits give for the symbol are kept; `argus` full run 19 min 21 s, 0 invalid, 0 retries, rerun 0 chat calls; members with a reason clause 34 → 62 of 479, types 47 → 74 of 175; members median 105 → 126 chars, max 489 → 334; `removeAllTokens(List<UUID>)` has its emergency-logout reason back; cost: more borrowed reasons (spot check of 15: 6 correct, 4 vague, 4 borrowed, 1 wrong); golden fqns all present); next 5.1 Embeddings |
+| Phase | 5 — Search and agent trial (Phase 4 LLM summaries complete pending the product owner's confirmation of the 4.5 review and the 4.6 descriptions; Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
+| Step | 5.1 Embeddings — **done** (`argus`: all 654 described symbols have a 1024-dim `bge-m3` vector, verified by SQL; cold embedding 11 calls / 654 texts, stage 8.6 s, run 10.1 s; rerun 0 embedding calls, run 2.5 s; ANN recall vs exact search 1.0); next 5.2 `annatar search` |
 | Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **5.1 Embeddings.** One commit. *Stage:* `index_embeddings` (7th stage,
+  after types) reads every symbol with a non-NULL `description` (id order),
+  builds its text with the pure `embeddings::embedding_text` (`fqn`, a
+  newline, the description; D-br) and sends all texts to
+  `LlmClient::embed` (embedding cache, misses only, batches of 64). The
+  first vector's length is the dimension: `schema::create_vectors` then
+  creates `symbol_vectors (symbol_id INTEGER PRIMARY KEY REFERENCES
+  symbols(id), embedding F32_BLOB(<dim>) NOT NULL)` and
+  `symbol_vectors_embedding` = `libsql_vector_idx(embedding,
+  'metric=cosine', 'compress_neighbors=float8')` in the build transaction
+  and inserts `vector32(?)` per symbol (D-bs, D-bt). *Failures (D-bu):* a
+  cache-only client (`--no-llm`, or the breaker tripped earlier) uses
+  `LlmClient::cached_embeddings` (new: cache only, `None` per miss) and
+  counts misses as skipped; a failed `embed` warns once, falls back to the
+  cache and counts the rest as failed; the run never fails on it; an index
+  without vectors has no `symbol_vectors` table. *Model check:*
+  `check_chat_model` → `check_models`: the embedding model is checked
+  after the chat model (missing → run fails before any chat call; D-bv).
+  *Config:* `[embedding] parent_description` (default `false`, the plan
+  default) appends a method's/constructor's enclosing type's description;
+  for 5.3 to compare (D-br). *Output:* `embeddings: N symbols, N embedded
+  (N from cache), N failed, N skipped; N embedding calls, N texts sent,
+  dim N` and `embed_*` fields in the info log; `IndexStats.embed_*`,
+  `embedding_dim`, `embed_llm`. `--no-llm` help, README, `annatar.toml`,
+  `plan.md` 5.1 and `project.md` (`symbol_vectors`) updated. `show` does
+  not print vectors (not needed; 5.2 search is the reader). *Tests (273,
+  5 ignored; +9):* libSQL `F32_BLOB(3)` + `libsql_vector_idx` +
+  `vector32` + `vector_top_k` + dimension mismatch rejected (schema);
+  `cached_embeddings` never calls the backend; embedding-model check;
+  `[embedding]` config; `embedding_text` default/parent/blank parent;
+  indexer: vectors for every described symbol, dim from the response,
+  `vector_top_k` on the committed index, rerun 0 embedding calls;
+  cache-only run + parent option; failed request keeps the run and leaves
+  no table; missing embedding model fails before any chat. *Real run
+  (`argus`, release, `--offline`, warm chat cache):* first run 654
+  symbols, **654 embedded, 11 embedding calls, 654 texts, dim 1024**, 0
+  chat calls; SQL: 654 symbols, 654 with a description, **0 described
+  without a vector**, 654 blobs of 4096 bytes. Cold embedding (scratch
+  copy, `embedding_cache` emptied): stage 8.6 s, run **10.1 s**; rerun
+  **0 embedding calls** (654 from cache), stage 0.66 s, run **2.5 s**
+  (4.6: 1.6 s); `--no-llm` 2.2 s, all 654 from cache. *Index size and
+  speed (D-bt):* the first version (default index options, SQLite's 2 MB
+  page cache) took 13.3 s for a fully cached stage and made `index.db`
+  144 MB: DiskANN rewrites multi-KiB nodes on each insert and the open
+  transaction spilled to the temp file on the container-mounted disk.
+  `PRAGMA cache_size` 256 MiB on the build connection → 1.4 s;
+  `compress_neighbors=float8` → 0.66 s and 75 MB. Recall of `vector_top_k`
+  against exact `vector_distance_cos` (each of the 654 vectors as query,
+  throwaway test): top-1 654/654 and recall@10 1.0 for default, float8,
+  `max_neighbors=32`, float8 + `max_neighbors=16` (18 MB, 0.47 s);
+  `float1bit` 0.9998.
 
 - **PO decision D-bq: member reasons are optional.** A method without its
   own reason is good enough when its class has one. All 654 `argus`
@@ -1513,12 +1565,16 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Agent:** 5.1 Embeddings (embed `fqn + description` through the
-  embedding cache; 4.6 replaced `fqn + what + why`; per D-bq consider
-  adding the parent type's description to a member's embedded text and
-  let 5.3 decide). Open #29 (logs on
-  stdout) must be fixed before or with 5.2, since the CLI is the agents'
-  interface (D-ax).
+- **Agent:** 5.2 `annatar search "<query>"`: embed the query with
+  `LlmClient::embed` (same model; the query vector's length must match the
+  index's `F32_BLOB` dimension), `vector_top_k('symbol_vectors_embedding',
+  vector32(?), k)` joined to `symbols` on `id = symbol_id`, optional kind
+  and role filters; a missing `symbol_vectors` table means the index has no
+  vectors (say so on stderr, D-bs). Open #29 (logs on stdout) must be fixed
+  before or with 5.2, since the CLI is the agents' interface (D-ax). Kind
+  and role filters on a vector index: filter after `vector_top_k` with a
+  larger k (open #36). 5.3 can compare `[embedding] parent_description`
+  (D-br, D-bq) by one rerun each (only embedding calls).
 - **Product owner:** the 4.6 trade-off is settled (D-bq: a member without
   a reason is fine when its class has one). Still open: the 4.5 review
   verdicts and golden questions (open #34), the borrowed reasons on
@@ -1583,6 +1639,7 @@ the decisions taken, and the tradeoffs behind them.
 | 4.6 review fixes and PO feedback | done | PO: "as short as possible without losing information", own reasons kept (borrowed ones and name guesses still excluded; accessor/constructor clause kept as "only when the history explains this very member or its field"); collective terms instead of enumerations; description-specific meta-phrase list (8 review sentences pass); `ollama.max_tokens` 1024 safety cap, `length` reply invalid, not in the cache key; per-stage peak prompt/completion tokens in the stats; "Merged " subjects dropped too; tests (commit order, type commit subjects); `argus` 19 min 21 s, 654 calls, 0 invalid/retries, rerun 0 calls; members with a reason 34 → 62, median 105 → 126 chars, max 489 → 334; spot check 6 C / 4 V / 4 B / 1 W of 15; 264 tests |
 | 4.6 Symbol descriptions (PO redesign) | done | one `description` (members `Description`, types `TypeDescription`) replaces `what`/`why`, `symbols.description` column; commit subjects always in the prompt (`History { tickets, commits }`); "as short as possible", no length limit; validation: blank, control chars, ticket key, openers, source phrases (no "the commit"); `show` prints `- description:`; `argus` 15 min 29 s, 541 chat calls, 0 invalid/retries, rerun 0 calls; median 105 (members) / 147 (types) chars, 99 % one sentence; spot check 15 C / 5 V / 0 W of 20; D-bm–D-bp; 262 tests |
 | 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
+| 5.1 Embeddings | done | `index_embeddings` stage after types: `fqn\ndescription` (pure `embeddings::embedding_text`, `[embedding] parent_description` off by default) through the embedding cache; `symbol_vectors` `F32_BLOB(<dim>)` + cosine `libsql_vector_idx` (`compress_neighbors=float8`) created by the stage from the first vector's length; `PRAGMA cache_size` 256 MiB for the inserts; `--no-llm`/breaker → cached embeddings only, failed request → cache fallback; embedding model checked with the chat model; `embeddings:` line; 273 tests; `argus`: 654/654 vectors, dim 1024, 11 calls cold (run 10.1 s), rerun 0 calls (2.5 s), index.db 75 MB, ANN recall 1.0 (D-br–D-bv) |
 
 ## Decisions and tradeoffs
 
@@ -1700,6 +1757,11 @@ the decisions taken, and the tradeoffs behind them.
 | D-bo (4.6) | Validation of a description: non-blank, no control characters, no ticket key (D-bh), no opener "This method/constructor/function" (members) or "This class/interface/enum/record/annotation/type" (types), no source or missing-information phrase (`summaries::source_meta_phrase` = D-bb's `REASON_META_PHRASES` **without "the commit"**, plus "commit history", plus a whole reply "Not specified"/"Unknown"/"None"/…); whitespace collapsed before storing. Dropped: length caps (`MAX_WHAT_CHARS`/`MAX_WHY_CHARS`), why-restates-what (D-av), "this method" anywhere and "this <kind> exists/is/was" (D-bi), which were `why`-specific. `finish_reason=length` detection (4.1) stays | Keep a generous cap (e.g. 1000); keep the full D-bb list | PO: no length limit. "the commit" is domain text in a description of behaviour ("publishes the event after the commit"); "this class is required" in the middle of a description is harmless once the opener is caught. Ticket summaries keep their own caps and checks (4.2 unchanged) **Amended (4.6 review fixes):** the meta check is description-specific (`describe::description_meta_phrase`): only clearly meta phrases, built from sources (ticket(s), commit(s), commit message(s), commit/change history, history, Javadoc) × "according to the …", "the … says/states/shows/mentions/explains", "the … does not / don't say/state/mention/specify/explain/give", "not stated/specified/mentioned/given/provided in the …", plus "no reason (is) given/stated/provided" and the bare stand-in replies; D-bb's list stays for the 4.2 purpose only. It rejected behaviour descriptions ("Returns null when the request does not specify a locale", "Records the change history of an order", "Closes this ticket …"). **Safety cap:** `ollama.max_tokens` (default 1024, `0` = not sent) bounds a looping reply, which would otherwise run to Ollama's limits or the 600 s timeout and trip the breaker for the whole run; it is not a length limit (the prompt mentions none; peak completion on `argus` 84 tokens, so the default is 12× above any real reply). A `length` reply is invalid even when it parses (retried once, never cached). Not in the LLM cache key: only complete replies are cached and a cap does not change a complete reply, so keying it would only re-ask cached summaries. With reasoning on, reasoning tokens count against the cap (probed), so raise it then |
 | D-bp (4.6) | `show` prints `- description:` for the symbol and every child in full; no display truncation. Stats lines and counters keep their names (`describe:`/`types:`, `described`, …) | First sentence or a truncated line for children | 99 % of descriptions are one sentence and p90 is ≈ 200 chars, so truncation would save little and `show` is the detail view; storage is never truncated |
 | D-bq (PO, after 4.6) | **Product-owner decision:** a member whose description carries no reason is fine as long as its enclosing type's description has one ("a method on a class that has a reason is good enough"). Every symbol keeps a code-based description (all 654 on `argus`); reasons are required only where the history explains the symbol, and the type level is where they are expected. No code rule to force or suppress member reasons (the D-bj fallback is not taken). | Push for a reason on every member; or a code rule that strips reasons from accessors/field-storing constructors | Asked after the PO read "62 of 479 members with a reason" as missing descriptions: the gap is reasons, not descriptions, and the class reason covers its members. Consequence for 5.1/5.3: a member's own embedding text lacks the class reason, so evaluate whether adding the parent type's description to a member's embedded text helps the golden set. |
+| D-br (5.1) | Embedded text = `fqn`, newline, description (trimmed), built by the pure `embeddings::embedding_text`; `[embedding] parent_description = true` appends a method's or constructor's enclosing type's description on a third line (types never get one; a NULL or blank parent description is left out). Default off = the plan's `fqn + description` | Parent description by default (state.md Next / D-bq); `kind` or `signature` in the text; a `fqn: description` one-liner | AGENTS.md: a config option instead of a changed default; D-bq says members may lean on their class's reason, so 5.3 can measure both with one rerun each (embedding calls only, never chat calls — the text is not part of any chat cache key). The fqn carries the class and method names, so a query naming them matches too |
+| D-bs (5.1) | `symbol_vectors` lives in `index.db` but not in `INDEX_TABLES`: `schema::vector_tables(dim)` / `create_vectors` build it, and the embeddings stage calls it once it has the first vector, in the build transaction. `symbol_id INTEGER PRIMARY KEY` = the rowid `vector_top_k` returns. No vector this run → no table; 5.2 must treat a missing table as "no embeddings". The dimension is not stored separately (it is in the column type) | Store the dimension from config; a fixed `F32_BLOB(1024)`; a `meta` table with the dimension; an `embedding` column on `symbols` added by `ALTER TABLE` | The plan says the dimension comes from the first response, so the DDL can only run then; a separate table keeps `symbols` unchanged and lets 5.2 test for vectors with one lookup. Verified on libsql 0.9.30 (`core`): `F32_BLOB(3)`, `libsql_vector_idx`, `vector32`, `vector_top_k`, and a wrong-length vector is rejected ("dimension") |
+| D-bt (5.1) | Index options `'metric=cosine', 'compress_neighbors=float8'` (default `max_neighbors`), and `PRAGMA cache_size = -262144` (256 MiB cap) on the build connection before the vector inserts (`schema::VECTOR_CACHE_KIB`) | Default options (float32 neighbours); `max_neighbors=16`/`32`; `float1bit`; no index (exact `vector_distance_cos` scan — fine for 654 rows, but the plan asks for `vector_top_k`) | Measured on `argus` (654 × 1024, fully cached stage): default + 2 MB cache 13.3 s and 144 MB `index.db` (spills to the temp file on the slow mount); + cache 1.4 s; + float8 0.66 s, 75 MB; float8 + 16 neighbours 0.47 s, 18 MB; recall vs exact search (each vector as query) top-1 654/654 and recall@10 1.0 for all of these, `float1bit` 0.9998. float8 keeps full-precision node vectors and the default neighbour count, so it should hold on larger repos too; `max_neighbors` can be lowered later if size matters (central index build, project.md) |
+| D-bu (5.1) | Embedding failures never fail the run: a cache-only client (`--no-llm`, or the chat breaker tripped in an earlier stage) uses `LlmClient::cached_embeddings` only (misses → `embed_skipped`); a failed `embed` call (after the backend's one transient retry) warns once, falls back to the cache (batches stored before the failure count as cached) and the rest are `embed_failed`; a cache fault in the fallback warns and leaves all without a vector. All texts go in one `embed` call (64 per batch); the embedding failure does not trip the chat breaker (it is the last stage) | Embed regardless of `--no-llm` (it is not a chat call); fail the run; per-batch fallback | `--no-llm` means "no model calls" (help text and README now say chat or embedding); a run with an unreachable server already trips the breaker at the model check, so it goes cache-only without timeouts. Vectors are content-keyed in `embedding_cache`, so the next run embeds only what is missing |
+| D-bv (5.1) | `LlmClient::check_models` (was `check_chat_model`) also checks the embedding model with `/api/show`, after the chat model: missing → the run fails before any chat call ("pull it or fix ollama.embedding_model"); unreachable → breaker as before (embedding check skipped) | Check only the chat model; check lazily in the stage | A wrong `embedding_model` would otherwise surface only after a 20-minute chat run, as 654 failed embeddings; consistent with D-ar |
 
 ## Open questions
 
@@ -1740,3 +1802,4 @@ the decisions taken, and the tradeoffs behind them.
 | 33 | The breaker (D-an) trips on the first backend failure. If one member's or type's request failed deterministically (same prompt, same failure every run), every run would trip at that symbol and everything after it would be cache-only for good, with no warning beyond the usual trip. Probed live (Ollama 0.35.1): an over-long prompt (≈ 300 000 words) is not rejected with 400/413 but silently truncated to the context (`prompt_tokens` 65 538) and answered 200 after 3 min 44 s, so the "context length" case does not exist there, and the prompts are capped (`body_chars`, `type_members`) far below it. Count a per-request 4xx (not 408/429) as invalid for that symbol instead of tripping, if a real run ever shows one? | 4.4 review | open — no deterministic failure seen on `argus`; revisit if a run trips at the same symbol twice |
 | 34 | The 4.5 quality review (`quality_review_4_5.md`) was done by the agent standing in for the product owner. Confirm or override the verdicts (especially the wrong/vague ones: `TokenValidationRest#deleteAllFromList`, `AuthDataCacheRest#delete`, `RoleRelationsUpdatedMessageConsumer#perform`, `OAuth2RequestCacheService`), whether empty whys on accessors, constructors and nested types are acceptable, GRLD-27116's purpose, and spot-check empty member whys in a package you know. Also review the 20 golden questions (`.annatar-local/golden-argus.toml`) | 4.5 | open — product owner. **Extended (4.5 review fixes):** also check the ≈ 5–8 lost reasons named in the review and D-bj, and the 24 golden questions (4 added: interface, repository, nested enum, constructor primaries). **Confidentiality (D-bl amended):** confirm that package-relative fqns in committed md docs are acceptable, and decide where the real golden set lives — its only copy is `/workspace/.annatar-local/golden-argus.toml` in the agent container (gitignored); please back it up. Also decide whether to rewrite history for the one company package prefix left in commit `abc05c7` (`tests/fixtures/jira/rich_description.json`, scrubbed since `9b44532`; the branch is pushed) **4.6:** the 4.5 verdicts judge the old what/why records (kept as the historical record); the product owner should also confirm the 4.6 descriptions and their trade-off (fewer reasons, D-bm). |
 | 35 | Suspected gaps in the accessor rule and the type prompt (D-bj), not seen on `argus`: record accessors (`name()`, no `get` prefix; `argus` has no records), accessors with non-`get` names (e.g. German `holeX`/`liefereX`) — the rule names accessors by kind and the model may key on the prefix — and the type prompt's "this {kind}" wording echoed into a why (the validator rejects only "this <kind> exists/is/was" openers). Check on a repo with records or such names before changing the prompt (a change costs a full re-describe) | 4.5 review | open — no prompt change **4.6:** the accessor clause is kept in the member prompt ("no reason for getters, setters, …"); an echoed "this {kind}" is now only rejected as an opener (D-bo), so the suspected echo cannot cost a retry; the record/German-accessor question still applies to whether such members get a borrowed reason. |
+| 36 | Kind and role filters for 5.2 search: `vector_top_k` has no `WHERE` push-down, so a filter after it can return fewer than k rows. Over-fetch (e.g. k × 4 or all 654 on `argus`) and filter, or scan with exact `vector_distance_cos` when a filter is set? | 5.1 | open — 5.2 decides |
