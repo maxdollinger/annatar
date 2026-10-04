@@ -77,7 +77,7 @@ Rerun `annatar index` whenever the code changes. It rebuilds the index from scra
 
 ```sh
 annatar search "who deletes expired tokens"     # the best matching files with their outline
-annatar show com.acme.token.TokenCleanup        # one symbol: description, tickets, commits, parent, children, used by / uses
+annatar show com.acme.token.TokenCleanup        # one symbol: description, parent, children, used by / uses (--history: also commits and tickets)
 annatar trace 'com.acme.token.TokenRepository#deleteByExpirationDateBefore(ZonedDateTime)'   # its callers, transitively, up to the entry points
 ```
 
@@ -90,7 +90,7 @@ For a coding agent, add this to the repository's `AGENTS.md` / `CLAUDE.md`:
 
 `annatar` is an index of this repository: what each class and method does and why (from Jira tickets and commits).
 - `annatar search "<question>"` finds the relevant files. Use it before grepping.
-- `annatar show '<fqn>'` explains one symbol with its tickets and commits, who uses it (`used by`) and what it uses.
+- `annatar show '<fqn>'` explains one symbol: its description, who uses it (`used by`) and what it uses. `--history` adds its commits and tickets.
 - `annatar trace '<fqn>'` lists its callers transitively, up to the entry points (`@Scheduled`, HTTP mappings, …).
 Descriptions can be wrong; the code is the source of truth.
 ```

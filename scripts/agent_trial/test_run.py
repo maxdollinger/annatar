@@ -94,6 +94,13 @@ class ClaudeCmdTest(unittest.TestCase):
         self.assertEqual(files[:files.index("--append-system-prompt")],
                          symbols[:symbols.index("--append-system-prompt")])
 
+    def test_brief_prompt_changes_only_the_show_bullet_of_usages(self):
+        brief = run.claude_cmd("m", "with", "q", 60, 3.0, "brief")
+        self.assertEqual(self.appended(brief), run.WITH_PROMPTS["brief"])
+        lines, usages = run.WITH_PROMPTS["brief"].splitlines(), run.WITH_PROMPTS["usages"].splitlines()
+        self.assertEqual([i for i, (a, b) in enumerate(zip(lines, usages)) if a != b], [2])
+        self.assertIn("`--history` adds", lines[2])
+
     def test_usages_prompt_adds_one_bullet_to_files(self):
         usages = run.claude_cmd("m", "with", "q", 60, 3.0, "usages")
         self.assertEqual(self.appended(usages), run.WITH_PROMPTS["usages"])

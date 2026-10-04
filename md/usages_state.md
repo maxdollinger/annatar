@@ -20,10 +20,23 @@ unique across both files.
 | --- | --- |
 | Phase | 6 — Usages — **done** (2026-10-04; 6.1–6.7 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
 | Step | 6.7 agent trial (T4) on usages — **done** (graded blind; reviewed, findings fixed): dispatcher 5/5, full marks 5/5 (4/5 under a strict reading), no measurable cost increase vs 5.5 (mean +7 %, median −8 %, p = 1.0); #42 closed. Phase 6 complete; next: open items / `plan.md` Later with the product owner |
-| Last updated | 2026-10-04 (6.7) |
+| Last updated | 2026-10-04 (`show` without history, D-eh) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
+
+- **`show` without history by default** (after Phase 6, product owner,
+  2026-10-04). The product owner judged the description and `used by` /
+  `uses` the valuable part of `show` and the commits and tickets
+  condensed by the description, so `show` drops them; `show --history`
+  prints them as before (D-eh). `show::render` keeps the full output (the
+  library and tests read the index through it), `render_with(.., history)`
+  serves the CLI. On `argus` (654 symbols): `show` output 2098 → 1115 KB
+  in total (−47 %), median 1963 → 1215 bytes, p90 7246 → 3750, max 31920 →
+  11361; the T4 consumer 12.6 → 4.0 KB. `run.py --with-prompt brief`: the
+  `usages` prompt with the `show` bullet describing `--history` (the old
+  prompts byte-identical), +1 Python test; README, `reference.md`,
+  `project.md` (`show` row). Not yet measured with agents.
 
 - **6.7 Agent trial (T4) on usages.** `scripts/agent_trial/run.py`
   `--with-prompt usages` (D-ed): the `files` prompt with one bullet
@@ -801,6 +814,9 @@ unique across both files.
 
 ### Next
 
+- **Agent trial on `show` without history** (D-eh): T4 (and T1–T3, since
+  T2 hinges on a ticket-only reason) with `--with-prompt brief`, to check
+  that correctness holds and cost drops.
 - Phase 6 is complete (6.7 reviewed and committed); `plan.md` has no
   further step. The next work is chosen with the product owner from the
   open items and `plan.md` Later — e.g. a multi-hop agent task to measure
@@ -822,6 +838,7 @@ unique across both files.
 | 6.5 `show`: `used by` / `uses` | done | `src/usage_query.rs`: `used_by` / `uses` as SQL joins (`inside` CTE over `parent_id`, `overridden` CTE up `overrides`), `entry_point` (D-du); `show`: `- entry point:`, `- used by:` / `- uses:` grouped by file, `fqn [kind] [ambiguous] [via I#m] :lines [entry: …]`, `-k`/`--limit` (default 20, 1–100) with `… N more`, `none` when empty, shown symbol only (D-dt); `via` = callers of every method it overrides, transitively; incoming `overrides` listed (D-dr); a type's `uses` rolls up its members' (D-ds); #45 decided: deferred to Later (D-dv); new open #50, #51; tests: `via`, roll-up, cap, no users, entry points, exact format, CLI `-k`; `argus`: `SecurityDataAddEventConsumer` names `SecurityDataEventDispatcherConfig` (:24, :28, :45) and `SecurityDataEventDispatcher#dispatch` (`call` :76), `via` on `UserCreatedMessageConsumer#perform` → `UserMessageDispatcher#performMessage` :123; index not rebuilt, 0 LLM calls; review: 10 findings — fixed: `uses` lines vs the used symbol's path (F1, title `uses (lines in this symbol's file)`), members' `overrides` left out of a type's roll-up (F2, `AbstractCache` 36 → 18 entries, its callers within the cap), duplicate `instantiate` of type and constructor (F3), `@ExceptionHandler` / `@PreDestroy` (F5), `none in main sources` (F6), total `ORDER BY` (F7), tests for `ambiguous`, two overrides and a diamond (F8), wording (F10); recorded: full fqns' token cost → open #51 with `via` kept as an fqn (F4, D-dw), `trace` reuse (F9 → Next) |
 | 6.6 `annatar trace` | done | `src/trace.rs`: two-pass walk (BFS levels, DFS print, D-eb) over `usage_query::callers` (new: `used_by`'s query with a `call`/`instantiate`/`reference` filter, roll-up only at the root; `Usage::symbol_kind`), one query per printed symbol (D-dx); tree `fqn [kind] [ambiguous] [via I#m] file:lines; …`, file left out when unchanged (D-dz), `(see above)`, `[entry: @A]`, `[no callers in main sources]`, `[N callers beyond depth D]`, `(see below)`, each symbol expanded at its shallowest level (D-eb), types below the root `[type, not followed]` or `[initializer]` (followed through `usage_query::constructions`, D-dy), entry points labelled on every copy and followed when code calls them (D-ec); `--depth` 1–10 (default 6), `-k` per symbol 1–100 (default 10, D-ea), usage errors exit 2; tests: via, diamond, cycle, entry / no-caller leaves, depth, re-expansion, cap, type root, format, CLI ranges; `argus`: the T4 consumer → `dispatch` :76 → `receiveAndDispatchMessages` :67 → `processMessages` :59 `[entry: @Scheduled]`; sizes over 654 symbols (Measurements); index not rebuilt, 0 LLM calls; review: 6 findings, all fixed — `(see above)` into a depth-cut expansion hid callers (F1, 26 → 0 on `argus`; `UserOrganizationService` now reaches the role dispatcher's `@Scheduled`), default depth 6 and #52 closed (F2), initializer types followed (F3), entry label on repeats and entry points with code callers followed (F4), elision wording (F5), docs (F6) |
 | 6.7 Agent trial (T4) on usages | done | `run.py --with-prompt usages` (files + one bullet on `used by` / `uses` / `trace`, D-ed), `trace` counted apart, +2 Python tests; README agent snippet; 6.7 protocol amendment; T4 × 5 + T1–T3 × 1, *with* arm, `main-67/`; blind grading 30/30 old grades agree; T4 dispatcher 5/5 (5.5: 3/5), full marks 5/5 (2/5), cost +7 % / tokens −10 % (n.s.), `show` 6.4 vs 3.4, `trace` 0; T1–T3 all 2; $1.28; D-ed–D-eg, #42 closed, #46/#47/#49/#50/#51 decided, open #53; review: 11 findings, all addressed — mechanism 3/5 via the consumer's `used by` (one hit via a `LOG_PREFIX` reference, one via search), cost "no measurable increase" (mean +7 %, median −8 %, p = 1.0; cache creation +21 %), T4-with-5 strict 4/5, D-eg premise, prompt cues, deviations disclosed (post-hoc note in `protocol.md`), README scope, doc drift, test CLI order; new open #54 |
+| `show` without history | done | default `show` prints description, usages, parent, children; `--history` adds commits and tickets (D-eh); −47 % output on `argus`; `run.py --with-prompt brief`; agent trial pending |
 
 ## Measurements
 
@@ -882,6 +899,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-ee (6.7) | **Verdict: usages close #42.** With `used by` in `show`, all 5 T4 agents named the queue dispatcher and got full marks (5.5: 3/5 and 2/5; 5.4 symbols: 1/5 and 0/5, p = 0.048 / 0.008), with cost not measurably different from 5.5 (mean +7 %, median −8 %, MW p = 1.0, n = 5; tokens −10 %); T1–T3 unchanged in correctness. The agents reached the dispatcher mostly through `show`'s `used by`, not `trace` (0 calls) | Call #42 narrowed until `trace` is used; keep it open for more runs | #42 is a correctness question and the dispatcher went to 5/5 (full marks 5/5, 4/5 under a strict reading of T4-with-5). The plan's cost criterion is met in the sense of no measurable increase, not strictly: the +7 % mean comes from cache creation (+21 %) from the larger `show` output (46.7 vs 26.3 KB per run), the real price of usages; vs 5.4 *without* T4 costs +13 % (n.s.) for −36 % tool calls. Vs 5.5 the gain is not significant at n = 5 (p = 0.44 / 0.17), vs the 5.4 symbol output it is. The intended mechanism, the consumer's `used by` naming `SubscriptionMessageDispatcher#performMessage … via MessageConsumer#perform`, shows in 3 of 5 streams; 1 found the dispatcher through an incidental `LOG_PREFIX` `reference` in another class's `used by`, 1 through search. `trace`'s value for agents is untested by T4 (one hop suffices) → #53. Caveats as D-ct: one task, 5 runs, the same kind of LLM grades, baselines ≈ 6.5 h older; and the prompt's mild cues (D-ed) |
 | D-ef (6.7, #46) | **No usages in the `search` file view**; callers stay one `show` away | `used by N` per hit, or the callers' files under each hit | The agents called `show` on their own in every T4 run (6.4 per run) and read `used by` there; a count or callers on every search result would cost output on every query (T1–T3 never needed them) to save at most one call. `project.md` keeps search as the entry and `show` / `trace` as the drill-down |
 | D-eg (6.7, #51) | **Usage lists keep full fqns** (D-dw stands) | Members relative to the file's top-level type, as `search` prints them | The package prefixes in the usage sections the T4 agents read were 4.3 KB per run (≈ 1.1 k tokens, < 2 % of a run's tokens even when re-read on later turns). The fqns the agents passed to `show` were mostly copied from earlier output (about half from usage lines), which a relative name would break; 2 typed ones for an inherited member failed (→ #54, not a naming issue). The usage sections do cost: the T4 cost rose +7 % (n.s.) through cache creation from the larger `show` output (D-ee), but the prefixes are a small part of it |
+| D-eh (after 6, product owner) | **`show` prints no commits and tickets unless `--history` is given.** The description condenses them; `show` is about what a symbol does and where it is used | Keep them (the 5.4 finding: ticket-only reasons found 5/5 with Annatar vs 0/5 without); dedupe a member's history against its parent's; shorten dates and merge commits under their tickets | Product-owner call: description and usages carry the value; −47 % `show` output on `argus` (the 6.7 cost rise came from `show` output). The reasons stay reachable through the description (built from tickets and commits) and `--history`. Risk: an agent no longer sees a ticket-only reason the description dropped (T2) — measured by the next trial; `project.md`'s `show` row updated |
 
 ## Open questions
 
