@@ -22,7 +22,7 @@ use annatar::{eval, indexer, show};
 struct Cli {
     /// Limit the run to paths under this prefix, for fast iteration. `index`
     /// still replaces the whole index.db, which then holds only this prefix;
-    /// `search` returns only symbols in files under it.
+    /// `search` matches only symbols in files under it.
     #[arg(long, global = true, value_name = "PREFIX")]
     path: Option<PathBuf>,
 
@@ -64,16 +64,18 @@ enum Command {
     /// Search symbol descriptions by meaning and print the files of the
     /// best matches: per file `rank. score path`, its top-level type as
     /// `kind fqn [role] :start-end` with its description, then its members
-    /// and nested types with their lines; matching symbols end with
+    /// and nested types with their lines; the best matching symbols end with
     /// `*score`. `--symbols` prints the matching symbols instead.
     Search {
         /// Plain-language query.
         query: String,
-        /// Only symbols of this kind (repeatable).
+        /// Only symbols of this kind can match (repeatable); the file output
+        /// still prints each file of a match whole.
         #[arg(long, value_name = "KIND", value_parser = PossibleValuesParser::new(SymbolKind::ALL.map(|kind| kind.as_str())))]
         kind: Vec<String>,
         /// Only types with this Spring role and their methods and
-        /// constructors (repeatable).
+        /// constructors can match (repeatable); the file output still prints
+        /// each file of a match whole.
         #[arg(long, value_name = "ROLE", value_parser = PossibleValuesParser::new(Role::ALL.map(|role| role.as_str())))]
         role: Vec<String>,
         /// Number of results: files (default 5, at most 20), or symbols
@@ -100,7 +102,15 @@ enum Command {
 }
 
 fn parse_limit(text: &str) -> Result<usize, String> {
-    parse_limit_from(text, 1)
+    parse_limit_from(text, 1).map_err(|_| format!("expected {}", search_limits()))
+}
+
+fn search_limits() -> String {
+    format!(
+        "files: 1 to {}; with --symbols: 1 to {}",
+        search::MAX_FILES,
+        search::MAX_LIMIT
+    )
 }
 
 fn parse_eval_limit(text: &str) -> Result<usize, String> {
@@ -127,13 +137,17 @@ async fn main() -> ExitCode {
     } = cli.command
         && limit > search::MAX_FILES
     {
-        Cli::command()
+        let mut command = Cli::command();
+        command.build();
+        command
+            .find_subcommand_mut("search")
+            .expect("search is a subcommand")
             .error(
                 ErrorKind::ValueValidation,
                 format!(
-                    "-k {limit}: search prints at most {} files; use --symbols for up to {} symbols",
+                    "-k {limit}: search prints at most {} files; use --symbols for more ({})",
                     search::MAX_FILES,
-                    search::MAX_LIMIT
+                    search_limits()
                 ),
             )
             .exit();
@@ -289,16 +303,16 @@ async fn run(cli: &Cli) -> Result<()> {
                 print!("{}", search::format_hits(&hits));
             } else {
                 let limit = limit.unwrap_or(search::DEFAULT_FILES);
-                let groups =
+                let found =
                     search::search_files(reader.connection(), &embedder, query, &filter, limit)
                         .await?;
-                let symbols = search::group_symbols(reader.connection(), &groups).await?;
-                if groups.is_empty() {
-                    eprintln!("no symbol matches the filter");
+                let symbols = search::group_symbols(reader.connection(), &found.groups).await?;
+                if let Some(note) = found.note() {
+                    eprintln!("{note}");
                 }
                 print!(
                     "{}",
-                    search::format_files(&groups, &symbols, search::MEMBER_LINES)
+                    search::format_files(&found.groups, &symbols, search::MEMBER_LINES)
                 );
             }
         }

@@ -202,6 +202,7 @@ pub async fn evaluate(
         let files =
             search::search_files(conn, embedder, question.text(), &Filter::default(), limit)
                 .await?
+                .groups
                 .into_iter()
                 .map(|group| group.file)
                 .collect::<Vec<_>>();

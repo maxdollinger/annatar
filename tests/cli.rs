@@ -153,10 +153,18 @@ fn search_rejects_unknown_filters_and_limits() {
         &["search", "--role", "dao", "users"][..],
         &["search", "-k", "0", "users"][..],
         &["search", "-k", "101", "users"][..],
+        &["search", "--symbols", "-k", "101", "users"][..],
     ] {
         let output = annatar(dir.path(), args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert_eq!(text(&output.stdout), "");
+        if args.contains(&"-k") {
+            assert!(
+                text(&output.stderr).contains("expected files: 1 to 20; with --symbols: 1 to 100"),
+                "{}",
+                text(&output.stderr)
+            );
+        }
     }
 }
 
@@ -506,10 +514,12 @@ async fn search_prints_files_by_default_and_symbols_on_request() {
     let many = annatar(dir.path(), &["search", "-k", "21", "users"]);
     assert_eq!(many.status.code(), Some(2));
     assert_eq!(text(&many.stdout), "");
+    let stderr = text(&many.stderr);
     assert!(
-        text(&many.stderr).contains("search prints at most 20 files; use --symbols"),
-        "{}",
-        text(&many.stderr)
+        stderr.contains(
+            "-k 21: search prints at most 20 files; use --symbols for more (files: 1 to 20; with --symbols: 1 to 100)"
+        ) && stderr.contains("Usage: annatar search "),
+        "{stderr}"
     );
     let many = annatar(dir.path(), &["search", "--symbols", "-k", "21", "users"]);
     assert!(many.status.success(), "{}", text(&many.stderr));
