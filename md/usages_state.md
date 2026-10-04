@@ -18,12 +18,120 @@ unique across both files.
 
 | | |
 | --- | --- |
-| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.5 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
-| Step | 6.5 `show`: `used by` and `uses` — **done** (reviewed, findings fixed); next: 6.6 `annatar trace <fqn> [--depth N]` |
-| Last updated | 2026-10-04 (6.5) |
+| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.6 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
+| Step | 6.6 `annatar trace <fqn> [--depth N]` — **done** (reviewed, findings fixed); next: 6.7 agent trial (T4) on usages |
+| Last updated | 2026-10-04 (6.6) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
+
+- **6.6 `annatar trace <fqn> [--depth N]`.** New module `src/trace.rs`
+  (`render(conn, fqn, depth, limit)`, `DEFAULT_DEPTH` 6, `MAX_DEPTH` 10,
+  `DEFAULT_LIMIT` 10) and the command `annatar trace <fqn> [--depth N]
+  [-k N]`. `usage_query` gains `callers(conn, id, roll_up)`: `used_by`'s
+  statement with a kind filter (`call`, `instantiate`, `reference`; no
+  `extends` / `implements` / `overrides` hops) and, without `roll_up`, an
+  `inside` of the symbol alone (`SELF`), so a type node below the root
+  does not fan out to its members' users (6.5 review F9); `used_by` is the
+  same private `users(..)` with the roll-up and no filter, unchanged.
+  `Usage` gains `symbol_kind` (the other symbol's kind), `usage_query`
+  `constructions(conn, id)` (the `instantiate` / constructor `call` edges
+  of a type, for `[initializer]` types). The walk (D-dx, D-eb) is in Rust,
+  one query per symbol reached, memoized: a breadth-first pass from the
+  root finds each symbol's shallowest level within the `-k` caps, then a
+  depth-first print with an explicit stack (no async recursion) expands
+  each symbol at its first shallowest occurrence; callers grouped per
+  symbol in the order of their first mention, links merged by kind /
+  `ambiguous` / `via`. Root:
+  `fqn [kind] file:start-end [entry: @A]`, its callers rolled up when it is
+  a type (as `show`'s `used by`, without internal edges, with the members'
+  `via` callers); below it per caller `fqn [kind] [ambiguous] [via I#m]
+  file:lines; …` — the file left out when it is the file of the symbol it
+  calls (D-dz) —, `[initializer]` (a type whose initializer calls the
+  symbol above, followed through its constructions, D-dy) and `[entry:
+  @A]` (`usage_query::entry_point`, on every copy) where they apply, ending
+  in `(see above)` (expanded earlier), `(see below)` (an earlier, deeper
+  copy of a symbol expanded further down at a shallower level, D-eb),
+  `[type, not followed]` (a type below the root that only references the
+  symbol above, D-dy), `[no callers in main sources]` (left out after an
+  entry point) or `[N callers beyond depth D]`; an entry point with callers
+  in code is followed on (D-ec), without them it ends the branch; at most `-k`
+  callers per symbol (`--limit`, default 10, 1–100) with `… N more` (D-ea).
+  `--depth` 1–10 and `-k` out of range are usage errors (exit 2, clap's
+  value parser like `show -k`); an unknown fqn is `error: symbol `…` not
+  found in the index` (exit 1). Reads only `index.db`; ≈ 8 ms per trace on
+  `argus` including process start. *Tests:* `trace` on a 6-file Java
+  fixture through `build_index` — the exact tree of a method with a `via`
+  and a direct call from one caller (`:27; :28`), a diamond (`left` /
+  `right` → `process`, the second `[entry: @Scheduled] (see above)`), a
+  cycle (`first` ↔ `second`), an entry-point and a no-caller leaf; depth 2
+  with `[1 caller beyond depth 2]`; the exact depth-2 tree of a type whose
+  members are reached deep first (`(see below)` copies, each expanded at
+  level 1); a 7-file chain fixture (`R ← A ← B ← X`, `R ← X ← Y ← Z
+  [@Bean] ← W [@Scheduled]`, depth 4: `X` at level 3 reads `(see below)`,
+  the level-1 `X` reaches `W`, through the `@Bean` entry `Z` its code
+  caller; fails on the pre-review walk); `-k 1` with `… 1 more` on two
+  levels; a type root (rolled-up callers, internal `audit` call left out,
+  `[type, not followed]` on the `Dispatcher` field, `Retry`'s field
+  initializer `[initializer]` → `Manual#run() instantiate`); an entry-point
+  root without callers; unknown fqn; the caller-line format (`ambiguous`,
+  `via`, kind, merged lines, file elision); `usage_query::callers` (kind
+  filter, no roll-up, roll-up equal to `used_by` without `overrides` /
+  `extends`); `tests/cli.rs`: the exact trace of `UserService#find(Long)`,
+  `--depth 1 -k 1` on a type, `--depth 0`/`11`, `-k 0`/`101` exit 2, a
+  missing fqn exit 1. 392 lib tests (+10) and 14 CLI tests (+1) pass; fmt
+  and clippy `--all-targets -D warnings` clean. *Docs:* `reference.md`
+  (command list, a `trace` paragraph with an example matching the binary
+  on `show`'s flow fixture), README command list, `usages.md` Output (real
+  `argus` trace, format, type root, D-dx), `plan.md` 6.6 (walk instead of
+  one CTE, type leaves, `-k` per symbol, default depth 6, shallowest
+  expansion, entry points with callers, initializer types). *`argus`*
+  (index current, not rebuilt; `index.db` and `cache.db` not written;
+  `trace --config real.toml`), final output after the review, default
+  depth 6: the T4 consumer reaches the dispatcher's `@Scheduled` method
+  through `dispatch` :76 and `receiveAndDispatchMessages` :67:
+
+  ```text
+  com.haufe.greenland.argus.messaging.consume.janus.securityMethods.messageConsumer.SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage) [method] backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/messageConsumer/SecurityDataAddEventConsumer.java:23-28
+    com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/SecurityDataEventDispatcher.java:76
+      com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcher#receiveAndDispatchMessages() :67
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcher#processMessages() :59 [entry: @Scheduled]
+  ```
+
+  The type `SecurityDataAddEventConsumer` (1947 bytes, 8 lines): the same
+  chain, plus `SecurityDataEventDispatcherConfig reference …:24 [type, not
+  followed]`, its constructor `reference :28 [no callers in main
+  sources]` (Spring calls it) and its getter `reference :45` → `dispatch`
+  :75 `(see above)`. A heavily used method,
+  `DynamoDBEventService#publishAsync(DynamoDBEvent)`: 43 lines, 9.4 KB,
+  every branch ending at a mapping, `@Scheduled` dispatcher, `@Bean` or
+  the depth, `… 4 more` at the root (14 callers); the largest trace,
+  `DynamoDBEvent`: 75 lines, 16.6 KB at depth 6 (56 / 13.6 KB at 4;
+  Measurements). Before D-dy the type nodes were followed: `AuthDataEvent`
+  75 lines / 17.6 KB at depth 4, mostly injection chains
+  (`TokenValidationEventService reference` → `UserTokenService reference`
+  → …). *Review* (`review-6.6.md`, 6 findings; the step met its done-when):
+  **F1 (high)** `(see above)` could point to an expansion deeper in the
+  tree whose subtree the depth had cut, hiding reachable callers (26
+  `argus` traces at depth 4; `UserOrganizationService` never showed
+  `RoleRelationMessageDispatcher#processMessages() [entry: @Scheduled]`,
+  reachable at level 4) — fixed with the two-pass walk (D-eb): a
+  breadth-first pass for each symbol's shallowest level, expansion only
+  there, earlier deeper copies `(see below)`; the `cut` set is gone; a
+  scan of all 654 symbols at depths 4, 5, 6, 8 and 10 (`-k 10` and
+  `-k 100`) finds 0 copies pointing to a deeper or missing expansion (the
+  review's `see.py`: 0 cases at 4 and 6, was 26), `UserOrganizationService`
+  now reaches the role dispatcher's `@Scheduled`; 44 of 654 traces carry
+  a `(see below)` (76 lines). **F2** default depth 4 → 6, #52 closed with
+  the measured table (D-ea). **F3** a type reached through a `call` /
+  `instantiate` from itself (a field initializer) is `[initializer]` and
+  followed through its constructions instead of `[type, not followed]`
+  (D-dy; 0 such edges on `argus`, output unchanged there). **F4** an entry
+  point's label is printed on every copy (`[entry: @Scheduled] (see
+  above)`), and an entry point with callers in code is followed on (D-ec;
+  0 on `argus`). **F5** file elision documented as "the file of the
+  symbol it calls" (`reference.md`, `usages.md`, D-dz, `main.rs`). **F6**
+  Done and Measurements rewritten for the new rules and depth 6.
 
 - **6.5 `show`: `used by` and `uses`.** New read-side module
   `src/usage_query.rs` (D-du): `used_by(conn, id)` and `uses(conn, id)`
@@ -585,23 +693,15 @@ unique across both files.
 
 ### Next
 
-- **6.6 `annatar trace <fqn> [--depth N]`** (`plan.md` Phase 6): a
-  recursive CTE over incoming `call`, `instantiate` and `reference` edges
-  through `overrides` (`via`), built on `usage_query` (the `inside` CTE for
-  a type tracing its members, the `overridden` CTE for `via`,
-  `usage_query::entry_point` for the `[entry: @Scheduled]` leaves); the
-  `argus` check: tracing `SecurityDataAddEventConsumer#consume(..)` reaches
-  `SecurityDataEventDispatcher#processMessages()` (`@Scheduled`) through
-  `dispatch` :76 and `receiveAndDispatchMessages` :59 (the `uses` of
-  `processMessages` above already shows that hop). From the 6.5 review
-  (F9): `used_by(id)` always rolls a type up, so a trace through a type
-  node (`SecurityDataEventDispatcherConfig reference :24`) would fan out
-  to every user of every member — `trace` needs a variant without the
-  roll-up (a scope parameter or `pub(crate)` CTE fragments; `INSIDE` is
-  private today) and a kind filter (`call` / `instantiate` / `reference`,
-  no `extends` / `implements` / `overrides` hops); `entry_point` and
-  `Usage::entry` are ready. Make `trace`'s per-level cap `-k` too, so the
-  flag means "entries per list" in both usage commands.
+- **6.7 Agent trial (T4) on usages** (`plan.md` Phase 6): re-run the 5.5
+  *with* arm on T4 (5 runs, the D-cs protocol and grading) with
+  `--with-prompt usages` in `scripts/agent_trial/run.py` — the file-output
+  prompt plus one paragraph on `used by` (`show`) and `trace` — and update
+  the README agent snippet in the same change. Success: the dispatcher in
+  5 of 5 answers, no cost increase over the 5.5 runs
+  (`.annatar-local/agent-trial/main-55/`). Record for #51 what the agents'
+  `show` / `trace` output cost (bytes, tokens), and whether any trace hit
+  the default depth 6 (D-ea, #52 closed).
 
 ## Step log
 
@@ -614,7 +714,7 @@ unique across both files.
 | 6.3a refactor(usages) split | done | review L6 of 6.3, no behaviour change: `src/usages.rs` (API, `resolve`, test helpers) + `src/usages/` `resolver.rs`, `members.rs`, `walk.rs`, `expr.rs` (D-dl); code moved verbatim, cross-file items `pub(super)`, tests moved with their code (39 tests, same names; 356 lib tests); `argus`: edges identical (1142, by fqn and by id), 0 chat calls; review: approved, 3 doc nits fixed |
 | 6.4 Overrides and measured quality | done | `overrides` edges, nearest per Java with type-argument substitution through generic super types, shared with the "overridden nearer" lookup (D-dn); #48 decided: super-type arguments substituted in inherited members, method-level bounded type variables typed by the bound (D-dp), receivers' own type arguments → open #49; `edges:` line + `edges_overrides`; `src/usage_eval.rs` + `annatar eval-usages` (D-do); hand-built 29-symbol `argus` usage set (D-dm); `argus`: 1200 edges (50 `overrides`), call sites 424 / 174 / 0 / 788, P 1.000 R 0.967 (88/91), overriders 10/10, misses 3 × lambda; review: 11 findings — fixed: a type variable of the nearer method or type matched any type (H1, wrong `overrides` and `call` edges) and a farther variable bound to a nearer variable (H2, the test expected a false override) via `Sig` / `Arg::Var`, varargs vs single parameter (M1), the random part of the set made reproducible and grown to 33 symbols with random-only scores (M2), bounds leaking between same-named variables (L1), package-private across packages (L2, `is_package_private`), header type arguments around the type (L3), eval wording and `symbol N` in index errors (L5); recorded: L4 recall gaps (`usages.md`), L5's optional checks (D-dq); 54-symbol set P 1.000 R 0.972 (104/107), random only 23/23, members 50/53; `argus` edges unchanged |
 | 6.5 `show`: `used by` / `uses` | done | `src/usage_query.rs`: `used_by` / `uses` as SQL joins (`inside` CTE over `parent_id`, `overridden` CTE up `overrides`), `entry_point` (D-du); `show`: `- entry point:`, `- used by:` / `- uses:` grouped by file, `fqn [kind] [ambiguous] [via I#m] :lines [entry: …]`, `-k`/`--limit` (default 20, 1–100) with `… N more`, `none` when empty, shown symbol only (D-dt); `via` = callers of every method it overrides, transitively; incoming `overrides` listed (D-dr); a type's `uses` rolls up its members' (D-ds); #45 decided: deferred to Later (D-dv); new open #50, #51; tests: `via`, roll-up, cap, no users, entry points, exact format, CLI `-k`; `argus`: `SecurityDataAddEventConsumer` names `SecurityDataEventDispatcherConfig` (:24, :28, :45) and `SecurityDataEventDispatcher#dispatch` (`call` :76), `via` on `UserCreatedMessageConsumer#perform` → `UserMessageDispatcher#performMessage` :123; index not rebuilt, 0 LLM calls; review: 10 findings — fixed: `uses` lines vs the used symbol's path (F1, title `uses (lines in this symbol's file)`), members' `overrides` left out of a type's roll-up (F2, `AbstractCache` 36 → 18 entries, its callers within the cap), duplicate `instantiate` of type and constructor (F3), `@ExceptionHandler` / `@PreDestroy` (F5), `none in main sources` (F6), total `ORDER BY` (F7), tests for `ambiguous`, two overrides and a diamond (F8), wording (F10); recorded: full fqns' token cost → open #51 with `via` kept as an fqn (F4, D-dw), `trace` reuse (F9 → Next) |
-| 6.6 `annatar trace` | next | |
+| 6.6 `annatar trace` | done | `src/trace.rs`: two-pass walk (BFS levels, DFS print, D-eb) over `usage_query::callers` (new: `used_by`'s query with a `call`/`instantiate`/`reference` filter, roll-up only at the root; `Usage::symbol_kind`), one query per printed symbol (D-dx); tree `fqn [kind] [ambiguous] [via I#m] file:lines; …`, file left out when unchanged (D-dz), `(see above)`, `[entry: @A]`, `[no callers in main sources]`, `[N callers beyond depth D]`, `(see below)`, each symbol expanded at its shallowest level (D-eb), types below the root `[type, not followed]` or `[initializer]` (followed through `usage_query::constructions`, D-dy), entry points labelled on every copy and followed when code calls them (D-ec); `--depth` 1–10 (default 6), `-k` per symbol 1–100 (default 10, D-ea), usage errors exit 2; tests: via, diamond, cycle, entry / no-caller leaves, depth, re-expansion, cap, type root, format, CLI ranges; `argus`: the T4 consumer → `dispatch` :76 → `receiveAndDispatchMessages` :67 → `processMessages` :59 `[entry: @Scheduled]`; sizes over 654 symbols (Measurements); index not rebuilt, 0 LLM calls; review: 6 findings, all fixed — `(see above)` into a depth-cut expansion hid callers (F1, 26 → 0 on `argus`; `UserOrganizationService` now reaches the role dispatcher's `@Scheduled`), default depth 6 and #52 closed (F2), initializer types followed (F3), entry label on repeats and entry points with code callers followed (F4), elision wording (F5), docs (F6) |
 | 6.7 Agent trial (T4) on usages | planned | |
 
 ## Measurements
@@ -630,6 +730,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | Misses by cause (lambda, library chain, generics, other) | 6.4 | After #48: **3 misses, all lambda** — `AuthDataEvent#getWebListResponse(..)` → `toWebResponse()` (`events.forEach(event -> … event.toWebResponse())`), `UserTokenBearer#removeTokenById(String)` → `UserToken#getId()` (`validTokens.removeIf(token -> token.getId()…)`), `UserTokenService#isTokenValid(..)` → `UserToken#getId()` (`getValidTokens().stream().anyMatch(userToken -> …)`, a library chain as well); library chain alone 0, generics 0, other 0; **0 false positives**. Before #48: 6 misses — lambda 3 (the same), generics 3 (`getPayload()` returning `T` on `SecurityMethodAddMessage` / `SecurityMethodRemoveMessage extends SecurityDataMessageBearer<SecurityData>` → the two consumers' `SecurityData` references; `message.getMessageType()` on `<T extends UserDataMessageBearer>`). All three lambda misses need a receiver's own type argument (`List<UserToken>`, `List<AuthDataEvent>`) and the lambda parameter's type from a library functional interface (open #49) |
 | Edge stage time (benchmark, `argus`) | 6.2 / 6.3 / 6.4 | 6.4: `argus` 11 ms (release, overrides and substitution included); benchmark (release) ≈ 5 ms per run (no overrides in it). 6.3 after the review: `argus` 11 ms, benchmark ≈ 26–27 ms. 6.3: `argus` 10–11 ms (release); benchmark (200 files, 1000 edges, debug) ≈ 25 ms per run. 6.2: `argus` 7 ms (release, 162 files, `index --offline` 2.2 s wall in all); synthetic benchmark (200 files, debug) ≈ 12 ms per run |
 | `show` list sizes on `argus` (654 symbols, `-k 100`) | 6.5 | after the review (members' `overrides` out of type roll-ups, no type `instantiate` beside its constructor's): `used by`: empty 230, median 1 entry, > 20 entries 2 (max 29, `DynamoDBEvent`; `AbstractCache` 18); `uses`: empty 289, median 1, > 20 4 (max 27, `RoleRelationsUpdatedMessageConsumer`); ≈ 14 ms per `show` including process start, so the default cap 20 cuts 2 + 4 lists. Before the review: `used by` > 20 for 5 (max 36, `AbstractCache`, half of it its subclasses' `overrides`), `uses` > 20 for 5 (max 31) |
+| `trace` sizes on `argus` (654 symbols) | 6.6 | after the review (D-eb shallowest expansion), `-k 10`: **default `--depth 6`**: only the root line (no callers) 237, median 3 lines / 538 bytes, p90 37 lines / 8.4 KB, max 75 lines / 16.6 KB (`DynamoDBEvent`), > 20 lines 109, 1.46 MB in all; a `@Scheduled` reached in 238 traces, cut by the depth 36 (33 of them on a `…Dispatcher#` line); a `… N more` in 20; a `(see below)` in 44 (76 lines). By depth (`-k 10`; reaching `@Scheduled` / cut / cut on a dispatcher line / p90 / max / total): 4: 165 / 136 / 92 / 7.2 KB, 27 L / 13.6 KB, 56 L / 1.20 MB; 5: 206 / 76 / 60 / 8.1 KB, 33 L / 15.7 KB, 68 L / 1.37 MB; **6: 238 / 36 / 33 / 8.4 KB, 37 L / 16.6 KB, 75 L / 1.46 MB**; 8: 261 / 2 / 2 / 8.8 KB, 38 L / 19.9 KB, 82 L / 1.50 MB; `--depth 10 -k 100`: 262 / 0, max 103 lines / 23.6 KB (`DynamoDBEvent`), no trace reaches depth 10. ≈ 235 bytes per line, most of it the full path and fqn (#51). The T4 trace 830 bytes, 4 lines; the type `SecurityDataAddEventConsumer` 1947 bytes, 8 lines; `DynamoDBEventService#publishAsync(DynamoDBEvent)` 43 lines / 9.4 KB (all unchanged from depth 4). Before the review (depth 4, `cut` re-expansion only at the limit): reaching `@Scheduled` 162, cut 141, same p90 / max; `--depth 4 -k 20` max 84 lines / 20.6 KB. Before D-dy (type nodes followed, depth 4): max 75 lines / 17.6 KB (`AuthDataEvent`), > 20 lines 97. ≈ 8 ms per trace including process start |
 | T4: dispatcher named / full marks / cost vs 5.5 | 6.7 | – |
 
 ## Decisions and tradeoffs
@@ -665,6 +766,12 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-du (6.5) | The read side of the edges lives in **`src/usage_query.rs`** (`used_by`, `uses`, `Usage`, `entry_point`, `ENTRY_ANNOTATIONS`), apart from the resolver (`usages`) and the eval (`usage_eval`), so `trace` reuses the CTEs and the entry-point test. Entry points: method annotations by simple name (qualified or with arguments), `@Scheduled`, `@RequestMapping`, `@Get/Post/Put/Delete/PatchMapping`, `@EventListener`, `@ExceptionHandler`, `@PostConstruct`, `@PreDestroy`, `@Bean`, several joined (`@ExceptionHandler` and `@PreDestroy` added in the review, F5); `public static void main(String[])` (or `String...`) by fqn and signature; types never | Detection in `show`; by fqn suffix only; Spring's meta-annotations (`@Schedules`, `@TransactionalEventListener`, listener annotations of messaging libraries such as `@KafkaListener`/`@SqsListener`, none on `argus`) | The list is `usages.md`'s plus `@ExceptionHandler` (the framework calls it on an exception, no caller in code) and `@PreDestroy` (the partner of `@PostConstruct`). On `argus` the framework-called methods are 10 `@Scheduled`, 14 `@Bean`, 11 `@PostConstruct`, 25 mappings, 2 `@ExceptionHandler`, 1 `main` (the developer's "`argus` uses only these" missed the two `@ExceptionHandler`s, review F5); no meta-annotations. An annotation by simple name can be a project's own of that name — acceptable for a label. `usage_eval::users` keeps its own query (excludes `overrides`, no `via`), unchanged |
 | D-dv (6.5, open #45) | **#45 decided: test callers are not indexed in Phase 6**; they belong to the Later test-code indexing item (`plan.md`), first as sources of usages only (rows marked as test, never described, embedded or searched; `used by` / `trace` list them apart). `reference.md` says test callers never show | Index test files for edges now | `edges.src_id` references `symbols`, so test sources need symbol rows, which `search`, `describe` (LLM cost), `eval` and the golden sets would all have to skip; that is a schema and pipeline change beyond 6.5–6.7. `project.md`'s "what a change can break" arguably includes tests, but the T4 gap (#42) is a main-code caller; 6.7 shows whether main-code usages suffice |
 | D-dw (6.5 review, F4) | **Usage lines keep full fqns, `via` included** (`via com.acme…MessageConsumer#perform(T)`, not `via MessageConsumer#perform(T)`); `plan.md` 6.5 now reads `via <fqn of I#m>`. The token cost of the repeated package is open #51 for 6.7 | Members relative to the file's top-level type, as `search`'s file view does (−28 to −35 % bytes on `argus` lists); only `via` shortened, as the plan's `via I#m` wording had it | Every printed symbol is something an agent copies into `show` / `trace`, which need the exact fqn (AGENTS.md: symbols are identified by fqn in the CLI); a relative `via` would be the one name in the output an agent cannot paste. Whether the bytes matter is measured in the 6.7 trial, not guessed |
+| D-dx (6.6) | **`trace` walks the tree in Rust, one SQL query per printed symbol** (`usage_query::callers`: `used_by`'s recursive `inside` / `overridden` CTEs with a kind filter, the roll-up only for the root), depth first with an explicit stack; not one recursive CTE over the whole tree as `plan.md` 6.6 had it (now reworded) | A recursive CTE yielding (depth, path, caller) rows, the tree rebuilt from them in Rust; a CTE for the reachable set plus per-node queries | The output's rules are about print order: "each symbol once, a repeat `(see above)`" is the first occurrence depth first, the cap is per printed symbol, a depth-cut symbol is counted and expanded where it recurs higher up, entry points and types stop a branch. A CTE enumerating paths needs path strings for cycle safety and grows with every path (diamonds multiply), and its rows would still be re-walked in Rust to apply those rules. The per-symbol query is the 6.5 statement (shared `via` and roll-up logic, no second SQL dialect of the same rules); a trace costs one query per printed line (≈ 8 ms per trace on `argus` with process start) |
+| D-dy (6.6) | **A type traces its members: the root type's callers are rolled up as `show`'s `used by`** (its members' and nested types' incoming `call` / `instantiate` / `reference` edges from outside, `via` callers included); **below the root a type that only references the symbol above is a leaf, `[type, not followed]`**: a type mentioning the symbol above (a field, a header type argument, an annotation) is shown with its lines, its own users are not traced. **Amended in the review (F3):** a type with a `call` / `instantiate` link of its own to the symbol above (a field initializer, an initializer block) is marked `[initializer]` and followed through the code constructing it (`usage_query::constructions`: `instantiate` edges into the type, `call` / `instantiate` into its constructors, from outside them) — the initializer runs whenever the type is constructed. Not followed: a subclass's construction (implicit `super()`), static initializers run at class load (both read as constructions or not at all) | Root as a tree of its members, each traced (names the member each caller reaches, #50, but prints every member without callers and the internal calls); a type below the root traced through its own incoming edges (no roll-up, the 6.5 review's suggestion) or rolled up | `project.md`: transitive callers, "what a change can break" — for a type, the users of any of its members, as `show` lists them. A type node's own users only hold it (fields, constructor parameters: the injection graph); the members that use the field reach the symbol through their own `call` edges and appear as callers on their own (the T4 type: `SecurityDataEventDispatcherConfig reference :24` is a leaf, its getter :45 leads to `dispatch`). Following them on `argus` printed injection chains (`AuthDataEvent`: 75 lines → 50, max over all symbols 17.6 → 13.6 KB) and no caller a member did not already show. An agent wanting the type's users runs `trace` on it. Initializer code is different: it executes on construction, so its blast radius is whoever constructs the type (`project.md`: "what a change can break"); a distinct leaf label would name the gap but leave it. On `argus` type-sourced edges are only `reference` / `extends` / `implements` (0 initializer edges), so the `argus` measurement behind this decision rests on reference links alone and the output there is unchanged |
+| D-dz (6.6) | **Format:** root `fqn [kind] file:start-end` (+ `[entry: @A]`, or `[no callers in main sources]`); one line per caller symbol, two spaces per level: `fqn`, then its links (kind unless `call`, `ambiguous`, `via <fqn>`, `:lines`) joined by `; `, the caller's file on the first link **only when it differs from the file of the symbol it calls** (the line it is indented under; a chain inside one file reads `:67`, `:59`, as the design's example; wording fixed in the review, F5 — a later sibling compares with its callee, not with the line printed above it, so siblings from one file each print the path); `[initializer]` and `[entry: @A]` next, the branch's end marker last (entry points: D-ec) | One line per link (as `show`; a caller with a direct and a `via` call would print twice and its subtree once); the file on every line; the file name only; the file once per group as in `show`'s headers | One line per symbol keeps "each symbol once" literal and the tree a tree; the full path is what an agent opens, the elision saves it on same-file hops (dispatcher chains) without making a line ambiguous — the callee is the line the caller is indented under, whose file is on its own line or above it. Full fqns as D-dw (pasteable into `show` / `trace`); token cost with #51 |
+| D-ea (6.6) | **`-k` caps callers per symbol** (each printed symbol's list, `… N more` under it), the flag meaning "entries per list" as in `show`; **default 10**, not `show`'s 20; `--depth` 1–10, out of range a usage error like `-k`; **default depth 6** (review F2, closes #52; `plan.md` had 4) | A cap per tree level (all symbols at one depth); default 20 as `show` | A trace multiplies lists: at 20 the largest `argus` trace is 84 lines / 20.6 KB, at 10 56 / 13.6 KB, and only 20 of 654 traces hit 10 (none 20). Per level would cut a deep branch for a wide sibling. Depth (measured after D-eb, `-k 10`, 654 symbols): 4 reaches `@Scheduled` in 165 traces and cuts 136 (92 on a dispatcher line — a symbol two calls below a consumer needs 5–6 hops to its `processMessages`), 6 reaches it in 238 and cuts 36 (33), 8: 261 / 2; p90 7.2 → 8.4 KB, max 13.6 → 16.6 KB, median unchanged (3 lines). 6.7's agents use the default, so deciding after the trial would measure the wrong setting; 8 adds 23 traces for +20 % max bytes |
+| D-eb (6.6 review, F1) | **Each symbol is expanded at its shallowest occurrence**: a breadth-first pass from the root (same `-k` caps, one memoized query per symbol, also for the symbols at the depth limit to count their callers) records each symbol's shallowest level; the depth-first print expands a symbol at its first occurrence on that level, prints `(see above)` for a later copy and `(see below)` for an earlier, deeper one; the `cut` set (re-expansion only of a symbol sitting exactly at the limit) is gone | Store the remaining depth per expanded symbol and expand again when a repeat has more (correct, but prints shared subtrees twice); the first occurrence depth first as before | The first-occurrence rule let the first-listed branch decide how deep a shared symbol was expanded: a symbol expanded one level above the limit had its callers cut, and its copy at level 1 read `(see above)` — 26 `argus` traces hid callers within the depth, among them a cronus dispatcher's `@Scheduled` (the T4 chain 6.7 grades). By induction every symbol within the depth is expanded once, at its shallowest level, so the depth never hides a reachable caller and `[N callers beyond depth D]` appears only on a symbol really at the limit; the query count is unchanged |
+| D-ec (6.6 review, F4) | **An entry point is labelled on every copy and followed on when code calls it**: `[entry: @A]` before `(see above)` / `(see below)` / the children; an entry point without callers in main sources ends the branch with just the label (no `[no callers in main sources]`), one with code callers (an inter-bean `@Bean` call, a controller method reused internally) is traced like any other symbol | Stop at every entry point (design "trace stops there"), silently dropping code callers; stop and count them (`[entry: @Bean; N callers not followed]`) | `project.md`'s blast radius: a change to the method also breaks its code callers, which the framework entry does not replace. On `argus` no entry method has an incoming `call` / `instantiate` / `reference` edge, so every entry still ends its branch there and the output only gains the label on repeats (an agent grepping for `@Scheduled` finds every copy) |
 
 ## Open questions
 
@@ -676,4 +783,5 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | 48 | Substitute a super type's type arguments in inherited members (`SecurityMethodAddMessage extends SecurityDataMessageBearer<SecurityData>` → `getPayload()` returns `SecurityData`) and in receivers' generic types (`Box<Item>#get()`)? Today a type variable stops the chain (`usages.md`, where resolution stops): on `argus` every message consumer's `message.getPayload().getUserId()` is unresolved. Also a **bounded** type variable (`<T extends UserDataMessageBearer> void sendAsync(T message)` → `message.getMessageType()`): its erasure, the bound, is as precise as a declared type, but 6.1 keeps only the type variables' names (6.3 review L3) | 6.3 | **closed (6.4, D-dp):** super-type arguments are substituted in inherited members (return types, fields, Lombok/record accessors) and in `overrides`; a method's bounded type variable types its variables by the bound — the 3 generics misses of the usage golden set are gone (+8 correct edges on `argus`). A receiver's own type arguments (`Box<Item>#get()`) and class-level bounds stay out → #49 |
 | 49 | A receiver's own type arguments and lambda parameter types (`List<UserToken> tokens; tokens.removeIf(t -> t.getId()…)`, `events.forEach(e -> e.toWebResponse())`): `Ty` keeps no type arguments and an untyped lambda parameter has no type, so the call is unresolved. All 3 misses of the 6.4 usage golden set (3 of 91 users), at most 13 of `argus`'s 1386 call sites. Model type arguments on `Ty` plus the parameter types of common JDK functional interfaces (`forEach`, `removeIf`, `stream().map/filter/anyMatch`), or leave it to SCIP? | 6.4 | open — after 6.7: only if the agent trial shows a caller missing for this reason |
 | 50 | A type's `used by` line names the user and the lines, not which member of the type it uses (`…Dispatcher#dispatch(..) :76` under `SecurityDataEventDispatcherConfig` could be `getQueueName()` or the getter). Name the member (`→ #getX()`), at the cost of longer lines, or leave it to `show` of the member? | 6.5 | open — after 6.7, if agents misread a type's users |
-| 51 | Usage lists repeat the full package in every fqn under a file header that already contains it (`show` of `AbstractCache -k 100`: 6595 bytes, 4275 without the package, −35 %; `SecurityDataAddEventConsumer` −28 %). Print members relative to the file's top-level type, as `search`'s file view does, at the cost of names an agent cannot paste into `show` / `trace` unchanged (D-dw)? | 6.5 review | open — after 6.7, on the trial's token cost |
+| 51 | Usage lists repeat the full package in every fqn under a file header that already contains it (`show` of `AbstractCache -k 100`: 6595 bytes, 4275 without the package, −35 %; `SecurityDataAddEventConsumer` −28 %). Print members relative to the file's top-level type, as `search`'s file view does, at the cost of names an agent cannot paste into `show` / `trace` unchanged (D-dw)? `trace` (6.6) prints the full path and fqn on most lines too, ≈ 235 bytes per line on `argus` (Measurements) | 6.5 review | open — after 6.7, on the trial's token cost |
+| 52 | `trace`'s default depth 4 cuts 141 of 654 `argus` traces (`-k 100`; 85 at 5, 46 at 6, 2 at 8, none at 10), and of the 669 cut lines in them most fall on the message dispatchers (pactum, cronus, cives, janus: `performMessage` / `dispatch` / `receiveAndDispatchMessages`, one or two hops below their `@Scheduled` `processMessages`) — the T4 pattern, for a symbol a few calls below a consumer — then `AuthDataService#preWarm(UUID)` (35). Raise the default (6 cuts a third as many, at more output) or keep 4 and let agents pass `--depth`? | 6.6 | **closed (6.6 review, F2): default depth 6** (D-ea): after D-eb, 4 → 6 raises the traces reaching `@Scheduled` 165 → 238 and lowers the cut ones 136 → 36 (dispatcher lines 92 → 33) for p90 7.2 → 8.4 KB; 6.7 records whether any trial trace still ends at the depth |

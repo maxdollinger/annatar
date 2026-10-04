@@ -16,6 +16,7 @@ pub mod symbols;
 #[cfg(test)]
 mod test_support;
 pub mod tickets;
+pub mod trace;
 pub mod usage_eval;
 pub mod usage_query;
 pub mod usages;

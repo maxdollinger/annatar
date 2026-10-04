@@ -161,6 +161,71 @@ fn show_lists_usages_capped_by_k() {
 }
 
 #[test]
+fn trace_prints_callers_and_rejects_depths_and_limits_out_of_range() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+
+    let trace = annatar(
+        dir.path(),
+        &["trace", "com.acme.sample.UserService#find(Long)"],
+    );
+    assert!(trace.status.success(), "{}", text(&trace.stderr));
+    assert_eq!(
+        text(&trace.stdout),
+        "com.acme.sample.UserService#find(Long) [method] src/main/java/com/acme/sample/UserService.java:16-18\n  com.acme.sample.UserController#get(Long) src/main/java/com/acme/sample/UserController.java:32 [entry: @GetMapping]\n"
+    );
+    let capped = annatar(
+        dir.path(),
+        &[
+            "trace",
+            "--depth",
+            "1",
+            "-k",
+            "1",
+            "com.acme.sample.UserService",
+        ],
+    );
+    assert!(capped.status.success(), "{}", text(&capped.stderr));
+    assert!(
+        text(&capped.stdout).ends_with("  … 3 more\n"),
+        "{}",
+        text(&capped.stdout)
+    );
+
+    for args in [
+        ["--depth", "0"],
+        ["--depth", "11"],
+        ["-k", "0"],
+        ["-k", "101"],
+    ] {
+        let rejected = annatar(
+            dir.path(),
+            &["trace", args[0], args[1], "com.acme.sample.UserService"],
+        );
+        assert_eq!(rejected.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&rejected.stdout), "");
+        let expected = if args[0] == "--depth" {
+            "expected a number from 1 to 10"
+        } else {
+            "expected a number from 1 to 100"
+        };
+        assert!(
+            text(&rejected.stderr).contains(expected),
+            "{}",
+            text(&rejected.stderr)
+        );
+    }
+
+    let missing = annatar(dir.path(), &["trace", "com.acme.sample.Missing"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        text(&missing.stderr),
+        "error: symbol `com.acme.sample.Missing` not found in the index\n"
+    );
+}
+
+#[test]
 fn search_without_an_index_is_one_error_line() {
     let dir = workspace();
 

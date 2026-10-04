@@ -204,7 +204,7 @@ Receiver typing, chains, implicit members (Lombok, records, enums), method refer
 
 **6.6 `annatar trace <fqn> [--depth N]`**
 *Goal:* transitive callers, so an agent sees the chain and what a change can break.
-A recursive CTE over incoming `call`, `instantiate` and `reference` edges, through `overrides` (`via`), default depth 4 (at most 10), each symbol once (a repeat prints `(see above)`), cycles safe; leaves are entry points (`[entry: @Scheduled]`) or symbols without callers (`[no callers in main sources]`); output as an indented tree with file:line, capped per level. A type traces its members. Usage errors as `search` (exit 2).
+A depth-first walk over one query per symbol (`usage_query::callers`, the recursive CTEs of 6.5; `usages_state.md` D-dx) along incoming `call`, `instantiate` and `reference` edges, through `overrides` (`via`), default depth 6 (at most 10; D-ea), each symbol once, at its shallowest level (a repeat prints `(see above)` / `(see below)`, D-eb), cycles safe; leaves are entry points (`[entry: @Scheduled]`, unless code calls them too, D-ec) or symbols without callers (`[no callers in main sources]`), and a type below the root (`[type, not followed]`; one whose initializer is the caller followed through its constructions, `[initializer]`, D-dy); output as an indented tree with file:line (D-dz), capped per symbol (`-k`, default 10). A type traces its members' callers (rolled up as in `show`). Usage errors as `search` (exit 2).
 *Done when:* tests cover depth, a cycle, a diamond, `via`, the entry-point and no-caller leaves; on `argus`, tracing a T4 consumer reaches the dispatcher's `@Scheduled` method.
 
 **6.7 Agent trial (T4) on usages**
