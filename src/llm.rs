@@ -16,8 +16,8 @@
 //! invalid instead of silently accepted.
 //!
 //! Both go through `cache.db`: `llm_cache` keyed by a hash of chat model,
-//! reasoning effort, canonical schema and prompt (the prompt is the full text,
-//! input included), `embedding_cache` keyed by a hash of embedding model and
+//! reasoning effort, temperature, canonical schema and prompt (the prompt is
+//! the full text, input included), `embedding_cache` keyed by a hash of embedding model and
 //! text. A changed key simply misses. Cache faults degrade: an unreadable,
 //! undecodable or no longer valid row is a miss, a failed write warns and keeps
 //! the result. The client is shared by reference across concurrent tasks; give
@@ -105,6 +105,8 @@ pub struct ChatRequest {
     pub schema: Value,
     /// `reasoning_effort` to send, if any.
     pub reasoning_effort: Option<String>,
+    /// Sampling temperature.
+    pub temperature: f64,
 }
 
 /// One chat completion as the backend returned it.
@@ -279,6 +281,7 @@ fn chat_body(request: &ChatRequest) -> Value {
             },
         },
         "stream": false,
+        "temperature": request.temperature,
     });
     if let Some(effort) = &request.reasoning_effort {
         body["reasoning_effort"] = json!(effort);
@@ -415,6 +418,21 @@ pub struct LlmStats {
     pub embed_hits: usize,
 }
 
+impl LlmStats {
+    /// What happened between `earlier` (a snapshot of the same client) and
+    /// `self`.
+    pub fn since(&self, earlier: &LlmStats) -> LlmStats {
+        LlmStats {
+            chat_calls: self.chat_calls - earlier.chat_calls,
+            chat_hits: self.chat_hits - earlier.chat_hits,
+            chat_retries: self.chat_retries - earlier.chat_retries,
+            embed_calls: self.embed_calls - earlier.embed_calls,
+            embed_texts: self.embed_texts - earlier.embed_texts,
+            embed_hits: self.embed_hits - earlier.embed_hits,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     chat_calls: AtomicUsize,
@@ -434,6 +452,7 @@ pub struct LlmClient {
     chat_model: String,
     embedding_model: String,
     reasoning_effort: Option<String>,
+    temperature: f64,
     counters: Counters,
 }
 
@@ -451,6 +470,7 @@ impl LlmClient {
             embedding_model: config.embedding_model.clone(),
             reasoning_effort: Some(config.reasoning_effort.clone())
                 .filter(|effort| !effort.is_empty()),
+            temperature: config.temperature,
             counters: Counters::default(),
         }
     }
@@ -491,34 +511,12 @@ impl LlmClient {
         T: DeserializeOwned + JsonSchema,
         F: Fn(&T) -> Result<(), String>,
     {
-        let schema =
-            serde_json::to_value(schemars::schema_for!(T)).context("serializing schema")?;
+        let (schema, key) = self.schema_and_key::<T>(prompt)?;
         let type_name = T::schema_name();
-        let key = completion_key(
-            &self.chat_model,
-            self.reasoning_effort.as_deref(),
-            &canonical_schema(&schema),
-            prompt,
-        );
-        let decode = |output: &str| -> Result<T, String> {
-            let value = serde_json::from_str::<T>(output).map_err(|err| err.to_string())?;
-            validate(&value)?;
-            Ok(value)
-        };
-
-        match self.cached_completion(&key).await {
-            Ok(Some(output)) => match decode(&output) {
-                Ok(value) => {
-                    self.counters.chat_hits.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(r#type = %type_name, "llm cache hit");
-                    return Ok(value);
-                }
-                Err(err) => {
-                    tracing::warn!(r#type = %type_name, "llm cache row is not valid, treating as a miss: {err}");
-                }
-            },
-            Ok(None) => {}
-            Err(err) => tracing::warn!("reading llm cache, treating as a miss: {err:#}"),
+        let decode = |output: &str| decode_checked(output, &validate);
+        let cached = self.cached_output(&key).await;
+        if let Some(value) = self.decode_hit(cached, &type_name, decode) {
+            return Ok(value);
         }
 
         let mut request = ChatRequest {
@@ -527,6 +525,7 @@ impl LlmClient {
             schema_name: schema_name(&type_name),
             schema,
             reasoning_effort: self.reasoning_effort.clone(),
+            temperature: self.temperature,
         };
         let mut attempt = 1;
         loop {
@@ -577,6 +576,65 @@ impl LlmClient {
                     }
                     .into());
                 }
+            }
+        }
+    }
+
+    /// The cached answer to `prompt` that passes `validate`, without ever
+    /// calling the backend: the cache-only half of
+    /// [`LlmClient::complete_with`]. A hit counts in `chat_hits`; a miss (or
+    /// an unreadable or no longer valid row) is `None`.
+    pub async fn cached_with<T, F>(&self, prompt: &str, validate: F) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + JsonSchema,
+        F: Fn(&T) -> Result<(), String>,
+    {
+        let (_, key) = self.schema_and_key::<T>(prompt)?;
+        let cached = self.cached_output(&key).await;
+        Ok(self.decode_hit(cached, &T::schema_name(), |output| {
+            decode_checked(output, &validate)
+        }))
+    }
+
+    /// The JSON schema of `T` and the `llm_cache` key of `prompt` for it.
+    fn schema_and_key<T: JsonSchema>(&self, prompt: &str) -> Result<(Value, String)> {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(T)).context("serializing schema")?;
+        let key = completion_key(
+            &self.chat_model,
+            self.reasoning_effort.as_deref(),
+            self.temperature,
+            &canonical_schema(&schema),
+            prompt,
+        );
+        Ok((schema, key))
+    }
+
+    /// The cached row for `key`; a read fault warns and is a miss.
+    async fn cached_output(&self, key: &str) -> Option<String> {
+        self.cached_completion(key).await.unwrap_or_else(|err| {
+            tracing::warn!("reading llm cache, treating as a miss: {err:#}");
+            None
+        })
+    }
+
+    /// `output` from the cache decoded by `decode`, counted as a hit; an
+    /// invalid row warns and is a miss.
+    fn decode_hit<T>(
+        &self,
+        output: Option<String>,
+        type_name: &str,
+        decode: impl Fn(&str) -> Result<T, String>,
+    ) -> Option<T> {
+        match decode(&output?) {
+            Ok(value) => {
+                self.counters.chat_hits.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(r#type = %type_name, "llm cache hit");
+                Some(value)
+            }
+            Err(err) => {
+                tracing::warn!(r#type = %type_name, "llm cache row is not valid, treating as a miss: {err}");
+                None
             }
         }
     }
@@ -731,6 +789,17 @@ impl LlmClient {
     }
 }
 
+/// Deserialize `output` into a `T` that passes `validate`.
+fn decode_checked<T, F>(output: &str, validate: &F) -> Result<T, String>
+where
+    T: DeserializeOwned,
+    F: Fn(&T) -> Result<(), String>,
+{
+    let value = serde_json::from_str::<T>(output).map_err(|err| err.to_string())?;
+    validate(&value)?;
+    Ok(value)
+}
+
 /// The check of [`LlmClient::complete`]: any parsed reply is valid.
 fn accept<T>(_: &T) -> Result<(), String> {
     Ok(())
@@ -814,10 +883,12 @@ fn sorted_keys(value: &Value) -> Value {
     }
 }
 
-/// `llm_cache` key: chat model, reasoning effort, canonical schema and prompt.
+/// `llm_cache` key: chat model, reasoning effort, temperature, canonical
+/// schema and prompt.
 fn completion_key(
     model: &str,
     reasoning_effort: Option<&str>,
+    temperature: f64,
     schema: &str,
     prompt: &str,
 ) -> String {
@@ -825,6 +896,7 @@ fn completion_key(
         "completion",
         model,
         reasoning_effort.unwrap_or(""),
+        &temperature.to_string(),
         schema,
         prompt,
     ])
@@ -986,6 +1058,7 @@ mod tests {
             chat_model: chat_model.to_string(),
             embedding_model: "embed".to_string(),
             reasoning_effort: "none".to_string(),
+            temperature: 0.0,
         }
     }
 
@@ -1061,6 +1134,7 @@ mod tests {
             request.schema
         );
         assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["temperature"], json!(0.0));
         assert_eq!(body["messages"][0]["role"], "user");
     }
 
@@ -1080,10 +1154,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_model_prompt_schema_or_effort_misses() {
+    async fn changed_model_prompt_schema_effort_or_temperature_misses() {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
-        backend.reply(&[SUMMARY, SUMMARY, r#"{"ok": true}"#, SUMMARY, SUMMARY]);
+        backend.reply(&[
+            SUMMARY,
+            SUMMARY,
+            r#"{"ok": true}"#,
+            SUMMARY,
+            SUMMARY,
+            SUMMARY,
+        ]);
         let llm = client(&backend, &store, &ollama("chat"));
         llm.complete::<Summary>("prompt").await.unwrap();
         llm.complete::<Summary>("other prompt").await.unwrap();
@@ -1101,9 +1182,15 @@ mod tests {
             .complete::<Summary>("prompt")
             .await
             .unwrap();
+        let mut warmer = ollama("chat");
+        warmer.temperature = 0.7;
+        client(&backend, &store, &warmer)
+            .complete::<Summary>("prompt")
+            .await
+            .unwrap();
 
-        assert_eq!(backend.chats().len(), 5);
-        assert_eq!(count(&store, "llm_cache").await, 5);
+        assert_eq!(backend.chats().len(), 6);
+        assert_eq!(count(&store, "llm_cache").await, 6);
     }
 
     #[tokio::test]
@@ -1242,6 +1329,41 @@ mod tests {
         );
         assert_eq!(backend.chats().len(), 2);
         assert_eq!(llm.stats().chat_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn cached_with_never_calls_the_backend() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[SUMMARY, r#"{"what": "", "why": "x"}"#]);
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.complete::<Summary>("prompt").await.unwrap();
+        llm.complete::<Summary>("blank").await.unwrap();
+        let before = llm.stats();
+
+        assert_eq!(
+            llm.cached_with::<Summary, _>("prompt", not_blank)
+                .await
+                .unwrap(),
+            Some(summary())
+        );
+        assert_eq!(
+            llm.cached_with::<Summary, _>("missing", not_blank)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            llm.cached_with::<Summary, _>("blank", not_blank)
+                .await
+                .unwrap(),
+            None,
+            "a cached row failing the check is a miss"
+        );
+        let stats = llm.stats().since(&before);
+        assert_eq!(stats.chat_calls, 0);
+        assert_eq!(stats.chat_hits, 1);
+        assert_eq!(backend.chats().len(), 2);
     }
 
     #[tokio::test]
@@ -1585,8 +1707,8 @@ mod tests {
     #[test]
     fn keys_separate_their_parts() {
         assert_ne!(
-            completion_key("ab", None, "s", "p"),
-            completion_key("a", Some("b"), "s", "p")
+            completion_key("ab", None, 0.0, "s", "p"),
+            completion_key("a", Some("b"), 0.0, "s", "p")
         );
         assert_ne!(embedding_key("m", "ab"), embedding_key("ma", "b"));
         assert_eq!(embedding_key("m", "t"), embedding_key("m", "t"));
@@ -1707,6 +1829,7 @@ mod tests {
                 .ok()
                 .or(file.map(|ollama| ollama.reasoning_effort))
                 .unwrap_or_else(|| crate::config::DEFAULT_REASONING_EFFORT.to_string()),
+            temperature: crate::config::DEFAULT_TEMPERATURE,
         }
     }
 

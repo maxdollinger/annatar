@@ -20,7 +20,7 @@ Everything that doesn't help answer these three questions is in **Later**, at th
 - Every step ships with tests. Unit tests use fixtures and never need network, Jira or Ollama. Tests that do are marked `#[ignore]` and run manually.
 - **Two database files.**
   - `index.db` is rebuilt from scratch on every run. It's written to a temporary file and atomically renamed into place, so a running MCP server never sees a half-built index.
-  - `cache.db` persists and holds only expensive results, keyed by content: tickets by ticket key (fetched once, never refreshed, since done tickets don't change), LLM outputs by a hash of model + prompt text + input (plus the response schema and reasoning effort, so a changed struct or setting misses), and embeddings by a hash of model + text. A changed prompt, model or input simply misses the cache, so no versioning or invalidation logic is needed. If a cache table's schema changes, drop that table.
+  - `cache.db` persists and holds only expensive results, keyed by content: tickets by ticket key (fetched once, never refreshed, since done tickets don't change), LLM outputs by a hash of model + prompt text + input (plus the response schema, reasoning effort and temperature, so a changed struct or setting misses), and embeddings by a hash of model + text. A changed prompt, model or input simply misses the cache, so no versioning or invalidation logic is needed. If a cache table's schema changes, drop that table.
 - **Symbols are identified by fully qualified name (fqn)** everywhere outside a single run: in caches, the golden set and the MCP tools. Row IDs change on every rebuild.
 - `--path <prefix>` limits a run to part of the repo, for fast iteration on prompts. The run still replaces the whole `index.db`, which then holds only that prefix (one warning says so; `state.md` D-ab).
 
@@ -110,6 +110,7 @@ Runs as a stage of the index build (after history, on the build's transaction, b
 **4.2 Ticket summaries**
 *Goal:* every available ticket has a one- to two-sentence summary and a purpose (why).
 *Done when:* all available tickets have a summary; a rerun makes no LLM calls.
+*Note:* a stage after tickets writes English `llm_summary` / `llm_purpose` to the index `tickets` table; sequential calls, a circuit breaker on the first model failure, `--no-llm` for cache-only runs, `temperature` 0 by default (`state.md` D-al–D-ap). *Deviation:* the agent's real run covered 4 real (scrubbed fixture) tickets because the Jira gateway is blocked from its container; the full `argus` run is the product owner's check (`state.md` D-aq, open #27).
 
 **4.3 Method and constructor what/why**
 *Goal:* every method and constructor has a one-line `what` and a `why`, stored by symbol in `index.db`.

@@ -54,14 +54,18 @@ pub const INDEX_TABLES: &[&str] = &[
     // 3.2 `tickets`: the readers' copy of `ticket_cache` for every key in
     // `symbol_tickets` that the cache knows (content or unavailable), so `show`
     // and MCP never open `cache.db`. Content columns are NULL when
-    // `unavailable = 1`.
+    // `unavailable = 1`. `summary` is the Jira title; 4.2 adds the chat
+    // model's English `llm_summary` and `llm_purpose` (NULL when the ticket
+    // is unavailable or was not summarised this run).
     "CREATE TABLE tickets (
         key TEXT PRIMARY KEY,
         unavailable INTEGER NOT NULL,
         issue_type TEXT,
         summary TEXT,
         description TEXT,
-        parent_key TEXT
+        parent_key TEXT,
+        llm_summary TEXT,
+        llm_purpose TEXT
     )",
     // 4.3/4.4 add the what/why columns to `symbols`; 5.1 adds `symbol_vec`
     // (`F32_BLOB` + `libsql_vector_idx`).
@@ -96,8 +100,9 @@ pub const CACHE_TABLES: &[&str] = &[
         fetched_at TEXT NOT NULL
     )",
     // 4.1 `llm_cache`: one validated chat reply (`output`, JSON text) per key,
-    // a blake3 hash of chat model + reasoning effort + the response type's
-    // JSON schema + the full prompt. Failed completions are never stored.
+    // a blake3 hash of chat model + reasoning effort + temperature (4.2) +
+    // the response type's JSON schema + the full prompt. Failed completions
+    // are never stored.
     "CREATE TABLE IF NOT EXISTS llm_cache (
         key TEXT PRIMARY KEY,
         model TEXT NOT NULL,

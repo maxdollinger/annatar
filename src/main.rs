@@ -5,6 +5,7 @@ use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
 use annatar::store::{IndexReader, Store};
+use annatar::summaries::Summarizer;
 use annatar::tickets::TicketFetch;
 use annatar::{indexer, show};
 
@@ -42,6 +43,10 @@ enum Command {
         /// already in cache.db are still used.
         #[arg(long)]
         offline: bool,
+        /// Make no chat-model calls; summaries already in cache.db are
+        /// still used, other tickets get none.
+        #[arg(long)]
+        no_llm: bool,
     },
     /// Print a symbol and its children.
     Show {
@@ -71,15 +76,17 @@ async fn main() -> Result<()> {
     );
 
     match &cli.command {
-        Command::Index { offline } => {
+        Command::Index { offline, no_llm } => {
             let jira = TicketFetch::from_config(config.jira.as_ref(), *offline)?;
             let store = Store::open(&config.data_dir).await?;
+            let llm = Summarizer::from_config(config.ollama.as_ref(), *no_llm, &store)?;
             let stats = indexer::build_index(
                 &store,
                 &config.repo,
                 cli.path.as_deref(),
                 &config.ticket_regex,
                 jira.as_ref(),
+                llm.as_ref(),
             )
             .await?;
             println!(
@@ -104,6 +111,17 @@ async fn main() -> Result<()> {
                 stats.tickets_failed,
                 stats.tickets_not_fetched,
                 stats.jira_requests
+            );
+            println!(
+                "summaries: {} tickets, {} summarised, {} invalid, {} failed, {} skipped; {} chat calls, {} cache hits, {} retries",
+                stats.summary_tickets,
+                stats.summaries,
+                stats.summaries_invalid,
+                stats.summaries_failed,
+                stats.summaries_skipped,
+                stats.llm.chat_calls,
+                stats.llm.chat_hits,
+                stats.llm.chat_retries
             );
         }
         Command::Show { fqn } => {
