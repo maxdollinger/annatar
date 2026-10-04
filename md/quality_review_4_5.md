@@ -1,5 +1,11 @@
 # Quality review 4.5 — what/why records on `argus`
 
+> **Historical record.** After this review the product owner replaced the
+> separate `what` / `why` with one short `description` per symbol (plan 4.6,
+> `state.md` D-bm–D-bp). The verdicts below judge the old records; the 4.6
+> spot check of this sample against the new descriptions is in `state.md`
+> (4.6 Done entry).
+
 Step 4.5 of [`plan.md`](./plan.md): are the generated records trustworthy
 (POC question 1)? The agent reviewed 34 symbols and 13 ticket summaries of the
 real `argus` index against the source and the ticket text, changed the

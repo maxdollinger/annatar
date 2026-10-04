@@ -10,8 +10,8 @@
 //! stages know there is no "why". The summaries stage in [`crate::indexer`]
 //! runs it for every available ticket and stores the result in the index
 //! `tickets` table. Later
-//! prompts (method and type what/why) take these summaries as their "why"
-//! context, so they are short and say why the change was needed.
+//! prompts (method and type descriptions) take these summaries as their
+//! ticket context, so they are short and say why the change was needed.
 //!
 //! [`Summarizer`] is the LLM client the stage calls; with `--no-llm` the
 //! client is cache-only and never calls the model.
@@ -143,7 +143,7 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
 /// Openers of a summary that talk about the ticket instead of the change.
 const SUMMARY_OPENERS: &[&str] = &["this ticket", "the ticket"];
 
-/// Phrases in a reason (a ticket's purpose, a member's `why`) that talk about
+/// Phrases in a reason (a ticket's purpose; see also [`source_meta_phrase`]) that talk about
 /// the sources or about missing information instead of giving a reason; such
 /// a reply is invalid and asked again. Narrow on purpose, so ordinary domain
 /// text ("the ticket price", "if one is not provided", "for no reason")
@@ -231,6 +231,11 @@ pub(crate) fn check_field(name: &str, value: &str, max: usize) -> Result<(), Str
             "`{name}` has {chars} characters; keep it under {max}"
         ));
     }
+    check_control_chars(name, value)
+}
+
+/// Reject a field with control characters other than whitespace.
+pub(crate) fn check_control_chars(name: &str, value: &str) -> Result<(), String> {
     if value.chars().any(|c| c.is_control() && !c.is_whitespace()) {
         return Err(format!("`{name}` contains control characters"));
     }
@@ -284,6 +289,30 @@ pub(crate) fn reason_meta_phrase(reason: &str) -> Option<&'static str> {
         })
 }
 
+/// Phrases besides [`REASON_META_PHRASES`] that talk about a symbol
+/// description's sources.
+const SOURCE_META_PHRASES: &[&str] = &["commit history"];
+
+/// The meta phrase in a symbol description: like [`reason_meta_phrase`], but
+/// "the commit" is domain text there ("publishes the event after the
+/// commit"), and "commit history" counts.
+pub(crate) fn source_meta_phrase(text: &str) -> Option<&'static str> {
+    let lower = collapse_whitespace(text).to_lowercase();
+    let bare = lower.trim_end_matches(['.', '!']);
+    NO_REASON_REPLIES
+        .iter()
+        .copied()
+        .find(|reply| bare == *reply)
+        .or_else(|| {
+            REASON_META_PHRASES
+                .iter()
+                .chain(SOURCE_META_PHRASES)
+                .copied()
+                .filter(|phrase| *phrase != "the commit")
+                .find(|phrase| lower.contains(phrase))
+        })
+}
+
 /// Every content word of `purpose` (longer than three letters, compared by
 /// its first five letters) also appears in `summary`: the purpose adds no
 /// reason.
@@ -332,7 +361,7 @@ impl Summarizer {
     }
 
     /// The summarizer for an `index` run, or `None` without an `[ollama]`
-    /// section (one warning; tickets get no summary, members no what/why).
+    /// section (one warning; tickets get no summary, methods and types no description).
     /// `no_llm` keeps the cached summaries but makes no chat call. The client
     /// gets its own `cache.db` connection.
     pub fn from_config(
@@ -343,7 +372,7 @@ impl Summarizer {
     ) -> Result<Option<Self>> {
         let Some(ollama) = ollama else {
             tracing::warn!(
-                "no [ollama] section in the config; tickets get no summaries, methods and types no what/why"
+                "no [ollama] section in the config; tickets get no summaries, methods and types no description"
             );
             return Ok(None);
         };

@@ -28,22 +28,23 @@ pub const MAX_TEMPERATURE: f64 = 2.0;
 pub const DEFAULT_JIRA_CONCURRENCY: usize = 4;
 
 /// Default number of most recent tickets (besides the first one) in a
-/// member's what/why prompt.
+/// member's description prompt.
 pub const DEFAULT_RECENT_TICKETS: usize = 3;
 
-/// Default number of commit subjects in a member's what/why prompt when none
-/// of its tickets is available.
+/// Default number of commit subjects in a member's or type's description
+/// prompt.
 pub const DEFAULT_COMMIT_SUBJECTS: usize = 5;
 
-/// Default number of characters of a member's source in its what/why prompt.
+/// Default number of characters of a member's source in its description
+/// prompt.
 pub const DEFAULT_BODY_CHARS: usize = 1500;
 
-/// Default number of members and nested types listed in a type's what/why
-/// prompt (public ones first).
+/// Default number of members and nested types listed in a type's
+/// description prompt (public ones first).
 pub const DEFAULT_TYPE_MEMBERS: usize = 30;
 
 /// Default number of most recent tickets (besides the first one) in a type's
-/// what/why prompt.
+/// description prompt.
 pub const DEFAULT_TYPE_RECENT_TICKETS: usize = 3;
 
 /// Environment variable holding the Jira API token.
@@ -73,25 +74,25 @@ pub struct Config {
     /// require it once Phase 4 lands.
     #[serde(default)]
     pub ollama: Option<OllamaConfig>,
-    /// What goes into the method, constructor and type what/why prompts.
+    /// What goes into the method, constructor and type description prompts.
     #[serde(default)]
     pub describe: DescribeConfig,
 }
 
-/// How much context a method, constructor or type what/why prompt carries.
+/// How much context a method, constructor or type description prompt carries.
 /// Every value changes the prompts, so changing one misses the LLM cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DescribeConfig {
     /// Most recent tickets shown besides the first (oldest) one.
     pub recent_tickets: usize,
-    /// Commit subjects shown when none of the member's tickets is available.
+    /// Most recent commit subjects shown (always, besides the tickets).
     pub commit_subjects: usize,
     /// Characters of the member's source (declaration and body), or of a
     /// type's declaration with its members cut out, shown; `0` leaves the
     /// source out (signature and Javadoc only).
     pub body_chars: usize,
-    /// Members and nested types listed with their `what` in a type's prompt,
+    /// Members and nested types listed with their description in a type's prompt,
     /// public ones first; the rest are only counted.
     pub type_members: usize,
     /// Most recent tickets shown besides the first one in a type's prompt (a
