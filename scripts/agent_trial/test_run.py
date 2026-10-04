@@ -75,6 +75,30 @@ class StreamTest(unittest.TestCase):
         ])
 
 
+class ClaudeCmdTest(unittest.TestCase):
+    def appended(self, cmd):
+        return cmd[cmd.index("--append-system-prompt") + 1] if "--append-system-prompt" in cmd else None
+
+    def test_with_prompt_variants(self):
+        files = run.claude_cmd("m", "with", "q", 60, 3.0)
+        self.assertEqual(self.appended(files), run.WITH_PROMPTS["files"])
+        self.assertIn("files", self.appended(files).splitlines()[1])
+        self.assertIn("`--symbols`", self.appended(files))
+        symbols = run.claude_cmd("m", "with", "q", 60, 3.0, "symbols")
+        self.assertEqual(self.appended(symbols), run.WITH_PROMPTS["symbols"])
+        self.assertIn("(default 10)", self.appended(symbols))
+        self.assertEqual(files[:files.index("--append-system-prompt")],
+                         symbols[:symbols.index("--append-system-prompt")])
+
+    def test_without_arm_gets_no_prompt(self):
+        for variant in run.WITH_PROMPTS:
+            self.assertIsNone(self.appended(run.claude_cmd("m", "without", "q", 60, 3.0, variant)))
+
+    def test_variants_differ_only_in_the_tool_lines(self):
+        files, symbols = (run.WITH_PROMPTS[v].splitlines() for v in ("files", "symbols"))
+        self.assertEqual((files[0], files[3]), (symbols[0], symbols[3]))
+
+
 class PathTest(unittest.TestCase):
     def test_annatar_only_on_the_with_path(self):
         old = dict(os.environ)
