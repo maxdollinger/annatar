@@ -57,10 +57,17 @@ enum Command {
         #[arg(long)]
         no_llm: bool,
     },
-    /// Print a symbol and its children.
+    /// Print a symbol and its children, with its entry-point annotations
+    /// and its direct usages: `used by` (for a type also its members' and
+    /// nested types' users, for a method also the callers of the methods it
+    /// overrides, `via`) and `uses`, grouped by file as `fqn [kind] :lines`.
     Show {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
         fqn: String,
+        /// Entries listed per usage list (default 20, at most 100); the
+        /// rest are counted as `… N more`.
+        #[arg(short = 'k', long, value_name = "N", default_value_t = show::DEFAULT_LIMIT, value_parser = parse_show_limit)]
+        limit: usize,
     },
     /// Search symbol descriptions by meaning and print the files of the
     /// best matches: per file `rank. score path`, its top-level type as
@@ -120,6 +127,10 @@ fn search_limits() -> String {
         search::MAX_FILES,
         search::MAX_LIMIT
     )
+}
+
+fn parse_show_limit(text: &str) -> Result<usize, String> {
+    parse_limit_from(text, 1)
 }
 
 fn parse_eval_limit(text: &str) -> Result<usize, String> {
@@ -298,9 +309,12 @@ async fn run(cli: &Cli) -> Result<()> {
                 stats.embedding_dim
             );
         }
-        Command::Show { fqn } => {
+        Command::Show { fqn, limit } => {
             let reader = IndexReader::open(&config.data_dir).await?;
-            print!("{}", show::render(reader.connection(), fqn).await?);
+            print!(
+                "{}",
+                show::render_limited(reader.connection(), fqn, *limit).await?
+            );
         }
         Command::Search {
             query,

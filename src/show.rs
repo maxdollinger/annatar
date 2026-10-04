@@ -3,15 +3,22 @@
 //! [`render`] looks a symbol up by its fully qualified name and prints its
 //! stored fields, then every child — nested types and members, recursively —
 //! sorted by source line, each with the model's `description` when it has
-//! one; a nested type or member also names its enclosing type. This is the
-//! read side of the index behind `annatar show`. Ticket types, titles
-//! and the model's summary and purpose come from the index `tickets` table,
-//! never from `cache.db`.
+//! one; a nested type or member also names its enclosing type. The shown
+//! symbol also lists its entry-point annotations and its direct usages
+//! (`used by`, `uses`, see [`usage_query`]), grouped by file and capped.
+//! This is the read side of the index behind `annatar show`. Ticket types,
+//! titles and the model's summary and purpose come from the index `tickets`
+//! table, never from `cache.db`.
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use libsql::{Connection, Row};
+
+use crate::usage_query::{self, Usage};
+
+/// Entries listed per `used by` / `uses` list unless asked otherwise.
+pub const DEFAULT_LIMIT: usize = 20;
 
 /// One row of the `symbol_commits` table, as read back for display.
 struct StoredCommit {
@@ -76,10 +83,16 @@ impl StoredSymbol {
     }
 }
 
-/// Render the symbol named `fqn` and all its children as indented text.
+/// Render the symbol named `fqn` and all its children as indented text,
+/// with at most [`DEFAULT_LIMIT`] entries in each of its usage lists.
 ///
 /// A missing `fqn` is an error that names the symbol.
 pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
+    render_limited(conn, fqn, DEFAULT_LIMIT).await
+}
+
+/// [`render`] with at most `limit` entries in each usage list.
+pub async fn render_limited(conn: &Connection, fqn: &str, limit: usize) -> Result<String> {
     let symbols = load_all(conn).await?;
     let commits = load_commits(conn).await?;
     let tickets = load_tickets(conn).await?;
@@ -106,6 +119,9 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
             .map(|symbol| symbol.fqn.as_str())
     });
 
+    let used_by = usage_query::used_by(conn, root.id).await?;
+    let uses = usage_query::uses(conn, root.id).await?;
+
     let mut out = String::new();
     let rows = Rows {
         parent,
@@ -113,6 +129,9 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
         commits: &commits,
         tickets: &tickets,
         info: &info,
+        used_by: &used_by,
+        uses: &uses,
+        limit,
     };
     write_symbol(root, &rows, 0, &mut out)?;
     Ok(out)
@@ -215,6 +234,11 @@ struct Rows<'a> {
     commits: &'a HashMap<i64, Vec<StoredCommit>>,
     tickets: &'a HashMap<i64, Vec<StoredTicket>>,
     info: &'a HashMap<String, TicketInfo>,
+    /// The rendered symbol's users and uses.
+    used_by: &'a [Usage],
+    uses: &'a [Usage],
+    /// Entries per usage list.
+    limit: usize,
 }
 
 fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut String) -> Result<()> {
@@ -292,12 +316,126 @@ fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut Stri
         }
     }
 
+    if depth == 0 {
+        if let Some(entry) =
+            usage_query::entry_point(&symbol.kind, &symbol.fqn, &symbol.signature, &annotations)
+        {
+            out.push_str(&format!("{field}- entry point: {entry}\n"));
+        }
+        write_usages(
+            "used by",
+            "used by: none in main sources",
+            rows.used_by,
+            rows.limit,
+            &field,
+            out,
+        );
+        write_usages(
+            "uses (lines in this symbol's file)",
+            "uses: none",
+            rows.uses,
+            rows.limit,
+            &field,
+            out,
+        );
+    }
+
     if let Some(list) = rows.children.get(&symbol.id) {
         for child in list {
             write_symbol(child, rows, depth + 1, out)?;
         }
     }
     Ok(())
+}
+
+/// One line of a usage list: a symbol, how it is linked, and the lines.
+struct Entry<'a> {
+    usage: &'a Usage,
+    lines: Vec<i64>,
+}
+
+impl Entry<'_> {
+    fn same(&self, usage: &Usage) -> bool {
+        let first = self.usage;
+        first.id == usage.id
+            && first.kind == usage.kind
+            && first.ambiguous == usage.ambiguous
+            && first.via == usage.via
+    }
+}
+
+/// `usages` (ordered by file and line) as `- title:`, then per file its
+/// path and one line per symbol and link, `fqn [kind] [ambiguous] [via
+/// I#m] :line, line [entry: @A]` (the kind left out for `call`); after
+/// `limit` lines `… N more`. No usages: `- none`.
+fn write_usages(
+    title: &str,
+    none: &str,
+    usages: &[Usage],
+    limit: usize,
+    field: &str,
+    out: &mut String,
+) {
+    if usages.is_empty() {
+        out.push_str(&format!("{field}- {none}\n"));
+        return;
+    }
+    let mut files: Vec<(&str, Vec<Entry>)> = Vec::new();
+    for usage in usages {
+        if files.last().is_none_or(|(file, _)| *file != usage.file) {
+            files.push((&usage.file, Vec::new()));
+        }
+        let (_, entries) = files.last_mut().expect("a file was pushed");
+        match entries.iter_mut().find(|entry| entry.same(usage)) {
+            Some(entry) => {
+                if !entry.lines.contains(&usage.line) {
+                    entry.lines.push(usage.line);
+                }
+            }
+            None => entries.push(Entry {
+                usage,
+                lines: vec![usage.line],
+            }),
+        }
+    }
+    let total: usize = files.iter().map(|(_, entries)| entries.len()).sum();
+
+    out.push_str(&format!("{field}- {title}:\n"));
+    let mut shown = 0;
+    'files: for (file, entries) in &files {
+        if shown == limit {
+            break;
+        }
+        out.push_str(&format!("{field}  {file}\n"));
+        for entry in entries {
+            if shown == limit {
+                break 'files;
+            }
+            shown += 1;
+            let usage = entry.usage;
+            let mut line = format!("{field}    {}", usage.fqn);
+            if usage.kind != "call" {
+                line.push(' ');
+                line.push_str(&usage.kind);
+            }
+            if usage.ambiguous {
+                line.push_str(" ambiguous");
+            }
+            if let Some(via) = &usage.via {
+                line.push_str(&format!(" via {via}"));
+            }
+            let lines: Vec<String> = entry.lines.iter().map(ToString::to_string).collect();
+            line.push_str(&format!(" :{}", lines.join(", ")));
+            if let Some(entry) = &usage.entry {
+                line.push_str(&format!(" [entry: {entry}]"));
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    if shown < total {
+        out.push_str(&format!("{field}  … {} more\n", total - shown));
+    }
 }
 
 /// The first 8 characters of a sha, enough to identify a commit in the index.
@@ -362,6 +500,8 @@ com.acme.show.Widget [class]
   - signature: public class Widget
   - javadoc:
     A widget.
+  - used by: none in main sources
+  - uses: none
   com.acme.show.Widget#build() [method]
     - file: src/main/java/com/acme/show/Widget.java:6-6
     - signature: public Widget build()
@@ -393,6 +533,8 @@ com.acme.show.Widget.Part#run() [method]
   - file: src/main/java/com/acme/show/Widget.java:9-9
   - parent: com.acme.show.Widget.Part
   - signature: void run()
+  - used by: none in main sources
+  - uses: none
 "
         );
     }
@@ -475,6 +617,251 @@ com.acme.show.Widget.Part#run() [method]
                 "GRLD-42 (first: 2024-01-01T00:00:00+01:00, last: 2024-01-01T00:00:00+01:00)"
             ),
             "ticket line: {output}"
+        );
+    }
+
+    const FLOW: [(&str, &str); 5] = [
+        (
+            "Message.java",
+            "\
+package com.acme.flow;
+
+public class Message {
+}
+",
+        ),
+        (
+            "Consumer.java",
+            "\
+package com.acme.flow;
+
+public interface Consumer {
+    void consume(Message message);
+}
+",
+        ),
+        (
+            "AddConsumer.java",
+            "\
+package com.acme.flow;
+
+public class AddConsumer implements Consumer {
+    @Override
+    public void consume(Message message) {
+        log();
+    }
+
+    private void log() {
+    }
+}
+",
+        ),
+        (
+            "Config.java",
+            "\
+package com.acme.flow;
+
+public class Config {
+    private final AddConsumer addConsumer = new AddConsumer();
+
+    public AddConsumer getAddConsumer() {
+        return addConsumer;
+    }
+}
+",
+        ),
+        (
+            "Dispatcher.java",
+            "\
+package com.acme.flow;
+
+public class Dispatcher {
+    private final Config config;
+    private final Consumer fallback;
+
+    public Dispatcher(Config config, Consumer fallback) {
+        this.config = config;
+        this.fallback = fallback;
+    }
+
+    @Scheduled(fixedDelay = 1)
+    public void process() {
+        dispatch(new Message());
+        dispatch(new Message());
+    }
+
+    void dispatch(Message message) {
+        config.getAddConsumer().consume(message);
+        fallback.consume(message);
+    }
+}
+",
+        ),
+    ];
+
+    async fn flow() -> (tempfile::TempDir, tempfile::TempDir) {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join("src/main/java/com/acme/flow");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, source) in FLOW {
+            std::fs::write(dir.join(name), source).unwrap();
+        }
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).await.unwrap();
+        let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
+        build_index(&store, repo.path(), None, &regex, &JiraMode::Disabled, None)
+            .await
+            .unwrap();
+        (repo, data)
+    }
+
+    #[tokio::test]
+    async fn a_method_lists_its_callers_with_via_and_what_it_uses() {
+        let (_repo, data) = flow().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+
+        let output = render(
+            reader.connection(),
+            "com.acme.flow.AddConsumer#consume(Message)",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "\
+com.acme.flow.AddConsumer#consume(Message) [method]
+  - file: src/main/java/com/acme/flow/AddConsumer.java:4-7
+  - parent: com.acme.flow.AddConsumer
+  - signature: public void consume(Message message)
+  - annotations: @Override
+  - used by:
+    src/main/java/com/acme/flow/Dispatcher.java
+      com.acme.flow.Dispatcher#dispatch(Message) :19
+      com.acme.flow.Dispatcher#dispatch(Message) via com.acme.flow.Consumer#consume(Message) :20
+  - uses (lines in this symbol's file):
+    src/main/java/com/acme/flow/AddConsumer.java
+      com.acme.flow.AddConsumer#log() :6
+    src/main/java/com/acme/flow/Consumer.java
+      com.acme.flow.Consumer#consume(Message) overrides :5
+    src/main/java/com/acme/flow/Message.java
+      com.acme.flow.Message reference :5
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_type_rolls_up_its_members_users_without_its_own() {
+        let (_repo, data) = flow().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+
+        let output = render(reader.connection(), "com.acme.flow.AddConsumer")
+            .await
+            .unwrap();
+
+        let lists = output
+            .split_once("  - used by:\n")
+            .map(|(_, rest)| rest.split_once("  com.acme.flow.AddConsumer#").unwrap().0)
+            .unwrap();
+        assert_eq!(
+            lists,
+            "    src/main/java/com/acme/flow/Config.java
+      com.acme.flow.Config instantiate :4
+      com.acme.flow.Config reference :4
+      com.acme.flow.Config#getAddConsumer() reference :6
+    src/main/java/com/acme/flow/Dispatcher.java
+      com.acme.flow.Dispatcher#dispatch(Message) :19
+      com.acme.flow.Dispatcher#dispatch(Message) via com.acme.flow.Consumer#consume(Message) :20
+  - uses (lines in this symbol's file):
+    src/main/java/com/acme/flow/Consumer.java
+      com.acme.flow.Consumer implements :3
+    src/main/java/com/acme/flow/Message.java
+      com.acme.flow.Message reference :5
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_point_without_users_says_so() {
+        let (_repo, data) = flow().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+
+        let output = render(reader.connection(), "com.acme.flow.Dispatcher#process()")
+            .await
+            .unwrap();
+
+        assert!(
+            output.contains(
+                "  - entry point: @Scheduled\n  - used by: none in main sources\n  - uses (lines in this symbol's file):\n    src/main/java/com/acme/flow/Dispatcher.java\n      com.acme.flow.Dispatcher#dispatch(Message) :14, 15\n"
+            ),
+            "{output}"
+        );
+        let caller = render(
+            reader.connection(),
+            "com.acme.flow.Dispatcher#dispatch(Message)",
+        )
+        .await
+        .unwrap();
+        assert!(
+            caller
+                .contains("      com.acme.flow.Dispatcher#process() :14, 15 [entry: @Scheduled]\n"),
+            "{caller}"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_list_is_capped_with_the_rest_counted() {
+        let (_repo, data) = flow().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+
+        let output = render_limited(reader.connection(), "com.acme.flow.Message", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.split_once("  - used by:\n").unwrap().1,
+            "    src/main/java/com/acme/flow/AddConsumer.java
+      com.acme.flow.AddConsumer#consume(Message) reference :5
+    src/main/java/com/acme/flow/Consumer.java
+      com.acme.flow.Consumer#consume(Message) reference :4
+    … 2 more
+  - uses: none
+"
+        );
+    }
+
+    #[test]
+    fn a_usage_line_marks_kind_ambiguous_via_and_entry_and_merges_lines() {
+        let usage = |id, fqn: &str, kind: &str, line, ambiguous, via: Option<&str>| Usage {
+            id,
+            fqn: fqn.to_string(),
+            file: "src/A.java".to_string(),
+            kind: kind.to_string(),
+            line,
+            ambiguous,
+            via: via.map(str::to_string),
+            entry: (id == 2).then(|| "@Scheduled".to_string()),
+        };
+        let usages = [
+            usage(1, "a.A#f()", "call", 3, true, None),
+            usage(1, "a.A#f()", "call", 3, false, None),
+            usage(1, "a.A#f()", "call", 7, true, None),
+            usage(2, "a.A#run()", "call", 9, false, Some("a.I#m()")),
+            usage(3, "a.A", "instantiate", 9, false, None),
+        ];
+        let mut out = String::new();
+
+        write_usages("used by", "used by: none", &usages, 20, "  ", &mut out);
+
+        assert_eq!(
+            out,
+            "  - used by:
+    src/A.java
+      a.A#f() ambiguous :3, 7
+      a.A#f() :3
+      a.A#run() via a.I#m() :9 [entry: @Scheduled]
+      a.A instantiate :9
+"
         );
     }
 }

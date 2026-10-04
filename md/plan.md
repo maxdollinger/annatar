@@ -199,7 +199,7 @@ Receiver typing, chains, implicit members (Lombok, records, enums), method refer
 
 **6.5 `show`: `used by` and `uses`**
 *Goal:* the direct usages of a symbol next to its description.
-`used by`: the using symbols grouped by file, `fqn :line[, line…]` (call-site lines), edge kind when it is not `call`, `ambiguous` marked, callers of an overridden method labelled `via I#m`; a type rolls up its members' and nested types' incoming edges, without its own. `uses`: the symbols it uses, grouped the same way. Entry-point annotations are named. Each list is capped (`… N more`); `reference.md` documents it.
+`used by`: the using symbols grouped by file, `fqn :line[, line…]` (call-site lines), edge kind when it is not `call`, `ambiguous` marked, callers of an overridden method labelled `via <fqn of I#m>`; a type rolls up its members' and nested types' incoming edges, without its own. `uses`: the symbols it uses, grouped the same way. Entry-point annotations are named. Each list is capped (`… N more`); `reference.md` documents it.
 *Done when:* tests cover a type roll-up, `via`, the cap and a symbol without users; on `argus`, `show` of a T4 consumer names the dispatcher config and, through `via` or `call`, the dispatcher.
 
 **6.6 `annatar trace <fqn> [--depth N]`**
@@ -222,7 +222,7 @@ Re-run the *with* arm on T4 (5 runs, the D-cs protocol and grading) with `--with
 - **Incremental indexing:** stable IDs, upserts, incremental history.
 - **Package summaries** and `annatar module`.
 - **Central build and local use:** CI publishing the index per commit, local branch overlay.
-- **Multi-module handling** (Maven/Gradle module per file, name resolution limited to the modules a file can see; a prerequisite for usages on a multi-module repository, `usages_state.md` D-cx), test-code indexing.
+- **Multi-module handling** (Maven/Gradle module per file, name resolution limited to the modules a file can see; a prerequisite for usages on a multi-module repository, `usages_state.md` D-cx), test-code indexing (first as sources of usages only, so `used by` and `trace` show test callers apart from main code: rows marked as test, never described, embedded or searched; `usages_state.md` #45, D-dv).
 - **Analysis:** hotspots from churn and bug tickets, temporal coupling.
 - **Spring configuration:** `application.yml`, `@Value`, `@ConfigurationProperties`.
 - **Human search page** for non-technical roles.

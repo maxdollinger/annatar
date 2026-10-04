@@ -17,5 +17,6 @@ pub mod symbols;
 mod test_support;
 pub mod tickets;
 pub mod usage_eval;
+pub mod usage_query;
 pub mod usages;
 pub mod walk;

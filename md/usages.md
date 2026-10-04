@@ -150,9 +150,9 @@ No edge, counted as unresolved:
 - wiring from `application.yml`, `@Value`, `@ConfigurationProperties`;
 - Spring events and message brokers between publisher and listener (`argus` has no Spring events; its queue dispatchers are ordinary calls and resolve);
 - Spring Data derived queries;
-- test code: test sources are not indexed, so test callers never show (open #45).
+- test code: test sources are not indexed, so test callers never show (#45, deferred to the Later test-code item, D-dv).
 
-**Entry points.** Methods the framework calls have no caller in the code: `@Scheduled`, `@RequestMapping` and `@GetMapping`/`@PostMapping`/…, `@EventListener`, `@PostConstruct`, `@Bean` methods, `public static void main`. `trace` stops there and labels them with the annotation (already stored in `symbols.annotations`).
+**Entry points.** Methods the framework calls have no caller in the code: `@Scheduled`, `@RequestMapping` and `@GetMapping`/`@PostMapping`/…, `@EventListener`, `@ExceptionHandler`, `@PostConstruct`/`@PreDestroy`, `@Bean` methods, `public static void main`. `trace` stops there and labels them with the annotation (already stored in `symbols.annotations`).
 
 ## Modules
 
@@ -184,23 +184,25 @@ One row per call site, so `show` can print every line. Roll-ups (a type's `used 
 
 ## Output
 
-Illustrative, from the dispatcher example; the exact format is fixed in 6.5 and 6.6 and documented in `reference.md`.
-
-`annatar show …SecurityDataAddEventConsumer` gains:
+`show` (6.5, format in `reference.md`; `…` shortens the paths and fqns here) — `annatar show …SecurityDataAddEventConsumer` on `argus` gains:
 
 ```
-used by:
-  …/janus/securityMethods/SecurityDataEventDispatcher.java
-    …SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) :76
-  …/janus/securityMethods/SecurityDataEventDispatcherConfig.java
-    …SecurityDataEventDispatcherConfig reference :24
-    …SecurityDataEventDispatcherConfig#<init>(SecurityDataAddEventConsumer, SecurityDataRemoveEventConsumer) reference :28
-    …SecurityDataEventDispatcherConfig#getSecurityDataAddEventConsumer() reference :45
-uses:
-  …
+  - used by:
+    …/janus/securityMethods/SecurityDataEventDispatcher.java
+      …SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) :76
+    …/janus/securityMethods/SecurityDataEventDispatcherConfig.java
+      …SecurityDataEventDispatcherConfig reference :24
+      …SecurityDataEventDispatcherConfig#<init>(SecurityDataAddEventConsumer,SecurityDataRemoveEventConsumer) reference :28
+      …SecurityDataEventDispatcherConfig#getSecurityDataAddEventConsumer() reference :45
+  - uses (lines in this symbol's file):
+    …/auth/authorization/cache/securitymethods/SecurityMethodsCache.java
+      …SecurityMethodsCache reference :20
+    …/auth/authorization/event/AuthDataCacheUpdateEvent.java
+      …AuthDataCacheUpdateEvent#<init>(String) instantiate :27
+    …
 ```
 
-Callers grouped by file with their lines; the kind named when it is not `call`; `ambiguous` marked; callers of an overridden interface method labelled `via I#m`; each list capped with `… N more`.
+Users grouped by their file with the lines of the mentions; the kind named when it is not `call`; `ambiguous` marked; entry points marked `[entry: @Scheduled]`; each list capped with `… N more` (`-k`, default 20). **`via`** (D-dr): a method that overrides others is used by the callers of each method it overrides, up the `overrides` chain — they call `I#m` and reach the override at run time —, listed `via` the full fqn of `I#m` (what an agent copies into `show` / `trace`, D-dw); a type's roll-up includes its members' `via` callers. A method's incoming `overrides` edges are listed too (`… overrides :44`: the methods overriding it); a type's roll-up leaves out the `overrides` edges into its members, which repeat the subtype's `extends` / `implements` line (6.5 review). **`uses`** of a type rolls up its members' and nested types' outgoing edges without the ones to symbols inside it and without its members' `overrides`, the mirror of `used by` (D-ds); its lines are in the shown symbol's file, not in the file heading them, which the title says (`uses (lines in this symbol's file)`, D-dt); a `new T(..)` with a declared constructor shows only the constructor. An empty `used by` reads `none in main sources` (#45). The queries (`src/usage_query.rs`) are SQL joins over `parent_id` and `overrides`, shared with `trace`, as is the entry-point test (`usage_query::entry_point`).
 
 `annatar trace '…SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage)'`:
 
@@ -236,6 +238,6 @@ Authoritative wording and *done when* in [`plan.md`](./plan.md), Phase 6.
 ## Alternatives and later work
 
 - **SCIP (scip-java)** resolves as the compiler does: generics, lambda parameters, library chains and modules included. It needs the repository to build on the indexer (no Gradle cache for `argus` in this environment, Maven Central behind the proxy allowlist, a build per repository centrally). It stays in **Later** as a precision upgrade that writes the same `edges` table; 6.4's misses are the trigger (D-cu).
-- **Test callers** as edge sources only (open #45).
+- **Test callers** as edge sources only: with the Later test-code indexing item, not in Phase 6 (#45, D-dv).
 - **Usages in the `search` file view** (`used by N`, callers' files), so an agent sees the caller without a second command (open #46).
 - **Callers in the description prompts:** changes every prompt, so the whole LLM cache misses (≈ 20 min on `argus`); decide after 6.7 (open #47).

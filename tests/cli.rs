@@ -122,6 +122,45 @@ fn results_go_to_stdout_logs_and_errors_to_stderr() {
 }
 
 #[test]
+fn show_lists_usages_capped_by_k() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+
+    let show = annatar(
+        dir.path(),
+        &["show", "-k", "1", "com.acme.sample.UserService"],
+    );
+    let all = annatar(dir.path(), &["show", "com.acme.sample.UserService"]);
+    let zero = annatar(
+        dir.path(),
+        &["show", "-k", "0", "com.acme.sample.UserService"],
+    );
+
+    assert!(show.status.success(), "{}", text(&show.stderr));
+    assert!(
+        text(&show.stdout).contains(
+            "  - used by:\n    src/main/java/com/acme/sample/UserController.java\n      com.acme.sample.UserController reference :16\n    … 3 more\n  - uses (lines in this symbol's file):\n    src/main/java/com/acme/sample/User.java\n      com.acme.sample.User reference :12, 16, 20\n"
+        ),
+        "{}",
+        text(&show.stdout)
+    );
+    assert!(
+        text(&all.stdout).contains(
+            "      com.acme.sample.UserController#list() :27 [entry: @GetMapping]\n      com.acme.sample.UserController#get(Long) :32 [entry: @GetMapping]\n  - uses (lines in this symbol's file):"
+        ),
+        "{}",
+        text(&all.stdout)
+    );
+    assert_eq!(zero.status.code(), Some(2));
+    assert!(
+        text(&zero.stderr).contains("expected a number from 1 to 100"),
+        "{}",
+        text(&zero.stderr)
+    );
+}
+
+#[test]
 fn search_without_an_index_is_one_error_line() {
     let dir = workspace();
 
