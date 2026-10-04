@@ -27,6 +27,17 @@ pub const MAX_TEMPERATURE: f64 = 2.0;
 /// Default number of Jira requests in flight during the ticket stage.
 pub const DEFAULT_JIRA_CONCURRENCY: usize = 4;
 
+/// Default number of most recent tickets (besides the first one) in a
+/// member's what/why prompt.
+pub const DEFAULT_RECENT_TICKETS: usize = 3;
+
+/// Default number of commit subjects in a member's what/why prompt when none
+/// of its tickets is available.
+pub const DEFAULT_COMMIT_SUBJECTS: usize = 5;
+
+/// Default number of characters of a member's source in its what/why prompt.
+pub const DEFAULT_BODY_CHARS: usize = 1500;
+
 /// Environment variable holding the Jira API token.
 pub const ENV_JIRA_TOKEN: &str = "ANNATAR_JIRA_TOKEN";
 
@@ -54,6 +65,33 @@ pub struct Config {
     /// require it once Phase 4 lands.
     #[serde(default)]
     pub ollama: Option<OllamaConfig>,
+    /// What goes into the method and constructor what/why prompts.
+    #[serde(default)]
+    pub describe: DescribeConfig,
+}
+
+/// How much context a method or constructor what/why prompt carries. Every
+/// value changes the prompt, so changing one misses the LLM cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DescribeConfig {
+    /// Most recent tickets shown besides the first (oldest) one.
+    pub recent_tickets: usize,
+    /// Commit subjects shown when none of the member's tickets is available.
+    pub commit_subjects: usize,
+    /// Characters of the member's source (declaration and body) shown; `0`
+    /// leaves the source out (signature and Javadoc only).
+    pub body_chars: usize,
+}
+
+impl Default for DescribeConfig {
+    fn default() -> Self {
+        Self {
+            recent_tickets: DEFAULT_RECENT_TICKETS,
+            commit_subjects: DEFAULT_COMMIT_SUBJECTS,
+            body_chars: DEFAULT_BODY_CHARS,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -266,6 +304,26 @@ embedding_model = "nomic-embed-text"
         assert_eq!(ollama.url, DEFAULT_OLLAMA_URL);
         assert_eq!(ollama.reasoning_effort, DEFAULT_REASONING_EFFORT);
         assert_eq!(ollama.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(config.describe, DescribeConfig::default());
+        assert_eq!(config.describe.recent_tickets, DEFAULT_RECENT_TICKETS);
+        assert_eq!(config.describe.commit_subjects, DEFAULT_COMMIT_SUBJECTS);
+        assert_eq!(config.describe.body_chars, DEFAULT_BODY_CHARS);
+    }
+
+    #[test]
+    fn describe_settings_are_optional_per_key_and_strict() {
+        let config = Config::parse(&format!("{MINIMAL}\n[describe]\nbody_chars = 0\n"))
+            .expect("config should parse");
+        assert_eq!(
+            config.describe,
+            DescribeConfig {
+                body_chars: 0,
+                ..DescribeConfig::default()
+            }
+        );
+        let err = Config::parse(&format!("{MINIMAL}\n[describe]\nrecent = 2\n"))
+            .expect_err("unknown key");
+        assert!(format!("{err:#}").contains("recent"), "{err:#}");
     }
 
     #[test]

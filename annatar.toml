@@ -43,3 +43,16 @@ ticket_regex = '\bGRLD-\d+\b'
 # Sampling temperature sent with chat requests, 0.0 (default: greedy, so a
 # regenerated record matches the cached one) to 2.0. Part of the LLM cache key.
 # temperature = 0.0
+
+# What goes into the method and constructor what/why prompts. Optional; every
+# value changes the prompts, so changing one misses the LLM cache.
+# [describe]
+# Most recent tickets shown besides the member's first (oldest) ticket
+# (default 3); each with its summary and purpose from the ticket summaries.
+# recent_tickets = 3
+# Commit subjects shown when none of the member's tickets is available
+# (default 5).
+# commit_subjects = 5
+# Characters of the member's source (declaration and body) shown (default
+# 1500); 0 sends only the signature and Javadoc.
+# body_chars = 1500
