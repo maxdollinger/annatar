@@ -3,8 +3,8 @@
 //! [`render`] looks a symbol up by its fully qualified name and prints its
 //! stored fields, then every child — nested types and members, recursively —
 //! sorted by source line, each with the model's `description` when it has
-//! one. This is the read side of the index: `annatar show`
-//! and later the MCP `get_symbol` tool both build on it. Ticket types, titles
+//! one; a nested type or member also names its enclosing type. This is the
+//! read side of the index behind `annatar show`. Ticket types, titles
 //! and the model's summary and purpose come from the index `tickets` table,
 //! never from `cache.db`.
 
@@ -99,8 +99,16 @@ pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
         list.sort_by_key(|symbol| (symbol.start_line, symbol.id));
     }
 
+    let parent = root.parent_id.and_then(|parent| {
+        symbols
+            .iter()
+            .find(|symbol| symbol.id == parent)
+            .map(|symbol| symbol.fqn.as_str())
+    });
+
     let mut out = String::new();
     let rows = Rows {
+        parent,
         children: &children,
         commits: &commits,
         tickets: &tickets,
@@ -201,6 +209,8 @@ async fn load_ticket_info(conn: &Connection) -> Result<HashMap<String, TicketInf
 
 /// Everything loaded for rendering, keyed by symbol id (or ticket key).
 struct Rows<'a> {
+    /// The fqn of the rendered symbol's enclosing type, if any.
+    parent: Option<&'a str>,
     children: &'a HashMap<i64, Vec<&'a StoredSymbol>>,
     commits: &'a HashMap<i64, Vec<StoredCommit>>,
     tickets: &'a HashMap<i64, Vec<StoredTicket>>,
@@ -222,6 +232,11 @@ fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut Stri
         "{field}- file: {}:{}-{}\n",
         symbol.file, symbol.start_line, symbol.end_line
     ));
+    if depth == 0
+        && let Some(parent) = rows.parent
+    {
+        out.push_str(&format!("{field}- parent: {parent}\n"));
+    }
     out.push_str(&format!("{field}- signature: {}\n", symbol.signature));
     if let Some(description) = &symbol.description {
         out.push_str(&format!("{field}- description: {description}\n"));
@@ -360,6 +375,26 @@ com.acme.show.Widget [class]
       - signature: void run()
 ";
         assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn a_nested_symbol_names_its_parent() {
+        let (_repo, data) = indexed().await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+
+        let output = render(reader.connection(), "com.acme.show.Widget.Part#run()")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output,
+            "\
+com.acme.show.Widget.Part#run() [method]
+  - file: src/main/java/com/acme/show/Widget.java:9-9
+  - parent: com.acme.show.Widget.Part
+  - signature: void run()
+"
+        );
     }
 
     #[tokio::test]

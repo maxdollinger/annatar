@@ -180,7 +180,7 @@ fn on_prefix_path(relative: &Path, prefix: &Path) -> bool {
 /// Reduce `prefix` to a path relative to `repo`. Absolute prefixes that fall
 /// outside `repo` return `None`; a relative prefix is normalised by dropping
 /// leading `./` components.
-fn relative_prefix(repo: &Path, prefix: &Path) -> Option<PathBuf> {
+pub fn relative_prefix(repo: &Path, prefix: &Path) -> Option<PathBuf> {
     if prefix.is_absolute() {
         if let Ok(relative) = prefix.strip_prefix(repo) {
             return Some(relative.to_path_buf());

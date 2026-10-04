@@ -148,6 +148,7 @@ Embed `fqn + description` through the embedding cache (was `fqn + what + why` be
 *Goal:* a plain-language question returns the top-k symbols with fqn, description and file:line.
 Use `vector_top_k`, with optional kind and role filters. The CLI is the agents' interface too (D-ax): results and errors on stdout/stderr are stable, compact lines an agent can read without a parser, logs go to stderr only (`state.md` open #29), and `show` gives the detail view (description, tickets, commits, parent, children, file:line).
 *Done when:* a query for a known responsibility lists the right class.
+*Built (5.2, `state.md` D-by–D-cd):* `annatar search [-k N] [--kind K]… [--role R]… "<query>"`; the query is embedded through `LlmClient::embed` with an in-memory cache (search writes no file); an index without vectors, without `index_meta`, or embedded with another model or dimension is refused with one error line. Unfiltered queries use `vector_top_k`; filtered ones an exact `vector_distance_cos` scan of the matching rows (open #36); a member matches `--role` by its enclosing type's role. Output: `rank. score fqn [kind] role=… file:start-end` plus the description on an indented line (README). Logs go to stderr, every error is one `error: …` line (open #29); `show` also names a symbol's parent.
 
 **5.3 Evaluate**
 *Goal:* a measured retrieval quality.
