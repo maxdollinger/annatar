@@ -10,6 +10,13 @@ pub const DEFAULT_TICKET_REGEX: &str = r"\bGRLD-\d+\b";
 /// Default URL of the local Ollama server.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
+/// Default reasoning effort sent with chat requests: thinking off.
+pub const DEFAULT_REASONING_EFFORT: &str = "none";
+
+/// Accepted `ollama.reasoning_effort` values; empty means the field is not
+/// sent and the model decides.
+pub const REASONING_EFFORTS: &[&str] = &["", "none", "low", "medium", "high"];
+
 /// Default number of Jira requests in flight during the ticket stage.
 pub const DEFAULT_JIRA_CONCURRENCY: usize = 4;
 
@@ -86,6 +93,14 @@ pub struct OllamaConfig {
     pub chat_model: String,
     /// Embedding model used for semantic search.
     pub embedding_model: String,
+    /// `reasoning_effort` sent with every chat request (one of
+    /// [`REASONING_EFFORTS`]). `none` turns a thinking model's reasoning off;
+    /// empty leaves it to the model.
+    #[serde(
+        default = "default_reasoning_effort",
+        deserialize_with = "deserialize_reasoning_effort"
+    )]
+    pub reasoning_effort: String,
 }
 
 impl Config {
@@ -132,6 +147,23 @@ fn deserialize_regex<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Regex
     let pattern = String::deserialize(deserializer)?;
     Regex::new(&pattern)
         .map_err(|err| serde::de::Error::custom(format!("invalid ticket_regex {pattern:?}: {err}")))
+}
+
+fn default_reasoning_effort() -> String {
+    DEFAULT_REASONING_EFFORT.to_string()
+}
+
+fn deserialize_reasoning_effort<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let effort = String::deserialize(deserializer)?;
+    if REASONING_EFFORTS.contains(&effort.as_str()) {
+        Ok(effort)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "invalid ollama.reasoning_effort {effort:?}: expected one of {REASONING_EFFORTS:?}"
+        )))
+    }
 }
 
 fn default_jira_concurrency() -> usize {
@@ -201,9 +233,27 @@ embedding_model = "nomic-embed-text"
         let config = Config::parse(&text).expect("config should parse");
 
         assert_eq!(config.ticket_regex.as_str(), DEFAULT_TICKET_REGEX);
-        assert_eq!(
-            config.ollama.expect("section present").url,
-            DEFAULT_OLLAMA_URL
+        let ollama = config.ollama.expect("section present");
+        assert_eq!(ollama.url, DEFAULT_OLLAMA_URL);
+        assert_eq!(ollama.reasoning_effort, DEFAULT_REASONING_EFFORT);
+    }
+
+    #[test]
+    fn reasoning_effort_is_validated() {
+        let with = |effort: &str| {
+            MINIMAL.replace(
+                "embedding_model = \"nomic-embed-text\"",
+                &format!("embedding_model = \"nomic-embed-text\"\nreasoning_effort = \"{effort}\""),
+            )
+        };
+        for effort in REASONING_EFFORTS {
+            let config = Config::parse(&with(effort)).expect("valid effort should parse");
+            assert_eq!(config.ollama.unwrap().reasoning_effort, *effort);
+        }
+        let err = Config::parse(&with("max")).expect_err("unknown effort should fail");
+        assert!(
+            format!("{err:#}").contains("invalid ollama.reasoning_effort \"max\""),
+            "error should name the bad value, got: {err:#}"
         );
     }
 

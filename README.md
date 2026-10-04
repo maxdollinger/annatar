@@ -32,6 +32,8 @@ annatar show com.acme.user.UserRepository     # a symbol, its children, commits 
 
 `index` fetches every ticket key found in the history from Jira once and caches it in `cache.db` (403/404 are cached as unavailable), so later runs make no Jira requests for known keys; the `tickets:` line of its output counts cached, fetched, unavailable and failed keys and the Jira requests made. Without a `[jira]` section or without `ANNATAR_JIRA_TOKEN` it warns once and uses cached tickets only; `--offline` does the same on purpose. Before fetching, `index` checks the credentials once (`/rest/api/2/myself`, retried on 429 like fetches); rejected credentials fail the run and nothing is cached. If Jira is unreachable or still rate limiting after retries, `index` stops fetching for that run with one warning, counts the remaining keys as not fetched and retries them next run. `show` lists each ticket with its type and summary, or `(unavailable)`.
 
+`[ollama]` configures the LLM client (Ollama's OpenAI-compatible `/v1` API: chat model, embedding model, `reasoning_effort`; see `annatar.toml`). `index` does not call it yet; Phase 4 wires it in. Its replies and embeddings are cached in `cache.db`. The live checks run with `cargo test llm -- --ignored` (`ANNATAR_OLLAMA_URL`, `ANNATAR_OLLAMA_CHAT_MODEL`, `ANNATAR_OLLAMA_EMBEDDING_MODEL` override `annatar.toml`).
+
 `--path <PREFIX>` is for fast iteration on part of the repo, not for refreshing a slice: a `--path` run still replaces the whole `index.db`, which then holds only that prefix (empty if the prefix matches nothing). The run logs a warning saying so; run `annatar index` without `--path` to get the full index back.
 
 ## Goals

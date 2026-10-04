@@ -26,9 +26,15 @@ ticket_regex = '\bGRLD-\d+\b'
 # Maximum Jira requests in flight while fetching tickets (default 4).
 # concurrency = 4
 
-# Ollama connection. Optional for now; required once Phase 4 wires summaries
-# and embeddings.
+# Ollama connection, used through its OpenAI-compatible /v1 API. Optional for
+# now; required once Phase 4 wires summaries and embeddings. LLM replies and
+# embeddings are cached in cache.db; changing a model simply misses the cache.
 # [ollama]
+# Server root (a trailing /v1 is accepted).
 # url = "http://localhost:11434"
-# chat_model = "qwen2.5-coder"
-# embedding_model = "nomic-embed-text"
+# chat_model = "qwen3.8:latest"
+# embedding_model = "bge-m3:latest"
+# reasoning_effort sent with chat requests: "none" (default) turns a thinking
+# model's reasoning off, "low" / "medium" / "high" turn it on, "" leaves it to
+# the model. Part of the LLM cache key.
+# reasoning_effort = "none"

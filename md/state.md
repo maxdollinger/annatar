@@ -10,12 +10,49 @@ the decisions taken, and the tradeoffs behind them.
 
 | | |
 | --- | --- |
-| Phase | 3 — Jira **complete**, including the product owner's real-Jira checks (3.1 real scrubbed fixtures + `fetches_real_ticket`, 3.2 real-repo second run on `argus`); Phase 2 and its audit remediation R0–R9 complete |
-| Step | Phase 3 product-owner checks — **done** (real fixtures, open #20; real-repo run, open #21; fixture-scrub review fixes); next 4.1 LLM client |
-| Last updated | 2026-10-03 |
+| Phase | 4 — LLM summaries, in progress (Phase 3 Jira complete, including the product owner's real-Jira checks; Phase 2 and its audit remediation R0–R9 complete) |
+| Step | 4.1 LLM client — **done** (live Ollama checks passed); next 4.2 Ticket summaries |
+| Last updated | 2026-10-04 |
 | Toolchain | rustc 1.99.0, edition 2024 |
 
 ### Done
+
+- **4.1 LLM client.** New `llm` module. `LlmClient::complete::<T:
+  DeserializeOwned + JsonSchema>(prompt)` sends the `schemars` 1 schema of `T`
+  as `response_format` `{type: json_schema, json_schema: {name, strict, schema}}`
+  to Ollama's `/v1/chat/completions` and deserializes the reply into `T`
+  (validation = serde). An invalid reply is retried once with the bad reply
+  and the serde error appended to the conversation; a second invalid reply is
+  a typed `InvalidOutput` error (downcastable) and nothing is cached; backend
+  (HTTP/transport) errors are returned, not retried. `LlmClient::embed(texts)`
+  (`/v1/embeddings`) looks each distinct text up in the cache, sends only the
+  misses in batches of `EMBED_BATCH` (64), never sends an empty batch, and
+  returns one vector per input in order. Seam `LlmBackend` (object-safe,
+  boxed `Send` futures) with `OllamaBackend` (reqwest, 600 s request / 10 s
+  connect timeout, Ollama's `error.message` in HTTP errors) and a test
+  `fake::FakeBackend` (scripted replies, records requests and batches).
+  `LlmStats` (`chat_calls`, `chat_hits`, `chat_retries`, `embed_calls`,
+  `embed_texts`, `embed_hits`) via `LlmClient::stats()` so 4.2+ can show a
+  rerun made no LLM calls. New cache tables `llm_cache` (key = blake3 of
+  chat model + reasoning effort + schema JSON + prompt; reply text) and
+  `embedding_cache` (key = blake3 of embedding model + text; `dim` +
+  little-endian f32 blob), D-ag. New config option `ollama.reasoning_effort`
+  (default `none`, validated at load), D-af; `schemars` 1.2 added. Not wired
+  into `index` yet (4.2). *Live probe (Ollama 0.35.1 on the host,
+  `qwen3.8:latest` = 27B Q4 thinking model, `bge-m3:latest` 1024 dims):*
+  `/v1` returns a thinking model's reasoning in `message.reasoning`, so
+  `content` is clean JSON; `"think": false` is ignored on `/v1`,
+  `reasoning_effort: "none"` turns thinking off (82 → 31 completion tokens,
+  ~8.0 s → ~1.5 s on a toy prompt); unknown effort values are accepted
+  silently; a schemars-shaped schema (`$schema`, `title`, nullable types) is
+  honoured; an unknown model is `404 {"error": {"message": ...}}`; an empty
+  embeddings `input` is a 400. *Live tests* (`cargo test llm -- --ignored`):
+  `completes_a_real_struct_and_caches_it` returned a valid `ClassSummary`
+  (role `repository`) cold in 1.2–2.5 s (`none`; 3.1 s with thinking left to
+  the model), repeat from cache in < 1 ms with 0 chat calls;
+  `embeds_real_texts_and_caches_them` 3 vectors × 1024 dims cold 85–120 ms,
+  cached < 1 ms. 19 new tests (18 `llm`, 1 config) + 2 ignored; 155 tests
+  pass (4 ignored).
 
 - **Phase 3 PO checks review fixes: finish the fixture scrub, cover tables.**
   `rich_description.json`: employer package paths and internal repo/module
@@ -710,7 +747,8 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Next
 
-- **Agent:** 4.1 LLM client.
+- **Agent:** 4.2 Ticket summaries (first caller of `LlmClient`; decide
+  open #22 and #23 there).
 - **Product owner:** confirm or override the PM defaults for J1, J2, J4,
   J9 (D-w–D-y, D-aa), the open #19 decision (D-ab) and J5–J8 (D-ac, D-ad);
   D-w and D-y are now backed by the real Jira (see their notes).
@@ -758,6 +796,7 @@ the decisions taken, and the tradeoffs behind them.
 | 3.2 fix: scoped-token auth | done | `Unauthorized { scope }` from a 401 `scope does not match`; preflight scope 401 inconclusive (debug, fetch anyway), fetch 401 still fatal; preflight 429 retried via the shared `with_retry` (`check_auth_with_retry`); error bodies capped at 4 KiB; README / Cloud hint / open #21: classic token + site URL vs scoped token + `api.atlassian.com/ex/jira/<cloudId>` + `read:jira-work`; 132 tests |
 | Phase 3 PO checks | done | real scrubbed fixtures (story, bug, sub-task `Task`, epic child `Verbesserung`, empty description, new rich description) replace the synthetic ones (closes J3, open #20); summary trimmed (D-ae); epic = `fields.parent` (Epic) + legacy `customfield_10930` (D-y); `fetches_real_ticket` tolerates a `scope` 401 preflight; PM real run on `argus` (release, fresh data dir): cold 19.5 s, 79 keys fetched, 80 requests; warm 1.9 s, 0 requests (closes open #21); 135 tests |
 | Phase 3 PO checks review fixes | done | `rich_description.json` scrub finished (`com/acme`, neutral repo/module names); security write-ups in `bug.json` (incl. summary) and `rich_description.json` reworded to neutral text, same markup (PM decision); attachment id `1`; whitespace-only summary = missing (D-ae); `html_table_keeps_cells_without_borders` (D-x); doc/plan wording; 136 tests |
+| 4.1 LLM client | done | `llm` module: `LlmClient::complete::<T>` (schemars 1 schema as `json_schema` response format, serde validation, one retry with the error, `InvalidOutput`, no caching of failures) and `embed` (per-text cache, misses only, batches of 64); `LlmBackend` seam + `OllamaBackend` + fake; `LlmStats`; `llm_cache` + `embedding_cache` (D-ag); `ollama.reasoning_effort` default `none` (D-af); live: struct cold 1.2–2.5 s / cached < 1 ms, bge-m3 1024 dims; 155 tests (4 ignored) |
 
 ## Decisions and tradeoffs
 
@@ -837,6 +876,9 @@ the decisions taken, and the tradeoffs behind them.
 | D-ac (3.2, J5, J6) | `index` without `[jira]` or without `ANNATAR_JIRA_TOKEN` skips fetching with one warning; `--offline` skips it even when configured (info log). The stage still runs offline: cached tickets are copied into the index, uncached keys are counted `tickets_not_fetched`. Errors: `Unauthorized` (401, CAPTCHA 403) fails the run and is never cached; 403/404 cached unavailable with `status` and `fetched_at`, no expiry (drop `ticket_cache` to refresh); 429 honours `Retry-After` (seconds form) with a 5 s doubling fallback, each wait capped at 60 s, at most 3 retries, then the key is **skipped without caching** (counted failed, retried next run); transport, other statuses, invalid keys and parse errors are likewise skipped with a warning and a count, never cached (an invalid key is rejected before any request and is not counted as one). **Circuit breaker** (3.2 review): the first transport failure (connect/TLS/timeout, body read) or 429 still failing after its retries stops the stage from starting fetches, aborts the in-flight ones and counts every remaining key `tickets_not_fetched`, with one warning; the run succeeds with the tickets it has. It trips on the first occurrence, not after N in a row: such failures are systemic (Jira down, VPN off, account throttled), the keys already in flight give the same evidence, and each further attempt costs up to the 30 s request timeout or a full back-off, so a hanging Jira would otherwise cost (keys / concurrency) × 30 s on every run. The client's `connect_timeout` is 10 s, so an unreachable host trips it fast. Per-task 429 waits are kept (no shared back-off across tasks): the breaker limits them to one key's retries. Other statuses and parse errors do not trip it. **Auth preflight** (real-Jira J6 finding): Jira Cloud answers a bearer token with a plain `403 {"error": "Failed to parse Connect Session Auth Token"}` on every request and no `X-Authentication-Denied-Reason`, which the per-issue mapping would read as "unavailable" and cache for every key. So before the first fetch (only when keys are missing, so a fully cached run makes 0 requests) the stage calls `GET /rest/api/2/myself` once, counted in `jira_requests`: any 401/403 there is `Unauthorized` (fails the run, nothing cached), other failures skip all fetches like the breaker. An issue 401/403 with the Connect body is `Unauthorized` too. **Scoped tokens** (preflight review): a 401 whose body says `scope does not match` is `Unauthorized { scope: true }`; on `myself` it is inconclusive (that endpoint needs `read:jira-user`, issues need `read:jira-work`, so a token fit for fetching may fail it): debug log and the fetches go ahead, where any 401 fails the run uncached. A 429 on the check is retried with the fetch back-off (shared `with_retry`), each request counted. Error bodies are read up to 4 KiB. A per-issue 403 that is a real permission denial stays `Unavailable`; a credential that passes `myself` but is denied per issue is still indistinguishable from that, which is accepted. Concurrency `jira.concurrency` (default 4, 0 rejected) as tokio tasks; the stage is the only writer. Successful fetches are cached as they arrive, so an aborted run keeps them. PM default, adopted audit recommendation; product owner may override. | Fail the run on 429/5xx; no offline flag; skip the whole stage offline; breaker after N > 1 consecutive failures; a shared 429 back-off | A flaky or rate-limited Jira should degrade the ticket data, not block the index, and nothing transient may poison the cache; bad credentials would otherwise silently leave every ticket missing. The 60 s cap is an addition so an absurd `Retry-After` cannot stall a run. Using the cache offline keeps `--path`/offline loops informative at zero cost. **Real run (open #21):** `argus` cold run 80 requests (79 keys + 1 preflight, preflight inconclusive on the scope 401), warm run 0 requests; no 403/429/breaker |
 | D-ad (3.2, J7, J8) | Test seam `jira::TicketSource` (object-safe: `fetch` returns a boxed `Send` future), implemented by `JiraClient`; tests use a scripted fake that counts calls and records peak concurrency. Cache table `ticket_cache` (cache.db) keyed by the requested key with issue type, summary, description, parent key, `unavailable`, `status`, `fetched_at`; index table `tickets` (key, unavailable, issue type, summary, description, parent key) for every key in `symbol_tickets` the cache knows. `show` reads only index.db. New `tickets` module holds the cache, fetch policy and retry; the stage lives in `indexer`. PM default, adopted audit recommendation; product owner may override. | `async fn` in trait with generics (not object-safe; would make `build_index` generic); a local HTTP mock server; `show` reading `cache.db` | Boxing one future per request is noise next to an HTTP call, and `Arc<dyn TicketSource>` lets fetches run as `'static` tasks. Keeping description in the index too lets Phase 4 build ticket summaries from index.db alone. The Jira-returned key of a moved issue is not stored (logged at debug) |
 | D-ae (Phase 3 PO checks) | `parse_issue` trims surrounding whitespace from the summary; a summary that is empty after trimming is treated as missing (`<key>: no summary`, review fix) | Keep the summary verbatim; accept an empty summary | Real summaries end in a space (GRLD-21115, GRLD-24229); trimming keeps prompts, `show` output and later comparisons clean. Already-cached `ticket_cache` rows keep the untrimmed text until refetched (schema unchanged, so no drop; delete `ticket_cache` to refresh) |
+| D-af (4.1) | New `ollama.reasoning_effort` (default `none`; `low`/`medium`/`high`; `""` = not sent), validated at config load and part of the LLM cache key | Leave thinking on; `think: false` (Ollama native API); no option | Live: `qwen3.8:latest` is a thinking model; on `/v1` `think` is ignored and `reasoning_effort: "none"` disables thinking, cutting completion tokens and time by ~2–5× on probes. Summaries from signature/Javadoc/tickets should not need reasoning; turn it on per run to compare in 4.5. Ollama accepts unknown values silently, hence the validation. The reasoning text (`message.reasoning`) is never used |
+| D-ag (4.1) | Cache layout: `llm_cache(key, model, output, created_at)`, key = blake3 over length-prefixed `completion`, chat model, reasoning effort, `serde_json` text of the schemars schema, full prompt; `output` is the trimmed validated reply text, re-deserialized on a hit (an undecodable row is a miss and is rewritten). `embedding_cache(key, model, dim, vector)`, key = blake3 over `embedding`, model, text; vector as little-endian f32 blob. Cache read/write faults degrade like D-q | Store `T` re-serialized; JSON vectors; key without the schema/effort; store the prompt | The schema in the key makes a changed struct (or field docs) miss, as the ground rules ask. Raw reply text needs no `Serialize` bound. The LE f32 blob is libSQL's `F32_BLOB` layout, so 5.1 can copy it straight into the vector column. Prompts are not stored (size); add a column if 4.5 review wants them |
+| D-ah (4.1) | `LlmBackend` seam (object-safe, boxed futures, like D-ad) and `LlmClient` owning a cloned cache `Connection`. Retry once on invalid output by appending the bad reply and the serde error as a follow-up turn; transport/HTTP errors are not retried. No `temperature`/`max_tokens` sent (model defaults); 600 s request / 10 s connect timeouts as constants; `ollama.url` may end in `/v1` | Resend the identical request; retry HTTP errors; `temperature: 0` | With the grammar-constrained format invalid JSON is rare, and resending the same prompt to a deterministic sampler would likely repeat the error, so the retry tells the model what was wrong. HTTP errors (model missing, server down) don't fix themselves on an immediate retry. Leaving temperature at the model default keeps that retry meaningful; determinism comes from the cache (open #22). A 27B local model on a long prompt can take minutes, hence the long timeout |
 
 ## Open questions
 
@@ -863,3 +905,5 @@ the decisions taken, and the tradeoffs behind them.
 | 19 | A `--path` run rebuilds `index.db` wholesale, so it leaves an index holding only that prefix, and a missing prefix empties it (`show` then fails repo-wide). Should `--path` merge into the existing index, refuse to replace it, or is narrowing intended and merely undocumented? | R8 | **resolved (R9, D-ab)** — narrowing is intended: `--path` is for fast prompt iteration; the run warns once that it replaces `index.db` with a partial index, and README + `--path` help document it. No merging (would need incremental indexing, Later) |
 | 20 | The 3.1 Jira fixtures are synthetic (no token available to the agent). Replace them with scrubbed real `renderedFields` captures (story, bug, sub-task, epic child, empty description) and confirm the auth mode and parent/epic field shape (J3, audit §3.1). | 3.1 | **resolved** (Phase 3 PO checks) — scrubbed real captures for story, bug, sub-task (`Task`, `subtask: true`), epic child, empty description, plus a rich description; auth = Cloud basic `email:token` via the gateway (D-w); epic = `fields.parent` + legacy `customfield_10930` (D-y) |
 | 21 | 3.2 is proven only against a fake `TicketSource`; no real Jira was reachable. Run `annatar index` twice on the real repo with a token: the second run should make 0 Jira requests unless the first run reported failed keys, and any requests must be for exactly those keys. How many keys come back fetched / unavailable / failed / not fetched (any 401/403/429, did the circuit breaker trip)? **Finding (2026-10-03):** the target `https://blueocean.jira.com` is Jira **Cloud** (`serverInfo` `deploymentType: Cloud`); a bearer token gets `403 Failed to parse Connect Session Auth Token` on every request, so `ANNATAR_JIRA_EMAIL` must be set (basic auth). Without it the run now fails at the auth preflight instead of caching every key unavailable. Classic API token: email + site URL as `base_url`. Scoped API token: email + `base_url = "https://api.atlassian.com/ex/jira/a91bc83a-f441-4972-9af4-e290d68c06e3"` (the site URL rejects it) + scope `read:jira-work` (a token without `read:jira-user` passes the preflight as inconclusive; a missing `read:jira-work` fails the run at the first fetch with a scope message). | 3.2 | **resolved** (Phase 3 PO checks) — `argus`, release, fresh data dir: run 1 fetched all 79 keys (0 unavailable/failed/not fetched) with 80 requests (79 + preflight, scope 401 inconclusive); run 2 0 requests; no 403/429, breaker not tripped |
+| 22 | Completions run at the model's default temperature (D-ah), so dropping `llm_cache` regenerates different text. Send `temperature: 0` (and keep the error-carrying retry) once 4.5 needs reproducible records? | 4.1 | open — decide in 4.2 / 4.5 |
+| 23 | `LlmClient` is safe to share across tasks, but nothing calls it concurrently yet. Does the host Ollama (`OLLAMA_NUM_PARALLEL`) gain from parallel requests for 4.2/4.3, or should calls stay sequential? Measure per-ticket / per-symbol time first. | 4.1 | open — measure in 4.2 / 4.3 |
