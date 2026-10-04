@@ -18,13 +18,13 @@
 //!    index `tickets` table an English summary and purpose from the chat
 //!    model (through the LLM cache); runs after tickets;
 //! 5. **describe** (`index_descriptions`) gives every method and constructor
-//!    a one-line `what` and a `why` from the chat model, built from its code,
-//!    its enclosing type and its tickets' summaries (or commit subjects);
-//!    runs after summaries, also on a repository without git (code only);
-//! 6. **types** (`index_type_descriptions`) gives every type a `what` and a
-//!    `why` the same way, bottom-up (nested types first), from its
-//!    declaration, its members' and nested types' `what` lines and its
-//!    tickets; runs after describe.
+//!    a short `description` from the chat model, built from its code, its
+//!    enclosing type, its tickets' summaries and its commit subjects; runs
+//!    after summaries, also on a repository without git (code only);
+//! 6. **types** (`index_type_descriptions`) gives every type a `description`
+//!    the same way, bottom-up (nested types first), from its declaration, its
+//!    members' and nested types' descriptions and its history; runs after
+//!    describe.
 //!
 //! A stage never commits: the transaction commits and the temporary file is
 //! atomically renamed over `index.db` exactly once, after the last stage. Any
@@ -48,9 +48,9 @@ use regex::Regex;
 
 use crate::config::DescribeConfig;
 use crate::describe::{
-    ChildWhat, Description, Member, MemberCommit, MemberTicket, Parent, Summary, TicketState,
-    TypeChild, TypeContext, TypeDescription, is_public, member_prompt, outline, select_children,
-    select_history, type_prompt, validate_description, validate_type_description,
+    ChildDescription, Description, Member, MemberCommit, MemberTicket, Parent, Summary,
+    TicketState, TypeChild, TypeContext, TypeDescription, is_public, member_prompt, outline,
+    select_children, select_history, type_prompt, validate_description, validate_type_description,
 };
 use crate::history::{self, Commit, HistoryCache};
 use crate::jira::{FetchError, Ticket};
@@ -128,8 +128,7 @@ pub struct IndexStats {
     /// describe_invalid + describe_failed + describe_incomplete +
     /// describe_skipped == describe_members`.
     pub describe_members: usize,
-    /// Members given a `what` (and maybe a `why`), from the LLM cache or the
-    /// model.
+    /// Members given a description, from the LLM cache or the model.
     pub described: usize,
     /// Of `described`, those answered from the LLM cache.
     pub described_cached: usize,
@@ -151,8 +150,7 @@ pub struct IndexStats {
     /// types_invalid + types_failed + types_incomplete + types_skipped ==
     /// type_symbols`.
     pub type_symbols: usize,
-    /// Types given a `what` (and maybe a `why`), from the LLM cache or the
-    /// model.
+    /// Types given a description, from the LLM cache or the model.
     pub types_described: usize,
     /// Of `types_described`, those answered from the LLM cache.
     pub types_described_cached: usize,
@@ -163,7 +161,7 @@ pub struct IndexStats {
     pub types_failed: usize,
     /// Types held back because their input is incomplete this run: a chosen
     /// ticket was not fetched yet or has no summary, or a listed member or
-    /// nested type has no `what` this run. Described on a later run.
+    /// nested type has no description this run. Described on a later run.
     pub types_incomplete: usize,
     /// Types not sent to the model: no `[ollama]` section, or not in the LLM
     /// cache with `--no-llm` or after the circuit breaker tripped.
@@ -213,7 +211,7 @@ pub struct IndexStats {
 ///
 /// `llm` summarises the available tickets and describes every method,
 /// constructor and type; `None` (no `[ollama]` section) leaves them without a summary
-/// or what/why. Its chat model is checked once before the
+/// or description. Its chat model is checked once before the
 /// stages run: a model the server does not have fails the run (like rejected
 /// Jira credentials). Other LLM failures never fail the run; see
 /// `index_summaries`, `index_descriptions` and `index_type_descriptions`.
@@ -288,10 +286,10 @@ pub async fn build_index(
         invalid_summaries: &invalid_summaries,
         unknown_tickets,
     };
-    let whats = index_descriptions(&transaction, &indexed, llm, &inputs, &mut stats).await?;
+    let described = index_descriptions(&transaction, &indexed, llm, &inputs, &mut stats).await?;
     stats.describe_llm = llm_stats().since(&before);
     let before = llm_stats();
-    index_type_descriptions(&transaction, &indexed, llm, &inputs, whats, &mut stats).await?;
+    index_type_descriptions(&transaction, &indexed, llm, &inputs, described, &mut stats).await?;
     stats.type_llm = llm_stats().since(&before);
     stats.llm = llm_stats().since(&run_before);
 
@@ -907,8 +905,7 @@ async fn write_summary(conn: &Connection, key: &str, summary: &TicketSummary) ->
 }
 
 /// Describe stage: give every method and constructor the structure stage
-/// wrote a `what` and a `why` from the chat model, stored on its `symbols`
-/// row. Runs after summaries, which it reads from the index `tickets` table.
+/// wrote a description from the chat model, stored on its `symbols` row. Runs after summaries, which it reads from the index `tickets` table.
 ///
 /// Members are taken in walk and source order and asked one at a time (the
 /// host Ollama serves one request at a time, D-ap). Each prompt is built by
@@ -929,8 +926,8 @@ async fn index_descriptions(
     llm: Option<&Summarizer>,
     inputs: &DescribeInputs<'_>,
     stats: &mut IndexStats,
-) -> Result<HashMap<i64, ChildWhat>> {
-    let mut whats = HashMap::new();
+) -> Result<HashMap<i64, ChildDescription>> {
+    let mut described = HashMap::new();
     let members: Vec<(&IndexedFile, &IndexedSymbol)> = files
         .iter()
         .flat_map(|file| file.symbols.iter().map(move |symbol| (file, symbol)))
@@ -939,7 +936,7 @@ async fn index_descriptions(
     stats.describe_members = members.len();
     let Some(llm) = llm else {
         stats.describe_skipped += members.len();
-        return Ok(whats);
+        return Ok(described);
     };
     let types: HashMap<&str, &Symbol> = files
         .iter()
@@ -1010,10 +1007,10 @@ async fn index_descriptions(
                 tracing::warn!(
                     fqn = %symbol.fqn,
                     error = format!("{err:#}"),
-                    "no valid what/why; skipping the member this run"
+                    "no valid description; skipping the member this run"
                 );
                 stats.describe_invalid += 1;
-                whats.insert(indexed.id, ChildWhat::Invalid);
+                described.insert(indexed.id, ChildDescription::Invalid);
                 continue;
             }
             Err(err) => {
@@ -1021,14 +1018,14 @@ async fn index_descriptions(
                     fqn = %symbol.fqn,
                     error = format!("{err:#}"),
                     remaining = members.len() - done - 1,
-                    "the chat model failed; remaining members use cached what/why only"
+                    "the chat model failed; remaining members use cached descriptions only"
                 );
                 stats.describe_failed += 1;
                 continue;
             }
         };
         write_description(transaction, indexed.id, &description).await?;
-        whats.insert(indexed.id, ChildWhat::Described(description.what_text()));
+        described.insert(indexed.id, ChildDescription::Described(description.text()));
         stats.described += 1;
         if llm.client.stats().chat_hits > hits {
             stats.described_cached += 1;
@@ -1046,7 +1043,7 @@ async fn index_descriptions(
         described = stats.described,
         cached = stats.described_cached,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "member what/why done"
+        "member descriptions done"
     );
     if stats.describe_invalid + stats.describe_failed + stats.describe_incomplete > 0 {
         tracing::warn!(
@@ -1057,25 +1054,24 @@ async fn index_descriptions(
             incomplete = stats.describe_incomplete,
             skipped = stats.describe_skipped,
             blocking_tickets = key_list(&blocking),
-            "some methods got no what/why this run; they are asked again next run"
+            "some methods got no description this run; they are asked again next run"
         );
     }
-    Ok(whats)
+    Ok(described)
 }
 
-/// Type stage: give every type the structure stage wrote a `what` and a
-/// `why` from the chat model, stored on its `symbols` row. Runs after the
-/// describe stage, whose members' `what` lines (`whats`, by symbol id) it
-/// lists.
+/// Type stage: give every type the structure stage wrote a description from
+/// the chat model, stored on its `symbols` row. Runs after the describe
+/// stage, whose members' descriptions (`described`, by symbol id) it lists.
 ///
 /// Types are taken bottom-up: the most deeply nested first, then by walk and
-/// source order, so an outer type lists its nested types' `what` lines. Each
+/// source order, so an outer type lists its nested types' descriptions. Each
 /// prompt is built by [`type_prompt`] from the type's own file and history:
 /// its declaration with members and nested types cut out (capped at
 /// `describe.body_chars`), up to `describe.type_members` children with their
-/// `what` (public ones first; the rest only counted) and its first plus
+/// description (public ones first; the rest only counted) and its first plus
 /// `describe.type_recent_tickets` most recent tickets, chosen like a
-/// member's. A listed child without a `what` this run holds the type back
+/// member's. A listed child without a description this run holds the type back
 /// (`types_incomplete`, which in turn holds back its outer type), so nothing
 /// built from partial input is cached; a child whose reply was invalid is
 /// listed without one. Ticket blocking, the title fallback, invalid replies,
@@ -1087,7 +1083,7 @@ async fn index_type_descriptions(
     files: &[IndexedFile],
     llm: Option<&Summarizer>,
     inputs: &DescribeInputs<'_>,
-    mut whats: HashMap<i64, ChildWhat>,
+    mut described: HashMap<i64, ChildDescription>,
     stats: &mut IndexStats,
 ) -> Result<()> {
     let types: HashMap<&str, &IndexedSymbol> = files
@@ -1169,14 +1165,17 @@ async fn index_type_descriptions(
                     kind,
                     name,
                     public: is_public(&child.symbol.signature, in_interface),
-                    what: whats.get(&child.id).cloned().unwrap_or(ChildWhat::Missing),
+                    description: described
+                        .get(&child.id)
+                        .cloned()
+                        .unwrap_or(ChildDescription::Missing),
                 }
             })
             .collect();
         let listed = match select_children(&listed, config.type_members) {
             Ok(listed) => listed,
             Err(missing) => {
-                tracing::debug!(fqn = %symbol.fqn, missing = missing.join(", "), "members without what/why this run; type not described");
+                tracing::debug!(fqn = %symbol.fqn, missing = missing.join(", "), "members without a description this run; type not described");
                 held_back += 1;
                 stats.types_incomplete += 1;
                 continue;
@@ -1226,10 +1225,10 @@ async fn index_type_descriptions(
                 tracing::warn!(
                     fqn = %symbol.fqn,
                     error = format!("{err:#}"),
-                    "no valid what/why; skipping the type this run"
+                    "no valid description; skipping the type this run"
                 );
                 stats.types_invalid += 1;
-                whats.insert(indexed.id, ChildWhat::Invalid);
+                described.insert(indexed.id, ChildDescription::Invalid);
                 continue;
             }
             Err(err) => {
@@ -1237,14 +1236,14 @@ async fn index_type_descriptions(
                     fqn = %symbol.fqn,
                     error = format!("{err:#}"),
                     remaining = order.len() - done - 1,
-                    "the chat model failed; remaining types use cached what/why only"
+                    "the chat model failed; remaining types use cached descriptions only"
                 );
                 stats.types_failed += 1;
                 continue;
             }
         };
         write_description(transaction, indexed.id, &description).await?;
-        whats.insert(indexed.id, ChildWhat::Described(description.what_text()));
+        described.insert(indexed.id, ChildDescription::Described(description.text()));
         stats.types_described += 1;
         if llm.client.stats().chat_hits > hits {
             stats.types_described_cached += 1;
@@ -1262,7 +1261,7 @@ async fn index_type_descriptions(
         described = stats.types_described,
         cached = stats.types_described_cached,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "type what/why done"
+        "type descriptions done"
     );
     if stats.types_invalid + stats.types_failed + stats.types_incomplete > 0 {
         tracing::warn!(
@@ -1274,7 +1273,7 @@ async fn index_type_descriptions(
             waiting_for_members = held_back,
             skipped = stats.types_skipped,
             blocking_tickets = key_list(&blocking),
-            "some types got no what/why this run; they are asked again next run"
+            "some types got no description this run; they are asked again next run"
         );
     }
     Ok(())
@@ -1378,15 +1377,15 @@ async fn member_commits(conn: &Connection) -> Result<HashMap<i64, Vec<MemberComm
     Ok(commits)
 }
 
-/// Store one member's `what` and `why` (whitespace collapsed, an empty `why`
-/// as `NULL`) on its `symbols` row.
+/// Store one symbol's description (whitespace collapsed) on its `symbols`
+/// row.
 async fn write_description(conn: &Connection, id: i64, description: &Description) -> Result<()> {
     conn.execute(
-        "UPDATE symbols SET what = ?2, why = ?3 WHERE id = ?1",
-        params![id, description.what_text(), description.why_text()],
+        "UPDATE symbols SET description = ?2 WHERE id = ?1",
+        params![id, description.text()],
     )
     .await
-    .with_context(|| format!("writing the what/why of symbol {id}"))?;
+    .with_context(|| format!("writing the description of symbol {id}"))?;
     Ok(())
 }
 
@@ -3404,8 +3403,8 @@ public class UserService {
     }
 
     const BRIEF: &str = r#"{"summary": "Adds the service.", "purpose": "Users need it."}"#;
-    const DESCRIBED: &str = r#"{"what": "Returns the value.", "why": ""}"#;
-    const TYPE_DESCRIBED: &str = r#"{"what": "Serves the values.", "why": ""}"#;
+    const DESCRIBED: &str = r#"{"description": "Returns the value."}"#;
+    const TYPE_DESCRIBED: &str = r#"{"description": "Serves the values."}"#;
     const BLANK: &str = r#"{"summary": " ", "purpose": "Users need it."}"#;
 
     /// A summarizer over `backend`; the summary tests' describe stage gets
@@ -3774,8 +3773,8 @@ public class UserService {
         assert!(!output.contains("purpose:"), "{output}");
     }
 
-    const WHAT_WHY: &str =
-        r#"{"what": "Returns the\nconfigured value.", "why": "Callers need the value."}"#;
+    const DESCRIPTION: &str =
+        r#"{"description": "Returns the\nconfigured value.  Callers need the value."}"#;
 
     async fn describe_with(
         repo: &Path,
@@ -3858,14 +3857,10 @@ public class UserService {
         );
     }
 
-    /// `(what, why)` of `fqn` in the committed index.
-    async fn what_why(data: &Path, fqn: &str) -> (Option<String>, Option<String>) {
+    /// The description of `fqn` in the committed index.
+    async fn description_of(data: &Path, fqn: &str) -> Option<String> {
         let reader = IndexReader::open(data).await.unwrap();
-        let conn = reader.connection();
-        (
-            text_of(conn, fqn, "what").await,
-            text_of(conn, fqn, "why").await,
-        )
+        text_of(reader.connection(), fqn, "description").await
     }
 
     /// The prompts of the describe requests `backend` received.
@@ -3879,12 +3874,13 @@ public class UserService {
     }
 
     #[tokio::test]
-    async fn members_get_what_why_from_ticket_summaries_and_a_rerun_makes_no_chat_calls() {
+    async fn members_get_descriptions_from_code_tickets_and_commits_and_a_rerun_makes_no_chat_calls()
+     {
         let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change"]);
         let data = tempfile::tempdir().unwrap();
         let jira = jira_with(&[fake::ticket("GRLD-1")]);
         let backend = FakeBackend::new();
-        backend.reply(&[BRIEF, WHAT_WHY]);
+        backend.reply(&[BRIEF, DESCRIPTION]);
 
         let cold =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
@@ -3909,20 +3905,20 @@ Source:
 public int value() {
     return 1;
 }
-Change history (the work it was created for, then the most recent changes, newest first):
+Tickets (the work it was created for, then the most recent changes, newest first):
 - Created for GRLD-1 (Story): Adds the service.
   Reason: Users need it.
+Commits (most recent messages, newest first):
+- GRLD-2 change
+- GRLD-1 add
 CONTEXT>>>
 "
             ),
-            "the source is dedented and GRLD-2 (unavailable) left out: {prompt}"
+            "the source is dedented and GRLD-2 (unavailable) left out of the tickets: {prompt}"
         );
         assert_eq!(
-            what_why(data.path(), "com.acme.Service#value()").await,
-            (
-                Some("Returns the configured value.".to_string()),
-                Some("Callers need the value.".to_string())
-            )
+            description_of(data.path(), "com.acme.Service#value()").await,
+            Some("Returns the configured value. Callers need the value.".to_string())
         );
 
         let quiet = FakeBackend::new();
@@ -3942,8 +3938,7 @@ CONTEXT>>>
                 "  com.acme.Service#value() [method]
     - file: src/main/java/com/acme/Service.java:4-6
     - signature: public int value()
-    - what: Returns the configured value.
-    - why: Callers need the value.
+    - description: Returns the configured value. Callers need the value.
 "
             ),
             "{output}"
@@ -3956,7 +3951,7 @@ CONTEXT>>>
         let data = tempfile::tempdir().unwrap();
         let jira = jira_with(&[fake::ticket("GRLD-1")]);
         let backend = FakeBackend::new();
-        backend.reply(&[BLANK, BLANK, WHAT_WHY]);
+        backend.reply(&[BLANK, BLANK, DESCRIPTION]);
 
         let first =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
@@ -3965,12 +3960,14 @@ CONTEXT>>>
         assert_eq!(first.described, 1, "described from the Jira title");
         let prompt = &describe_prompts(&backend)[0];
         assert!(
-            prompt.ends_with("- Created for GRLD-1 (Story): Summary of GRLD-1\nCONTEXT>>>\n"),
+            prompt.ends_with(
+                "- Created for GRLD-1 (Story): Summary of GRLD-1\nCommits (most recent messages, newest first):\n- GRLD-1 add\nCONTEXT>>>\n"
+            ),
             "{prompt}"
         );
 
         let backend = FakeBackend::new();
-        backend.reply(&[BRIEF, r#"{"what": "Returns the value.", "why": ""}"#]);
+        backend.reply(&[BRIEF, DESCRIBED]);
         let second =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
 
@@ -3980,16 +3977,17 @@ CONTEXT>>>
             "a valid summary changes the prompt"
         );
         assert_eq!(
-            what_why(data.path(), "com.acme.Service#value()").await,
-            (Some("Returns the value.".to_string()), None),
-            "an empty why is stored as NULL"
+            description_of(data.path(), "com.acme.Service#value()").await,
+            Some("Returns the value.".to_string())
         );
         let reader = IndexReader::open(data.path()).await.unwrap();
         let output = crate::show::render(reader.connection(), "com.acme.Service#value()")
             .await
             .unwrap();
-        assert!(output.contains("- what: Returns the value.\n"), "{output}");
-        assert!(!output.contains("- why:"), "{output}");
+        assert!(
+            output.contains("- description: Returns the value.\n"),
+            "{output}"
+        );
     }
 
     #[tokio::test]
@@ -4008,7 +4006,7 @@ CONTEXT>>>
         let jira = jira_with(&[fake::ticket("GRLD-1"), fake::ticket("GRLD-3")]);
         let backend = FakeBackend::new();
         backend.always("TicketSummary", BRIEF);
-        backend.always("Description", WHAT_WHY);
+        backend.always("Description", DESCRIPTION);
         let first =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
         assert_eq!(first.described, 3);
@@ -4039,16 +4037,16 @@ CONTEXT>>>
         assert_eq!(stats.describe_skipped, 1, "C changed and is not cached");
         assert_eq!(stats.describe_llm.chat_calls, 0);
         assert_eq!(
-            what_why(data.path(), "com.acme.A#value()").await.0,
-            Some("Returns the configured value.".to_string())
+            description_of(data.path(), "com.acme.A#value()").await,
+            Some("Returns the configured value. Callers need the value.".to_string())
         );
         assert_eq!(
-            what_why(data.path(), "com.acme.B#value()").await,
-            (None, None)
+            description_of(data.path(), "com.acme.B#value()").await,
+            None
         );
         assert_eq!(
-            what_why(data.path(), "com.acme.C#value()").await,
-            (None, None)
+            description_of(data.path(), "com.acme.C#value()").await,
+            None
         );
     }
 
@@ -4070,9 +4068,19 @@ CONTEXT>>>
         let keys = ["GRLD-1", "GRLD-2", "GRLD-3", "GRLD-4"];
         let jira = jira_with(&keys.map(fake::ticket));
         let backend = FakeBackend::new();
-        let bad = r#"{"what": " ", "why": ""}"#;
+        let bad = r#"{"description": " "}"#;
         backend.reply(&[
-            BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, bad, bad, WHAT_WHY,
+            BLANK,
+            BLANK,
+            BLANK,
+            BLANK,
+            BLANK,
+            BLANK,
+            BLANK,
+            BLANK,
+            bad,
+            bad,
+            DESCRIPTION,
         ]);
 
         let stats =
@@ -4092,7 +4100,7 @@ CONTEXT>>>
         let repo = repo_with_commits(&["GRLD-1 add", "Tidy up"]);
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
-        backend.reply(&[WHAT_WHY]);
+        backend.reply(&[DESCRIPTION]);
 
         let stats = describe_in(
             repo.path(),
@@ -4110,7 +4118,7 @@ CONTEXT>>>
         let prompt = &describe_prompts(&backend)[0];
         assert!(
             prompt.contains(
-                "Change history (commit messages, newest first):\n- Tidy up\n- GRLD-1 add\nCONTEXT>>>"
+                "Tickets: (none)\nCommits (most recent messages, newest first):\n- Tidy up\n- GRLD-1 add\nCONTEXT>>>"
             ),
             "{prompt}"
         );
@@ -4130,12 +4138,12 @@ CONTEXT>>>
     }
 
     #[tokio::test]
-    async fn commit_subjects_stand_in_when_no_ticket_is_available() {
+    async fn commit_subjects_without_an_available_ticket() {
         let repo = repo_with_commits(&["GRLD-2 change", "Tidy up", "Tidy up"]);
         let data = tempfile::tempdir().unwrap();
         let jira = jira_with(&[]);
         let backend = FakeBackend::new();
-        backend.reply(&[WHAT_WHY]);
+        backend.reply(&[DESCRIPTION]);
 
         let stats =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
@@ -4145,7 +4153,7 @@ CONTEXT>>>
         let prompt = &describe_prompts(&backend)[0];
         assert!(
             prompt.contains(
-                "Change history (commit messages, newest first):\n- Tidy up\n- GRLD-2 change\nCONTEXT>>>"
+                "Tickets: (none)\nCommits (most recent messages, newest first):\n- Tidy up\n- GRLD-2 change\nCONTEXT>>>"
             ),
             "{prompt}"
         );
@@ -4157,13 +4165,16 @@ CONTEXT>>>
         write(repo.path(), "src/main/java/com/acme/Service.java", &java(7));
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
-        backend.reply(&[WHAT_WHY]);
+        backend.reply(&[DESCRIPTION]);
 
         let stats = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
 
         assert_eq!(stats.described, 1);
         let prompt = &describe_prompts(&backend)[0];
-        assert!(prompt.contains("Change history: (none)\n"), "{prompt}");
+        assert!(
+            prompt.ends_with("Tickets: (none)\nCommits: (none)\nCONTEXT>>>\n"),
+            "{prompt}"
+        );
     }
 
     #[tokio::test]
@@ -4183,7 +4194,7 @@ CONTEXT>>>
         commit(repo.path(), "Add A and B", "2024-01-01T00:00:00+00:00");
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
-        backend.reply(&[WHAT_WHY, WHAT_WHY]);
+        backend.reply(&[DESCRIPTION, DESCRIPTION]);
         let full = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
         assert_eq!(full.described, 2);
 
@@ -4219,8 +4230,8 @@ CONTEXT>>>
         assert_eq!(stats.describe_skipped, 1);
         assert!(backend.chats().is_empty());
         assert_eq!(
-            what_why(data.path(), "com.acme.Service#value()").await,
-            (None, None)
+            description_of(data.path(), "com.acme.Service#value()").await,
+            None
         );
     }
 
@@ -4235,8 +4246,8 @@ CONTEXT>>>
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
         backend.reply(&[
-            r#"{"what": "This method does things.", "why": ""}"#,
-            r#"{"what": " ", "why": ""}"#,
+            r#"{"description": "This method does things."}"#,
+            r#"{"description": " "}"#,
         ]);
 
         let stats = describe_with(repo.path(), data.path(), None, None, &backend, false).await;
@@ -4276,8 +4287,8 @@ public class Orders extends Base {
 }
 ";
 
-    fn type_reply(what: &str) -> String {
-        format!(r#"{{"what": "{what}", "why": "Billing needs it."}}"#)
+    fn type_reply(text: &str) -> String {
+        format!(r#"{{"description": "{text} Billing needs it."}}"#)
     }
 
     /// The prompts of the type requests `backend` received.
@@ -4352,9 +4363,9 @@ Declaration (members and nested types are cut out and listed below):
 public static class Line {
     private int amount;
 }
-Methods, constructors and nested types (what each does):
+Methods, constructors and nested types (with their descriptions):
 - method amount(): Returns the value.
-- enum Kind: Lists the kinds.
+- enum Kind: Lists the kinds. Billing needs it.
 "
             ),
             "{}",
@@ -4372,13 +4383,15 @@ Declaration (members and nested types are cut out and listed below):
 public class Orders extends Base {
     private final Repo repo;
 }
-Methods, constructors and nested types (what each does):
+Methods, constructors and nested types (with their descriptions):
 - constructor Orders(Repo): Returns the value.
 - method helper(): Returns the value.
-- class Line: Holds one order line.
-Change history (the work it was created for, then the most recent changes, newest first):
+- class Line: Holds one order line. Billing needs it.
+Tickets (the work it was created for, then the most recent changes, newest first):
 - Created for GRLD-1 (Story): Adds the service.
   Reason: Users need it.
+Commits (most recent messages, newest first):
+- GRLD-1 add orders
 CONTEXT>>>
 "
             ),
@@ -4411,8 +4424,7 @@ CONTEXT>>>
 com.acme.Orders [class] role=service
   - file: src/main/java/com/acme/Orders.java:4-22
   - signature: public class Orders extends Base
-  - what: Keeps the order book.
-  - why: Billing needs it.
+  - description: Keeps the order book. Billing needs it.
 "
             ),
             "{output}"
@@ -4423,8 +4435,7 @@ com.acme.Orders [class] role=service
   com.acme.Orders.Line [class]
     - file: src/main/java/com/acme/Orders.java:15-21
     - signature: public static class Line
-    - what: Holds one order line.
-    - why: Billing needs it.
+    - description: Holds one order line. Billing needs it.
 "
             ),
             "{output}"
@@ -4435,7 +4446,7 @@ com.acme.Orders [class] role=service
     com.acme.Orders.Line.Kind [enum]
       - file: src/main/java/com/acme/Orders.java:20-20
       - signature: enum Kind
-      - what: Lists the kinds.
+      - description: Lists the kinds. Billing needs it.
 "
             ),
             "{output}"
@@ -4470,10 +4481,11 @@ com.acme.Orders [class] role=service
         assert!(
             prompts[2].contains(
                 "\
-Methods, constructors and nested types (what each does):
+Methods, constructors and nested types (with their descriptions):
 - constructor Orders(Repo): Returns the value.
 - (2 more not listed)
-Change history: (none)
+Tickets: (none)
+Commits: (none)
 "
             ),
             "{}",
@@ -4493,7 +4505,7 @@ Change history: (none)
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
         backend.always("TypeDescription", TYPE_DESCRIBED);
-        let blank = r#"{"what": " ", "why": ""}"#;
+        let blank = r#"{"description": " "}"#;
         backend.reply(&[DESCRIBED, DESCRIBED, blank, blank]);
 
         let first = run_llm_stages(
@@ -4536,12 +4548,12 @@ Change history: (none)
         );
         assert!(quiet.chats().is_empty());
         assert_eq!(
-            what_why(data.path(), "com.acme.Orders.Line").await,
-            (None, None)
+            description_of(data.path(), "com.acme.Orders.Line").await,
+            None
         );
-        assert_eq!(what_why(data.path(), "com.acme.Orders").await, (None, None));
+        assert_eq!(description_of(data.path(), "com.acme.Orders").await, None);
         assert_eq!(
-            what_why(data.path(), "com.acme.Orders.Line.Kind").await.0,
+            description_of(data.path(), "com.acme.Orders.Line.Kind").await,
             Some("Serves the values.".to_string())
         );
     }
@@ -4627,14 +4639,14 @@ Change history: (none)
         assert_eq!(stats.describe_incomplete, 0);
         assert_eq!(stats.types_incomplete, 1, "Service chose GRLD-2");
         assert_eq!(stats.type_llm.chat_calls, 0);
-        let warning = log_line(&logs, "some types got no what/why");
+        let warning = log_line(&logs, "some types got no description");
         assert!(
             warning.contains("incomplete=1")
                 && warning.contains("waiting_for_members=0")
                 && warning.contains("blocking_tickets=\"GRLD-2\""),
             "{warning}"
         );
-        assert!(!logs.contains("some methods got no what/why"), "{logs}");
+        assert!(!logs.contains("some methods got no description"), "{logs}");
 
         let fetched = jira_with(&[fake::ticket("GRLD-1"), fake::ticket("GRLD-2")]);
         let stats = run_llm_stages(
@@ -4711,7 +4723,7 @@ public interface Repo {
 Declaration (members and nested types are cut out and listed below):
 record Point(int x, int y) {
 }
-Methods, constructors and nested types (what each does):
+Methods, constructors and nested types (with their descriptions):
 - compact constructor Point: Returns the value.
 - constructor Point(int): Returns the value.
 "
@@ -4725,7 +4737,7 @@ Methods, constructors and nested types (what each does):
 public interface Repo {
     int MAX = 3;
 }
-Methods, constructors and nested types (what each does):
+Methods, constructors and nested types (with their descriptions):
 - method find(Long): Returns the value.
 - method size(): Returns the value.
 - record Point: Serves the values.
@@ -4744,7 +4756,7 @@ Methods, constructors and nested types (what each does):
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
         backend.always("Description", DESCRIBED);
-        let blank = r#"{"what": " ", "why": ""}"#;
+        let blank = r#"{"description": " "}"#;
         let kinds = type_reply("Lists the kinds.");
         let book = type_reply("Keeps the order book.");
         backend.reply(&[&kinds, blank, blank, &book]);
@@ -4770,12 +4782,12 @@ Methods, constructors and nested types (what each does):
             prompts[3]
         );
         assert_eq!(
-            what_why(data.path(), "com.acme.Orders").await.0,
-            Some("Keeps the order book.".to_string())
+            description_of(data.path(), "com.acme.Orders").await,
+            Some("Keeps the order book. Billing needs it.".to_string())
         );
         assert_eq!(
-            what_why(data.path(), "com.acme.Orders.Line").await,
-            (None, None)
+            description_of(data.path(), "com.acme.Orders.Line").await,
+            None
         );
     }
 
@@ -4811,7 +4823,7 @@ Methods, constructors and nested types (what each does):
         );
         assert_eq!(stats.types_skipped, 1, "Other after the trip");
         assert_eq!(stats.type_llm.chat_calls, 1);
-        let warning = log_line(&logs, "some types got no what/why");
+        let warning = log_line(&logs, "some types got no description");
         assert!(
             warning.contains("failed=1")
                 && warning.contains("waiting_for_members=2")

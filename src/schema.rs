@@ -15,10 +15,9 @@ use libsql::Connection;
 /// `CREATE TABLE` statements for the disposable `index.db`, in dependency
 /// order.
 pub const INDEX_TABLES: &[&str] = &[
-    // 1.5 `symbols`. 4.3 adds the chat model's one-line `what` and `why`
-    // for methods and constructors: NULL when not described this run, and
-    // `why` also NULL when the history gives no reason. 4.4 fills them for
-    // types.
+    // 1.5 `symbols`. 4.6 (product-owner redesign) adds the chat model's
+    // `description` of every method, constructor and type, NULL when not
+    // described this run (it replaced 4.3/4.4's `what` and `why`).
     "CREATE TABLE symbols (
         id INTEGER PRIMARY KEY,
         parent_id INTEGER REFERENCES symbols(id),
@@ -32,8 +31,7 @@ pub const INDEX_TABLES: &[&str] = &[
         javadoc TEXT,
         annotations TEXT NOT NULL DEFAULT '[]',
         content_hash TEXT NOT NULL,
-        what TEXT,
-        why TEXT
+        description TEXT
     )",
     "CREATE INDEX symbols_parent_id ON symbols(parent_id)",
     // 2.2 `symbol_commits`.

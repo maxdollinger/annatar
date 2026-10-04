@@ -43,7 +43,7 @@ enum Command {
         /// already in cache.db are still used.
         #[arg(long)]
         offline: bool,
-        /// Make no chat-model calls; summaries and what/why already in
+        /// Make no chat-model calls; summaries and descriptions already in
         /// cache.db are still used, the rest get none.
         #[arg(long)]
         no_llm: bool,
@@ -53,7 +53,7 @@ enum Command {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
         fqn: String,
     },
-    /// Search what/why records by meaning.
+    /// Search symbol descriptions by meaning.
     Search {
         /// Plain-language query.
         query: String,

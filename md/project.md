@@ -50,7 +50,7 @@ One index serves all five goals; each draws on a different part of it.
 | New engineer | "Where does user persistence live and why is it split this way?" | Module overview, the main symbols, the tickets behind them |
 | Experienced engineer | "Can I remove this method, and who relies on it?" | The requirement it served, its direct and transitive callers |
 | Product owner, support, QA | "Which part of the system handles refunds?" | A plain-language description and the user stories it implements |
-| Coding agent | "Find the code responsible for session expiry" | Ranked symbols with file:line, what/why, usages, in one call |
+| Coding agent | "Find the code responsible for session expiry" | Ranked symbols with file:line, description, usages, in one call |
 
 ## How it works
 
@@ -59,10 +59,10 @@ Five steps turn a repository into an intent index. Every step is incremental: a 
 1. **Structure:** tree-sitter extracts every class, method and function with its signature, doc comment and file:line.
 2. **History:** `git log -L` per symbol yields the commits that shaped it and the ticket keys they mention.
 3. **Tickets:** each referenced ticket is fetched once and summarised.
-4. **What/why:** an LLM writes a one-line *what* and a *why* per symbol from its signature, docs and ticket summaries, bottom-up from members to types.
-5. **Embeddings:** the what/why text is embedded for search.
+4. **Descriptions:** an LLM writes one short description per symbol (what it does and, where its history explains it, why it exists) from its code, its ticket summaries and its commit history, bottom-up from members to types. (Until POC step 4.5 this was a separate *what* and *why*; the product owner merged them in 4.6.)
+5. **Embeddings:** the description text is embedded for search.
 
-Embeddings are made from the what/why text, not from code, so similarity search matches intent: "where do we handle user persistence" finds `UserRepository`. Structure and history need no LLM; the LLM is used only for ticket summaries and the what/why records.
+Embeddings are made from the description text, not from code, so similarity search matches intent: "where do we handle user persistence" finds `UserRepository`. Structure and history need no LLM; the LLM is used only for ticket summaries and the symbol descriptions.
 
 ## Interfaces
 
@@ -70,8 +70,8 @@ The `annatar` CLI is the primary interface, for people and coding agents alike: 
 
 | Command | Returns |
 | --- | --- |
-| `annatar search "<query>" [--kind] [--role] [--path]` | Ranked symbols with name, kind, file:line, what and why; no code |
-| `annatar show <fqn>` | Full what/why, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
+| `annatar search "<query>" [--kind] [--role] [--path]` | Ranked symbols with name, kind, file:line and description; no code |
+| `annatar show <fqn>` | Full description, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
 | `annatar module <path>` | Module summary and its main symbols; the entry point for an unfamiliar area |
 | `annatar trace <fqn> --depth <n>` | Transitive callers, so an agent or engineer sees what a change can break |
 
@@ -88,9 +88,9 @@ The index is built centrally and served locally. Symbols are identified by their
 
 Tables in `index.db`:
 
-- `symbols`: name, kind, file, line, what, why, content hash
+- `symbols`: name, kind, file, line, description, content hash
 - `edges`: src, dst, kind (call, import, implements)
-- `symbol_vec`: embeddings of the what/why text, not of the code
+- `symbol_vec`: embeddings of the description text, not of the code
 - `tickets`: one cached summary per ticket ID
 
 Vector search finds candidate symbols; plain joins and recursive CTEs over `edges` answer usage and blast-radius questions. No separate graph database is needed.
@@ -99,14 +99,14 @@ Vector search finds candidate symbols; plain joins and recursive CTEs over `edge
 
 - The LLM summaries are the expensive step; generating them once per commit saves the cost on every machine.
 - Only the central indexer holds credentials for the ticket system.
-- Everyone queries the same what/why, so answers are consistent.
+- Everyone queries the same descriptions, so answers are consistent.
 - Output: `index-<commit>.db` published as an artifact.
 
 **Local use** (the CLI next to the agent):
 
 - Downloads the index for the nearest main commit.
 - Re-extracts changed files on the current branch with tree-sitter, so structure and edges always match the working copy.
-- Marks what/why on changed symbols as `stale`, or regenerates it with a small local model; new symbols get a structure-only entry until the next central build.
+- Marks descriptions on changed symbols as `stale`, or regenerates it with a small local model; new symbols get a structure-only entry until the next central build.
 
 A separate hosted service only becomes worthwhile when several teams or many repositories need cross-repo search and access control.
 
@@ -141,7 +141,7 @@ Analysis starts from bugs and churn and then investigates the code structure the
 
 The intent index and its CLI come first; analysis follows on the data already collected.
 
-1. **MVP on one real repo:** symbols and edges, per-symbol history and tickets, ticket summaries, what/why, embeddings, the four CLI commands.
+1. **MVP on one real repo:** symbols and edges, per-symbol history and tickets, ticket summaries, symbol descriptions, embeddings, the four CLI commands.
 2. **Central build and local use:** CI job that publishes the index per commit, local overlay for branches.
 3. **Human access:** a search page for non-technical roles.
 4. **Analysis:** hotspots, temporal coupling, risk hints in `annatar show`.
@@ -150,6 +150,6 @@ The intent index and its CLI come first; analysis follows on the data already co
 
 - **Agent efficiency:** on tasks where the relevant code is known in advance, compare tokens and tool calls with and without Annatar. A good sign is an agent going from `annatar search` straight to the right file without grepping around.
 - **Agent quality:** fewer changes that break callers or contradict the original requirement.
-- **Summary accuracy:** hand-check a sample of what/why records against the code and tickets before relying on them.
+- **Summary accuracy:** hand-check a sample of symbol descriptions against the code and tickets before relying on them.
 - **Onboarding:** new engineers find the right area and its reasoning without asking a colleague first.
 - **Self-service:** non-technical roles answer "what does this part do" without pulling in an engineer.

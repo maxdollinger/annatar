@@ -8,8 +8,8 @@ Scope: **Java / Spring** only, **Jira** only (keys like `GRLD-123`), **Ollama** 
 
 ## What the POC has to prove
 
-1. **Quality:** what/why records generated from signature, Javadoc and ticket summaries are correct and useful.
-2. **Retrieval:** searching what/why by meaning finds the right class or method for a plain-language question.
+1. **Quality:** symbol descriptions generated from the code, its tickets and its commit history are correct and useful (until 4.5: separate what/why records; the product owner merged them into one description in 4.6).
+2. **Retrieval:** searching the descriptions by meaning finds the right class or method for a plain-language question.
 3. **Agent value:** a coding agent using the `annatar` CLI finds relevant code faster and with fewer tokens.
 
 Everything that doesn't help answer these three questions is in **Later**, at the end.
@@ -112,13 +112,13 @@ Runs as a stage of the index build (after history, on the build's transaction, b
 *Done when:* all available tickets have a summary; a rerun makes no LLM calls.
 *Note:* a stage after tickets writes English `llm_summary` / `llm_purpose` to the index `tickets` table; the prompt depends on the ticket alone (no parent), and `purpose` is empty (`NULL`) when the ticket gives no reason; sequential calls; the chat model is checked once before the build (missing → the run fails); the circuit breaker (first model failure or 5 invalid replies in a row) lives on the shared LLM client, so later stages honour it; `--no-llm` for cache-only runs, `temperature` 0 by default (`state.md` D-al–D-ap, D-ar, D-as). Verified on the full `argus` run: 79/79 tickets summarised, a rerun makes 0 chat calls (D-aq, open #27 closed).
 
-**4.3 Method and constructor what/why**
+**4.3 Method and constructor what/why** *(superseded by 4.6: the `what`/`why` pair became one `description`; selection, hold-back and caching below still apply)*
 *Goal:* every method and constructor has a one-line `what` and a `why`, stored by symbol in `index.db`.
 Input, built by a pure, tested function: signature, Javadoc, parent class name and role, and ticket summaries (the first ticket plus the most recent few, capped). If all its tickets are unavailable, use commit subjects instead. A method whose chosen available ticket has no summary this run (failed, or skipped after the breaker tripped; an invalid one falls back to the Jira title since the review fixes) is skipped this run rather than generated without it, so the cache never holds a what/why built from incomplete input; a `NULL` purpose is valid input and means the ticket gives no "why". Try it on one package with `--path` first and note time per symbol.
 *Done when:* `show` prints what/why for methods.
 *Note:* a stage after summaries (also on a non-git repository, code only) writes `what` / `why` columns on the index `symbols` row; besides signature, Javadoc and parent it sends a capped excerpt of the member's source (`describe.body_chars`, default 1500: on `argus` it made `what` concrete and stopped it guessing from ticket text); the first ticket is the oldest `first_date`, the recent ones the newest `last_date` (`describe.recent_tickets`, default 3), dates compared in UTC, ties by key; commit subjects (`describe.commit_subjects`, default 5, merges left out) only when no ticket is available; `why` is empty (`NULL`) when the history gives no reason (`state.md` D-at–D-aw). *Review fixes (D-az–D-bb):* only the *chosen* tickets can make a member incomplete — a ticket not fetched yet competes in the selection and blocks only when it would be chosen; permanent fetch failures are cached unavailable and, without Jira configured, uncached tickets count as unavailable; a ticket whose summary was *invalid* stands in with its Jira title (a summary missing because the breaker tripped or `--no-llm` still holds the member back); the source excerpt replaces the signature line.
 
-**4.4 Type what/why, bottom-up**
+**4.4 Type what/why, bottom-up** *(superseded by 4.6 like 4.3: types now get one `description`, built from their members' descriptions; bottom-up order and hold-back unchanged)*
 *Goal:* every type has a `what` and `why` built from its own context and its members' `what` lines.
 Process the deepest nested types first, so an outer class can include its nested types' `what` lines. Cap the input for large classes (e.g. public members first, then a fixed maximum). A type's history span is its whole body, so its tickets are effectively the file's tickets: cap those too. Because the input includes members' output, a changed method misses the cache for its class when its `what` text changes and it is one of the listed members (within the cap); a change that leaves its `what` as it was, or a member left out by the cap, keeps the class's cache entry.
 *Done when:* `show` prints what/why for types, including a large class and a nested class.
@@ -128,18 +128,23 @@ Process the deepest nested types first, so an outer class can include its nested
 *Goal:* evidence that the records are trustworthy, and a fixed benchmark for retrieval.
 Review 20–30 symbols you know well against the code and tickets; adjust prompts. Write 15–20 plain-language questions, each with the fqn it should find, as a test fixture.
 *Done when:* you'd trust the records you reviewed; the golden set exists. **This answers question 1.**
-*Note:* the review is in [`quality_review_4_5.md`](./quality_review_4_5.md) (34 symbols, 13 tickets, before/after; verdicts pending the product owner's confirmation). It led to stricter `why` prompts: a reason only when the history explains this member or type itself, none from a project name alone, always empty for accessors, `equals`/`hashCode`/`toString` and field-storing constructors (prompt-only, ≈ 85 % followed), nested types not inheriting their file's reason; ticket purposes empty for title-only tickets; type `what`s do not expand abbreviations (`state.md` D-bj, D-bk). The golden set format is TOML (`[[question]] text, expect = [fqn, alternates…], kind?, note?`), loaded and validated by `golden::GoldenSet`; `golden::check_index` reports expected fqns an index lacks. Real golden sets name employer packages, so they stay out of git (`.annatar-local/golden-argus.toml`, 24 questions for `argus`; also because a real set is only usable against the private index); the repository holds a synthetic fixture for the sample project. Questions are written from code and tickets, never by paraphrasing generated what/why (D-bl).
+*Note:* the review is in [`quality_review_4_5.md`](./quality_review_4_5.md) (34 symbols, 13 tickets, before/after; verdicts pending the product owner's confirmation). It led to stricter `why` prompts: a reason only when the history explains this member or type itself, none from a project name alone, always empty for accessors, `equals`/`hashCode`/`toString` and field-storing constructors (prompt-only, ≈ 85 % followed), nested types not inheriting their file's reason; ticket purposes empty for title-only tickets; type `what`s do not expand abbreviations (`state.md` D-bj, D-bk). The golden set format is TOML (`[[question]] text, expect = [fqn, alternates…], kind?, note?`), loaded and validated by `golden::GoldenSet`; `golden::check_index` reports expected fqns an index lacks. Real golden sets name employer packages, so they stay out of git (`.annatar-local/golden-argus.toml`, 24 questions for `argus`; also because a real set is only usable against the private index); the repository holds a synthetic fixture for the sample project. Questions are written from code and tickets, never by paraphrasing generated what/why (D-bl). *After 4.6:* the review judged the what/why records; question 1 is re-checked for the single description by 4.6's spot check, and the golden set (fqns only) is unaffected.
+
+**4.6 Symbol descriptions (product-owner redesign, 2026-10-04)**
+*Goal:* every method, constructor and type has one general `description` instead of the separate `what` and `why`.
+Product owner: "Move from the pure what / why to a simple general symbol description with the code itself the ticket and the commit history as context. There should be no length limit only the instruction to describe it as short as possible." One response field `description` (members `Description`, types `TypeDescription`, `deny_unknown_fields`) and one `description` column on `symbols` in place of `what`/`why`. The prompt asks for a description of what the symbol does, as short as possible, and the reason it exists only when its tickets or commits explain it for this symbol (same anti-borrowing and anti-invention guidance as 4.5). Context: the code (members: the capped source excerpt, `describe.body_chars`; types: the outline plus their members' and nested types' descriptions, bottom-up), the chosen tickets with their 4.2 summary and purpose (title fallback as in 4.3), and **always** the newest `describe.commit_subjects` distinct commit subjects (merges left out), no longer only when no ticket is available. No length limit in prompt or validation; `finish_reason=length` truncation detection (4.1) stays. Validation: non-blank, no control characters, no ticket key, no "This method/This class…" opener, no talk about sources or missing information; whitespace collapsed before storing (`state.md` D-bm–D-bp).
+*Done when:* `show` prints `description` for every described symbol; a rerun makes 0 chat calls; a spot check of the 4.5 sample against the code is in `state.md`.
 
 ## Phase 5 — Search and agent trial
 
 **5.1 Embeddings**
-*Goal:* every symbol with what/why has a vector in a searchable index.
-Embed `fqn + what + why` through the embedding cache. Take the dimension from the first embedding response, not from config. Store it in an `F32_BLOB(<dim>)` column with a `libsql_vector_idx` index.
-*Done when:* every symbol with what/why has a vector.
+*Goal:* every symbol with a description has a vector in a searchable index.
+Embed `fqn + description` through the embedding cache (was `fqn + what + why` before 4.6). Take the dimension from the first embedding response, not from config. Store it in an `F32_BLOB(<dim>)` column with a `libsql_vector_idx` index.
+*Done when:* every symbol with a description has a vector.
 
 **5.2 `annatar search "<query>"`**
-*Goal:* a plain-language question returns the top-k symbols with fqn, what, why and file:line.
-Use `vector_top_k`, with optional kind and role filters. The CLI is the agents' interface too (D-ax): results and errors on stdout/stderr are stable, compact lines an agent can read without a parser, logs go to stderr only (`state.md` open #29), and `show` gives the detail view (what, why, tickets, parent, children, file:line).
+*Goal:* a plain-language question returns the top-k symbols with fqn, description and file:line.
+Use `vector_top_k`, with optional kind and role filters. The CLI is the agents' interface too (D-ax): results and errors on stdout/stderr are stable, compact lines an agent can read without a parser, logs go to stderr only (`state.md` open #29), and `show` gives the detail view (description, tickets, commits, parent, children, file:line).
 *Done when:* a query for a known responsibility lists the right class.
 
 **5.3 Evaluate**
