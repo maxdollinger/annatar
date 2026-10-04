@@ -128,6 +128,7 @@ Process the deepest nested types first, so an outer class can include its nested
 *Goal:* evidence that the records are trustworthy, and a fixed benchmark for retrieval.
 Review 20–30 symbols you know well against the code and tickets; adjust prompts. Write 15–20 plain-language questions, each with the fqn it should find, as a test fixture.
 *Done when:* you'd trust the records you reviewed; the golden set exists. **This answers question 1.**
+*Note:* the review is in [`quality_review_4_5.md`](./quality_review_4_5.md) (34 symbols, 13 tickets, before/after; verdicts pending the product owner's confirmation). It led to stricter `why` prompts: a reason only when the history explains this member or type itself, none from a project name alone, always empty for accessors, `equals`/`hashCode`/`toString` and field-storing constructors, nested types not inheriting their file's reason; ticket purposes empty for title-only tickets; type `what`s do not expand abbreviations (`state.md` D-bj, D-bk). The golden set format is TOML (`[[question]] text, expect = [fqn, alternates…], kind?, note?`), loaded and validated by `golden::GoldenSet`; `golden::check_index` reports expected fqns an index lacks. Real golden sets name employer packages, so they stay out of git (`.annatar-local/golden-argus.toml`, 20 questions for `argus`); the repository holds a synthetic fixture for the sample project. Questions are written from code and tickets, never by paraphrasing generated what/why (D-bl).
 
 ## Phase 5 — Search and agent trial
 
@@ -144,6 +145,7 @@ Use `vector_top_k`, with optional kind and role filters. The CLI is the agents' 
 **5.3 Evaluate**
 *Goal:* a measured retrieval quality.
 Run the golden set; report how often the expected fqn is in the top 1 and top 5.
+The set is `.annatar-local/golden-argus.toml` (outside git, D-bl), loaded with `golden::GoldenSet::load`; run `golden::check_index` first so a renamed symbol fails loudly instead of counting as a miss. Score the first `expect` entry and, separately, "any of `expect`" (the alternates); report types and methods apart (`kind`).
 *Done when:* numbers are in the PR. **This answers question 2.**
 
 **5.4 Agent trial**

@@ -1,0 +1,32 @@
+# Synthetic golden set for tests/fixtures/sample-project. The format of the
+# real golden sets (kept out of git, see md/state.md D-bl): each question is
+# written from the code, not from generated what/why text; `expect` holds the
+# symbol it is about first, then acceptable alternates.
+
+[[question]]
+text = "Which HTTP endpoint returns all accounts?"
+expect = ["com.acme.sample.UserController#list()"]
+kind = "method"
+
+[[question]]
+text = "How is one account looked up by its numeric key?"
+expect = [
+  "com.acme.sample.UserService#find(Long)",
+  "com.acme.sample.UserController#get(Long)",
+]
+kind = "method"
+note = "the service does the lookup; the endpoint that delegates to it is acceptable too"
+
+[[question]]
+text = "Where is the account stored in the database?"
+expect = ["com.acme.sample.User"]
+kind = "class"
+
+[[question]]
+text = "What does the API send back when a request fails?"
+expect = ["com.acme.sample.UserController.ErrorResponse"]
+kind = "class"
+
+[[question]]
+text = "Can we query accounts by their e-mail address?"
+expect = ["com.acme.sample.UserRepository#findByEmail(String)"]
