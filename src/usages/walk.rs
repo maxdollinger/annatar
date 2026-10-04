@@ -17,6 +17,11 @@ use super::{Edge, EdgeKind, Usages};
 pub(super) struct Region {
     pub(super) types: HashSet<String>,
     pub(super) type_vars: HashSet<String>,
+    /// The first bound of a bounded type variable among them, as written
+    /// (`<T extends Msg>`): a variable or parameter of the type `T` is
+    /// typed by it, its erasure. A name declared twice in the region (a
+    /// method of an anonymous class) has none.
+    pub(super) bounds: HashMap<String, Vec<String>>,
 }
 
 /// One anonymous or local class around the current node.
@@ -292,19 +297,33 @@ impl<'a> FileWalk<'_, 'a> {
                 let Some(first) = segments.first() else {
                     return Ty::Unknown;
                 };
+                if let [var] = segments.as_slice()
+                    && let Some(bound) = self.region.bounds.get(*var)
+                {
+                    let bound: Vec<&str> = bound.iter().map(String::as_str).collect();
+                    return match bound.first() {
+                        Some(first) if self.is_type_name(first) => self.resolved_ty(&bound),
+                        _ => Ty::Unknown,
+                    };
+                }
                 if !self.is_type_name(first) {
                     return Ty::Unknown;
                 }
-                match self
-                    .resolver
-                    .resolve_type(self.file, self.scope(), &segments)
-                {
-                    Lookup::Found(fqn) => Ty::Indexed(fqn, 0),
-                    Lookup::Ambiguous(_) => Ty::Unknown,
-                    Lookup::External | Lookup::Unknown => {
-                        Ty::External(segments[segments.len() - 1].to_string(), 0)
-                    }
-                }
+                self.resolved_ty(&segments)
+            }
+        }
+    }
+
+    /// The type a dotted type name stands for in the current scope.
+    fn resolved_ty(&self, segments: &[&str]) -> Ty {
+        match self
+            .resolver
+            .resolve_type(self.file, self.scope(), segments)
+        {
+            Lookup::Found(fqn) => Ty::Indexed(fqn, 0),
+            Lookup::Ambiguous(_) => Ty::Unknown,
+            Lookup::External | Lookup::Unknown => {
+                Ty::External(segments[segments.len() - 1].to_string(), 0)
             }
         }
     }
@@ -664,16 +683,33 @@ impl<'a> FileWalk<'_, 'a> {
 /// see [`Region`].
 fn scan_region(root: Node<'_>, source: &str) -> Region {
     let mut region = Region::default();
+    let mut twice = HashSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         let mut cursor = node.walk();
         match node.kind() {
             "type_parameter" => {
-                if let Some(name) = node
-                    .named_children(&mut cursor)
+                let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+                if let Some(name) = children
+                    .iter()
                     .find(|child| child.kind() == "type_identifier")
                 {
-                    region.type_vars.insert(node_text(name, source).to_string());
+                    let name = node_text(*name, source).to_string();
+                    let mut bound = Vec::new();
+                    if let Some(first) = children
+                        .iter()
+                        .find(|child| child.kind() == "type_bound")
+                        .and_then(|bound| bound.named_child(0))
+                        && type_segments(first, source, &mut bound)
+                    {
+                        region.bounds.insert(
+                            name.clone(),
+                            bound.into_iter().map(str::to_string).collect(),
+                        );
+                    }
+                    if !region.type_vars.insert(name.clone()) {
+                        twice.insert(name);
+                    }
                 }
             }
             kind if type_kind(kind).is_some() && node != root => {
@@ -685,6 +721,7 @@ fn scan_region(root: Node<'_>, source: &str) -> Region {
         }
         stack.extend(node.children(&mut cursor));
     }
+    region.bounds.retain(|name, _| !twice.contains(name));
     region
 }
 

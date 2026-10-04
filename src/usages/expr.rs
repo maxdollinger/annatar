@@ -448,7 +448,7 @@ impl<'a> FileWalk<'_, 'a> {
             return Ty::Unknown;
         }
         self.calls_to(&chosen, EdgeKind::Call, line);
-        self.return_type(&chosen)
+        self.return_type(&[], &chosen)
     }
 
     /// A call of `name` on a receiver of the types `owners`: the methods
@@ -467,7 +467,7 @@ impl<'a> FileWalk<'_, 'a> {
             .choose(self.resolver.methods(owners, name), args);
         if !chosen.is_empty() {
             self.calls_to(&chosen, EdgeKind::Call, line);
-            return self.return_type(&chosen);
+            return self.return_type(owners, &chosen);
         }
         match self.resolver.implicit(owners, name, args.len()) {
             Some((owner, ty)) => {
@@ -514,12 +514,14 @@ impl<'a> FileWalk<'_, 'a> {
         }
     }
 
-    /// The return type the chosen methods agree on.
-    fn return_type(&self, chosen: &[Method<'a>]) -> Ty {
+    /// The return type the chosen methods agree on, called on a receiver
+    /// of the types `owners`: a type variable of an inherited method's type
+    /// is the type argument the receiver's type gives it.
+    fn return_type(&self, owners: &[String], chosen: &[Method<'a>]) -> Ty {
         let mut types = chosen.iter().map(|method| {
             method.facts.return_type.as_ref().map_or(Ty::Unknown, |ty| {
                 self.resolver
-                    .declared(method.owner, ty, &method.facts.type_params)
+                    .declared_via(owners, method.owner, ty, &method.facts.type_params)
             })
         });
         let Some(first) = types.next() else {
@@ -1225,5 +1227,91 @@ class O {
                 ("this#toString".to_string(), 2),
             ]
         );
+    }
+
+    #[test]
+    fn an_inherited_member_returns_the_type_argument_its_super_type_gives() {
+        let (edges, usages) = resolve_all(&[
+            (
+                "a/Bearer.java",
+                "\
+package a;
+import lombok.Getter;
+class Bearer<T> {
+    T payload;
+    T getPayload() { return payload; }
+}
+class Mid<X> extends Bearer<X> {}
+@Getter
+class Holder<T> { private T item; }
+class Data { void id() {} }
+class AddMessage extends Mid<Data> {
+    void self() { getPayload().id(); }
+}
+class DataHolder extends Holder<Data> {}
+",
+            ),
+            (
+                "a/Consumer.java",
+                "\
+package a;
+class Consumer {
+    void consume(AddMessage message, DataHolder holder, Bearer<Data> raw) {
+        message.getPayload().id();
+        message.payload.id();
+        holder.getItem().id();
+        raw.getPayload().id();
+    }
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            edges_with(&edges, "-call-> a.Data#id()"),
+            [
+                "a.AddMessage#self() -call-> a.Data#id() :12",
+                "a.Consumer#consume(AddMessage,DataHolder,Bearer<Data>) -call-> a.Data#id() :4",
+                "a.Consumer#consume(AddMessage,DataHolder,Bearer<Data>) -call-> a.Data#id() :5",
+                "a.Consumer#consume(AddMessage,DataHolder,Bearer<Data>) -call-> a.Data#id() :6",
+            ]
+        );
+        assert_eq!(unresolved_calls(&usages), [("?#id".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_variable_of_a_bounded_type_variable_is_typed_by_its_bound() {
+        let calls = calls(&[(
+            "a/Publisher.java",
+            "\
+package a;
+class Msg { String type() { return null; } }
+class Publisher {
+    <T extends Msg> void send(T message) { message.type(); }
+    <U> void raw(U message) { message.type(); }
+}
+",
+        )]);
+        assert_eq!(calls, ["a.Publisher#send(T) -call-> a.Msg#type() :4"]);
+    }
+
+    #[test]
+    fn a_bound_does_not_leak_into_a_variable_of_the_same_name() {
+        let calls = calls(&[(
+            "a/Publisher.java",
+            "\
+package a;
+class Msg { String type() { return null; } }
+class Publisher {
+    <T> void run(T value) {
+        new Runnable() {
+            public void run() {}
+            <T extends Msg> void go(T t) {}
+        };
+        value.type();
+    }
+}
+",
+        )]);
+        assert!(calls.is_empty(), "{calls:?}");
     }
 }

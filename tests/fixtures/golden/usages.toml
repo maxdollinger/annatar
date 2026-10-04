@@ -1,0 +1,37 @@
+# Synthetic usage golden set for tests/fixtures/sample-project. The format of
+# the real usage golden sets (kept out of git, see md/usages_state.md): each
+# symbol with its true direct users, found by reading the code.
+
+[[symbol]]
+fqn = "com.acme.sample.UserService"
+kind = "class"
+users = [
+  "com.acme.sample.UserController",
+  "com.acme.sample.UserController#<init>(UserService)",
+  "com.acme.sample.UserController#list()",
+  "com.acme.sample.UserController#get(Long)",
+]
+note = "a type's users roll up its members' callers"
+
+[[symbol]]
+fqn = "com.acme.sample.UserService#find(Long)"
+kind = "method"
+users = ["com.acme.sample.UserController#get(Long)"]
+overridden_by = []
+note = "the Long overload, not find(String)"
+
+[[symbol]]
+fqn = "com.acme.sample.UserService#find(String)"
+users = []
+
+[[symbol]]
+fqn = "com.acme.sample.User"
+users = [
+  "com.acme.sample.UserController#list()",
+  "com.acme.sample.UserController#get(Long)",
+  "com.acme.sample.UserService#findAll()",
+  "com.acme.sample.UserService#find(Long)",
+  "com.acme.sample.UserService#find(String)",
+  "com.acme.sample.UserRepository",
+  "com.acme.sample.UserRepository#findByEmail(String)",
+]

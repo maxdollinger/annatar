@@ -87,7 +87,7 @@ For a coding agent, add this to the repository's `AGENTS.md` / `CLAUDE.md`:
 Descriptions can be wrong; the code is the source of truth.
 ```
 
-Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only), `-v` (logs on stderr). Everything else (output formats, filters, `eval`, how each stage works) is in [`md/reference.md`](./md/reference.md).
+Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only), `-v` (logs on stderr). Everything else (output formats, filters, `eval`, `eval-usages`, how each stage works) is in [`md/reference.md`](./md/reference.md).
 
 ## POC findings
 

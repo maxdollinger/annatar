@@ -107,8 +107,23 @@ static FQN: LazyLock<Regex> = LazyLock::new(|| {
     .expect("the fqn pattern is valid")
 });
 
+/// Whether `fqn` has the shape of a type or member fqn.
+pub(crate) fn is_fqn(fqn: &str) -> bool {
+    FQN.is_match(fqn)
+}
+
+/// Whether `fqn` can name a symbol of `kind`: a member has `#`, a
+/// constructor `#<init>(`.
+pub(crate) fn kind_fits(kind: SymbolKind, fqn: &str) -> bool {
+    match kind {
+        SymbolKind::Constructor => fqn.contains("#<init>("),
+        SymbolKind::Method => fqn.contains('#') && !fqn.contains("#<init>("),
+        _ => !fqn.contains('#'),
+    }
+}
+
 /// `kind` with its indefinite article ("a class", "an interface").
-fn with_article(kind: &str) -> String {
+pub(crate) fn with_article(kind: &str) -> String {
     let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
         "an"
     } else {
@@ -161,7 +176,7 @@ impl GoldenSet {
             };
             let mut fqns = HashSet::new();
             for fqn in &question.expect {
-                if !FQN.is_match(fqn) {
+                if !is_fqn(fqn) {
                     anyhow::bail!("question {number}: {fqn:?} is not a fully qualified name");
                 }
                 if !fqns.insert(fqn) {
@@ -177,14 +192,7 @@ impl GoldenSet {
                             SymbolKind::ALL.map(|kind| kind.as_str())
                         )
                     })?;
-                    let fits = match kind {
-                        SymbolKind::Constructor => primary.contains("#<init>("),
-                        SymbolKind::Method => {
-                            primary.contains('#') && !primary.contains("#<init>(")
-                        }
-                        _ => !primary.contains('#'),
-                    };
-                    if !fits {
+                    if !kind_fits(kind, primary) {
                         anyhow::bail!(
                             "question {number}: {primary} is not {}",
                             with_article(kind.as_str())

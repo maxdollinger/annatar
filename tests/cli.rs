@@ -475,6 +475,60 @@ fn eval_takes_no_path() {
     );
 }
 
+#[test]
+fn eval_usages_scores_the_edges_without_ollama() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    let set = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/usages.toml");
+
+    let eval = annatar(dir.path(), &["eval-usages", set.to_str().unwrap()]);
+
+    assert!(eval.status.success(), "{}", text(&eval.stderr));
+    let stdout = text(&eval.stdout);
+    assert!(
+        stdout
+            .starts_with("1. P 1.000 R 1.000 (4/4, 4 found) [types] com.acme.sample.UserService\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with(
+            "all 4: P 1.000 R 1.000 (12/12, 12 found)\n\
+             types 2: P 1.000 R 1.000 (11/11, 11 found)\n\
+             members 2: P 1.000 R 1.000 (1/1, 1 found)\n\
+             overridden by 1: P - R - (0/0, 0 found)\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn eval_usages_fails_on_a_renamed_symbol_and_takes_no_path() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    std::fs::write(
+        dir.path().join("usages.toml"),
+        "[[symbol]]\nfqn = \"com.acme.sample.UserService#lookup(Long)\"\nusers = []\n",
+    )
+    .unwrap();
+
+    let eval = annatar(dir.path(), &["eval-usages", "usages.toml"]);
+    let with_path = annatar(dir.path(), &["--path", "src", "eval-usages", "usages.toml"]);
+
+    assert_eq!(eval.status.code(), Some(1));
+    assert_eq!(text(&eval.stdout), "");
+    assert_eq!(
+        text(&eval.stderr),
+        "error: the usage golden set does not match the index: com.acme.sample.UserService#lookup(Long) is not in the index (\"symbol 1\")\n"
+    );
+    assert_eq!(with_path.status.code(), Some(1));
+    assert_eq!(
+        text(&with_path.stderr),
+        "error: eval-usages scores the whole index and takes no --path\n"
+    );
+}
+
 #[tokio::test]
 async fn search_prints_files_by_default_and_symbols_on_request() {
     let dir = workspace();
