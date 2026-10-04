@@ -306,6 +306,7 @@ mod tests {
     use crate::indexer::build_index;
     use crate::store::{IndexReader, Store};
     use crate::test_support::{commit, init_repo};
+    use crate::tickets::JiraMode;
     use regex::Regex;
 
     const SOURCE: &str = "\
@@ -330,7 +331,7 @@ public class Widget {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
-        build_index(&store, repo.path(), None, &regex, None, None)
+        build_index(&store, repo.path(), None, &regex, &JiraMode::Disabled, None)
             .await
             .unwrap();
         (repo, data)
@@ -423,7 +424,7 @@ com.acme.show.Widget [class]
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
-        build_index(&store, repo.path(), None, &regex, None, None)
+        build_index(&store, repo.path(), None, &regex, &JiraMode::Disabled, None)
             .await
             .unwrap();
         drop(store);

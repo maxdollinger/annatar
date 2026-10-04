@@ -589,6 +589,13 @@ impl LlmClient {
         self.cache_only.load(Ordering::Relaxed)
     }
 
+    /// Start counting invalid completions in a row from zero; each LLM stage
+    /// calls it first, so a streak in one stage cannot trip the breaker in
+    /// the next one.
+    pub fn reset_invalid_streak(&self) {
+        self.consecutive_invalid.store(0, Ordering::Relaxed);
+    }
+
     /// Trip the circuit breaker: cache-only from now on, one warning.
     fn trip(&self, reason: &str) {
         if !self.cache_only.swap(true, Ordering::Relaxed) {
@@ -1533,6 +1540,34 @@ mod tests {
         let err = llm.complete::<Summary>("next").await.unwrap_err();
         assert!(is_unavailable(&err), "{err:#}");
         assert_eq!(backend.chats().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn reset_invalid_streak_starts_the_count_again() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        for round in 0..MAX_CONSECUTIVE_INVALID - 1 {
+            backend.reply(&["x", "x"]);
+            llm.complete::<Summary>(&format!("bad {round}"))
+                .await
+                .unwrap_err();
+        }
+        llm.reset_invalid_streak();
+        for round in 0..MAX_CONSECUTIVE_INVALID - 1 {
+            backend.reply(&["x", "x"]);
+            llm.complete::<Summary>(&format!("next stage {round}"))
+                .await
+                .unwrap_err();
+        }
+        assert!(
+            !llm.is_cache_only(),
+            "{} invalid in a row across a reset do not trip the breaker",
+            2 * (MAX_CONSECUTIVE_INVALID - 1)
+        );
+        backend.reply(&["x", "x"]);
+        llm.complete::<Summary>("last").await.unwrap_err();
+        assert!(llm.is_cache_only());
     }
 
     #[tokio::test]

@@ -22,7 +22,8 @@
 //!    its enclosing type and its tickets' summaries (or commit subjects);
 //!    runs after summaries, also on a repository without git (code only).
 //!
-//! The type what/why stage slots in after describe the same way. A stage never commits: the transaction commits and the temporary file is
+//! The type what/why stage slots in after describe the same way. A stage
+//! never commits: the transaction commits and the temporary file is
 //! atomically renamed over `index.db` exactly once, after the last stage. Any
 //! stage error drops the transaction and the build, leaving the previous index
 //! untouched.
@@ -43,7 +44,7 @@ use libsql::{Connection, Transaction, params};
 use regex::Regex;
 
 use crate::describe::{
-    Description, Member, MemberCommit, MemberTicket, Parent, TicketState, member_prompt,
+    Description, Member, MemberCommit, MemberTicket, Parent, Summary, TicketState, member_prompt,
     select_history, validate_description,
 };
 use crate::history::{self, Commit, HistoryCache};
@@ -53,7 +54,8 @@ use crate::store::Store;
 use crate::summaries::{Summarizer, TicketSummary, ticket_prompt, validate_summary};
 use crate::symbols::{JavaParser, Symbol};
 use crate::tickets::{
-    CachedTicket, Fetched, TicketCache, TicketFetch, check_auth_with_retry, fetch_with_retry,
+    CachedTicket, Fetched, JiraMode, TicketCache, TicketFetch, check_auth_with_retry,
+    fetch_with_retry,
 };
 use crate::walk;
 
@@ -84,10 +86,13 @@ pub struct IndexStats {
     pub ticket_hits: usize,
     /// Keys fetched from Jira this run and cached with content.
     pub tickets_fetched: usize,
-    /// Keys Jira answered 403/404 for this run, cached as unavailable.
+    /// Keys that failed permanently this run (403/404, another 4xx except
+    /// 408/425/429, an unparseable issue, not a Jira key), cached as
+    /// unavailable.
     pub tickets_unavailable: usize,
-    /// Keys whose fetch failed this run (rate limit after retries, transport,
-    /// other status, unparseable response); not cached, retried next run.
+    /// Keys whose fetch failed transiently this run (rate limit after
+    /// retries, transport, 5xx, a response that is not JSON); not cached,
+    /// retried next run.
     pub tickets_failed: usize,
     /// Keys missing from the cache that were not fetched because Jira is not
     /// configured, has no token, the run is `--offline`, or the circuit
@@ -129,8 +134,8 @@ pub struct IndexStats {
     /// Members whose chat call failed (backend error; trips the breaker).
     pub describe_failed: usize,
     /// Members not described because their input is incomplete this run: a
-    /// chosen ticket has no summary, or a ticket was never fetched. Described
-    /// on a later run that has it.
+    /// chosen ticket was not fetched yet or has no summary (circuit breaker,
+    /// `--no-llm`). Described on a later run that has it.
     pub describe_incomplete: usize,
     /// Members not sent to the model: no `[ollama]` section, or not in the
     /// LLM cache with `--no-llm` or after the circuit breaker tripped.
@@ -172,10 +177,11 @@ pub struct IndexStats {
 /// changes still gets history, which may be mis-attributed because `-L`
 /// resolves its span against `HEAD`, but that history is never cached.
 ///
-/// `jira` is how missing tickets are fetched; `None` (offline, or Jira not
-/// configured) still copies already-cached tickets into the index but makes no
-/// request. Bad Jira credentials abort the run; see `index_tickets` for the
-/// other outcomes.
+/// `jira` is how missing tickets are fetched; [`JiraMode::Offline`] and
+/// [`JiraMode::Disabled`] still copy already-cached tickets into the index but
+/// make no request (with `Disabled` the describe stage treats the uncached
+/// ones as unavailable). Bad Jira credentials abort the run; see
+/// `index_tickets` for the other outcomes.
 ///
 /// `llm` summarises the available tickets and describes every method and
 /// constructor; `None` (no `[ollama]` section) leaves them without a summary
@@ -188,7 +194,7 @@ pub async fn build_index(
     repo: &Path,
     path_prefix: Option<&Path>,
     ticket_regex: &Regex,
-    jira: Option<&TicketFetch>,
+    jira: &JiraMode,
     llm: Option<&Summarizer>,
 ) -> Result<IndexStats> {
     anyhow::ensure!(
@@ -228,6 +234,7 @@ pub async fn build_index(
     let run_before = llm_stats();
 
     let indexed = index_structure(&transaction, repo, &files, &mut stats).await?;
+    let mut invalid_summaries = HashSet::new();
     if is_repo {
         index_history(
             &transaction,
@@ -240,11 +247,23 @@ pub async fn build_index(
         .await?;
         index_tickets(&transaction, store.cache(), jira, &mut stats).await?;
         let before = llm_stats();
-        index_summaries(&transaction, llm, &mut stats).await?;
+        invalid_summaries = index_summaries(&transaction, llm, &mut stats).await?;
         stats.summary_llm = llm_stats().since(&before);
     }
     let before = llm_stats();
-    index_descriptions(&transaction, &indexed, llm, &mut stats).await?;
+    let unknown_tickets = match jira {
+        JiraMode::Disabled => UnknownTickets::Unavailable,
+        JiraMode::Fetch(_) | JiraMode::Offline => UnknownTickets::Pending,
+    };
+    index_descriptions(
+        &transaction,
+        &indexed,
+        llm,
+        &invalid_summaries,
+        unknown_tickets,
+        &mut stats,
+    )
+    .await?;
     stats.describe_llm = llm_stats().since(&before);
     stats.llm = llm_stats().since(&run_before);
 
@@ -509,7 +528,7 @@ async fn index_history(
 async fn index_tickets(
     transaction: &Transaction,
     cache_conn: &Connection,
-    jira: Option<&TicketFetch>,
+    jira: &JiraMode,
     stats: &mut IndexStats,
 ) -> Result<()> {
     let keys = distinct_ticket_keys(transaction).await?;
@@ -536,8 +555,8 @@ async fn index_tickets(
     }
 
     match jira {
-        Some(jira) => fetch_tickets(&cache, jira, missing, &mut known, stats).await?,
-        None => stats.tickets_not_fetched += missing.len(),
+        JiraMode::Fetch(jira) => fetch_tickets(&cache, jira, missing, &mut known, stats).await?,
+        JiraMode::Offline | JiraMode::Disabled => stats.tickets_not_fetched += missing.len(),
     }
     if stats.tickets_failed > 0 {
         tracing::warn!(
@@ -625,17 +644,24 @@ async fn fetch_tickets(
                     ..ticket
                 })
             }
-            Err(FetchError::Unavailable { status }) => {
+            Err(err @ FetchError::Unauthorized { .. }) => {
+                return Err(anyhow::Error::new(err))
+                    .with_context(|| format!("fetching ticket {key}"));
+            }
+            Err(err) if err.is_permanent() => {
+                if !matches!(err, FetchError::Unavailable { .. }) {
+                    tracing::warn!(
+                        key,
+                        error = %err,
+                        "ticket cannot be fetched; caching it as unavailable"
+                    );
+                }
                 stats.tickets_unavailable += 1;
-                if let Err(err) = cache.put_unavailable(&key, status).await {
+                if let Err(err) = cache.put_unavailable(&key, err.status()).await {
                     tracing::warn!(key, error = format!("{err:#}"), "could not cache ticket");
                 }
                 known.insert(key, CachedTicket::Unavailable);
                 continue;
-            }
-            Err(err @ FetchError::Unauthorized { .. }) => {
-                return Err(anyhow::Error::new(err))
-                    .with_context(|| format!("fetching ticket {key}"));
             }
             Err(err) => {
                 tracing::warn!(key, error = %err, "could not fetch ticket; skipping it this run");
@@ -688,17 +714,22 @@ async fn fetch_tickets(
 /// stage, only cached summaries are used and the rest count as
 /// `summaries_skipped`. Without a summarizer every available ticket is
 /// `summaries_skipped`. Only an index write error fails the stage.
+///
+/// Returns the keys whose summary was invalid, for the describe stage's
+/// title fallback.
 async fn index_summaries(
     transaction: &Transaction,
     llm: Option<&Summarizer>,
     stats: &mut IndexStats,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
     let tickets = available_tickets(transaction).await?;
     stats.summary_tickets = tickets.len();
+    let mut invalid = HashSet::new();
     let Some(llm) = llm else {
         stats.summaries_skipped += tickets.len();
-        return Ok(());
+        return Ok(invalid);
     };
+    llm.client.reset_invalid_streak();
     let started = std::time::Instant::now();
     for (done, ticket) in tickets.iter().enumerate() {
         let prompt = ticket_prompt(ticket);
@@ -719,6 +750,7 @@ async fn index_summaries(
                     "no valid ticket summary; skipping it this run"
                 );
                 stats.summaries_invalid += 1;
+                invalid.insert(ticket.key.clone());
                 continue;
             }
             Err(err) => {
@@ -754,10 +786,41 @@ async fn index_summaries(
             invalid = stats.summaries_invalid,
             failed = stats.summaries_failed,
             skipped = stats.summaries_skipped,
+            invalid_keys = key_list(&invalid),
             "some tickets got no summary this run; they are asked again next run"
         );
     }
-    Ok(())
+    Ok(invalid)
+}
+
+/// Most keys a warning lists.
+const MAX_LISTED_KEYS: usize = 10;
+
+/// `keys` sorted and joined, at most [`MAX_LISTED_KEYS`] of them, then how
+/// many more.
+fn key_list<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
+    let keys: std::collections::BTreeSet<&String> = keys.into_iter().collect();
+    let mut list = keys
+        .iter()
+        .take(MAX_LISTED_KEYS)
+        .map(|key| key.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if keys.len() > MAX_LISTED_KEYS {
+        list.push_str(&format!(" (+{} more)", keys.len() - MAX_LISTED_KEYS));
+    }
+    list
+}
+
+/// What the describe stage makes of a member's ticket that is not in the
+/// index `tickets` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownTickets {
+    /// Jira may fetch it on a later run (`--offline`, a transient failure):
+    /// a member that would choose it waits.
+    Pending,
+    /// Jira is not configured: it is never fetched, so it is unavailable.
+    Unavailable,
 }
 
 /// The available tickets in the index `tickets` table, by key.
@@ -802,8 +865,12 @@ async fn write_summary(conn: &Connection, key: &str, summary: &TicketSummary) ->
 /// Members are taken in walk and source order and asked one at a time (the
 /// host Ollama serves one request at a time, D-ap). Each prompt is built by
 /// [`member_prompt`] from the member alone, so a rerun hits the LLM cache. A
-/// member whose input is incomplete (a chosen ticket without a summary, an
-/// unfetched ticket) is `describe_incomplete` and not asked. Invalid replies,
+/// chosen ticket whose summary was invalid this run (`invalid_summaries`)
+/// stands in with its Jira title. A member whose input is incomplete (a
+/// chosen ticket not fetched yet, or without a summary because the breaker
+/// tripped or `--no-llm`) is `describe_incomplete` and not asked; one warning
+/// lists the blocking keys. Tickets not in the index count as unavailable
+/// when `unknown_tickets` says so (Jira not configured). Invalid replies,
 /// backend failures and the circuit breaker behave as in `index_summaries`
 /// (the breaker is shared, so a tripped summaries stage leaves this one
 /// cache-only). Without a summarizer every member is `describe_skipped`. Only
@@ -812,6 +879,8 @@ async fn index_descriptions(
     transaction: &Transaction,
     files: &[IndexedFile],
     llm: Option<&Summarizer>,
+    invalid_summaries: &HashSet<String>,
+    unknown_tickets: UnknownTickets,
     stats: &mut IndexStats,
 ) -> Result<()> {
     let members: Vec<(&IndexedFile, &IndexedSymbol)> = files
@@ -830,9 +899,11 @@ async fn index_descriptions(
         .filter(|indexed| indexed.symbol.kind.is_type())
         .map(|indexed| (indexed.symbol.fqn.as_str(), &indexed.symbol))
         .collect();
-    let mut tickets = member_tickets(transaction).await?;
+    let mut tickets = member_tickets(transaction, invalid_summaries, unknown_tickets).await?;
     let mut commits = member_commits(transaction).await?;
     let config = &llm.describe;
+    let mut blocking = HashSet::new();
+    llm.client.reset_invalid_streak();
     let started = std::time::Instant::now();
     for (done, (file, indexed)) in members.iter().enumerate() {
         let symbol = &indexed.symbol;
@@ -844,6 +915,7 @@ async fn index_descriptions(
             Ok(history) => history,
             Err(incomplete) => {
                 tracing::debug!(fqn = %symbol.fqn, reason = %incomplete, "member input incomplete; not described this run");
+                blocking.extend(incomplete.keys().cloned());
                 stats.describe_incomplete += 1;
                 continue;
             }
@@ -927,6 +999,7 @@ async fn index_descriptions(
             failed = stats.describe_failed,
             incomplete = stats.describe_incomplete,
             skipped = stats.describe_skipped,
+            blocking_tickets = key_list(&blocking),
             "some methods got no what/why this run; they are asked again next run"
         );
     }
@@ -934,12 +1007,19 @@ async fn index_descriptions(
 }
 
 /// Every member's tickets with what the index `tickets` table knows about
-/// them, by symbol id.
-async fn member_tickets(conn: &Connection) -> Result<HashMap<i64, Vec<MemberTicket>>> {
+/// them, by symbol id. A ticket whose summary is missing because it was
+/// invalid (`invalid_summaries`) gets its Jira title instead; a ticket not in
+/// the table is [`TicketState::Unknown`] or, per `unknown_tickets`,
+/// unavailable.
+async fn member_tickets(
+    conn: &Connection,
+    invalid_summaries: &HashSet<String>,
+    unknown_tickets: UnknownTickets,
+) -> Result<HashMap<i64, Vec<MemberTicket>>> {
     let mut rows = conn
         .query(
             "SELECT st.symbol_id, st.ticket_key, st.first_date, st.last_date,
-                    t.unavailable, t.issue_type, t.llm_summary, t.llm_purpose
+                    t.unavailable, t.issue_type, t.llm_summary, t.llm_purpose, t.summary
              FROM symbol_tickets st LEFT JOIN tickets t ON t.key = st.ticket_key",
             (),
         )
@@ -947,22 +1027,36 @@ async fn member_tickets(conn: &Connection) -> Result<HashMap<i64, Vec<MemberTick
         .context("reading member tickets")?;
     let mut tickets: HashMap<i64, Vec<MemberTicket>> = HashMap::new();
     while let Some(row) = rows.next().await.context("reading member ticket row")? {
+        let key: String = row.get(1).context("reading symbol_tickets.ticket_key")?;
         let unavailable: Option<i64> = row.get(4).context("reading tickets.unavailable")?;
         let issue_type: Option<String> = row.get(5).context("reading tickets.issue_type")?;
         let state = match (unavailable, issue_type) {
-            (None, _) => TicketState::Unknown,
-            (Some(0), Some(issue_type)) => TicketState::Available {
-                issue_type,
-                summary: row.get(6).context("reading tickets.llm_summary")?,
-                purpose: row.get(7).context("reading tickets.llm_purpose")?,
-            },
+            (None, _) if unknown_tickets == UnknownTickets::Pending => TicketState::Unknown,
+            (Some(0), Some(issue_type)) => {
+                let summary: Option<String> = row.get(6).context("reading tickets.llm_summary")?;
+                let title: Option<String> = row.get(8).context("reading tickets.summary")?;
+                let summary = match (summary, title) {
+                    (Some(summary), _) => Summary::Model {
+                        summary,
+                        purpose: row.get(7).context("reading tickets.llm_purpose")?,
+                    },
+                    (None, Some(title)) if invalid_summaries.contains(&key) => {
+                        Summary::Title(title)
+                    }
+                    (None, _) => Summary::Missing,
+                };
+                TicketState::Available {
+                    issue_type,
+                    summary,
+                }
+            }
             _ => TicketState::Unavailable,
         };
         tickets
             .entry(row.get(0).context("reading symbol_tickets.symbol_id")?)
             .or_default()
             .push(MemberTicket {
-                key: row.get(1).context("reading symbol_tickets.ticket_key")?,
+                key,
                 first_date: row.get(2).context("reading symbol_tickets.first_date")?,
                 last_date: row.get(3).context("reading symbol_tickets.last_date")?,
                 state,
@@ -1327,9 +1421,22 @@ mod tests {
         Regex::new(DEFAULT_TICKET_REGEX).unwrap()
     }
 
+    /// `jira` as the run's Jira mode; `None` is `--offline`.
+    fn jira_mode(jira: Option<&TicketFetch>) -> JiraMode {
+        jira.map_or(JiraMode::Offline, |jira| JiraMode::Fetch(jira.clone()))
+    }
+
     async fn build(repo: &Path, data_dir: &Path) -> Result<IndexStats> {
         let store = Store::open(data_dir).await.unwrap();
-        build_index(&store, repo, None, &ticket_regex(), None, None).await
+        build_index(
+            &store,
+            repo,
+            None,
+            &ticket_regex(),
+            &JiraMode::Disabled,
+            None,
+        )
+        .await
     }
 
     async fn id_of(conn: &Connection, fqn: &str) -> i64 {
@@ -1590,7 +1697,7 @@ public class UserService {
             Path::new("/does/not/exist"),
             None,
             &ticket_regex(),
-            None,
+            &JiraMode::Disabled,
             None,
         )
         .await
@@ -1680,9 +1787,16 @@ public class UserService {
 
     async fn index_git_repo(repo: &Path, data: &Path) -> IndexStats {
         let store = Store::open(data).await.unwrap();
-        build_index(&store, repo, None, &ticket_regex(), None, None)
-            .await
-            .unwrap()
+        build_index(
+            &store,
+            repo,
+            None,
+            &ticket_regex(),
+            &JiraMode::Disabled,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn row_count(conn: &Connection, table: &str, symbol_id: i64) -> i64 {
@@ -2372,9 +2486,16 @@ public class UserService {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
 
-        build_index(&store, repo.path(), None, &ticket_regex(), None, None)
-            .await
-            .unwrap();
+        build_index(
+            &store,
+            repo.path(),
+            None,
+            &ticket_regex(),
+            &JiraMode::Disabled,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             fqns(data.path()).await,
             vec!["com.acme.a.A", "com.acme.b.B"]
@@ -2385,7 +2506,7 @@ public class UserService {
             repo.path(),
             Some(Path::new("src/main/java/com/acme/a")),
             &ticket_regex(),
-            None,
+            &JiraMode::Disabled,
             None,
         )
         .await
@@ -2404,7 +2525,7 @@ public class UserService {
         jira: Option<&TicketFetch>,
     ) -> Result<IndexStats> {
         let store = Store::open(data).await.unwrap();
-        build_index(&store, repo, None, &ticket_regex(), jira, None).await
+        build_index(&store, repo, None, &ticket_regex(), &jira_mode(jira), None).await
     }
 
     /// A git repo whose one file was committed once per message.
@@ -2560,6 +2681,53 @@ public class UserService {
         assert_eq!(second.tickets_failed, 1);
         assert_eq!(source.calls_for("GRLD-1"), 2);
         assert_eq!(cache_count(data.path(), "ticket_cache").await, 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_fetch_failures_are_cached_as_unavailable() {
+        let repo = repo_with_commits(&["GRLD-1 add", "GRLD-2 change", "GRLD-3 fix", "GRLD-4 x"]);
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Status(400)]);
+        source.script("GRLD-2", &[Answer::Parse]);
+        source.script("GRLD-3", &[Answer::Status(500)]);
+        source.script("GRLD-4", &[Answer::Status(408)]);
+        let jira = fake::instant(source.clone(), 4);
+
+        let first = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.tickets_unavailable, 2,
+            "400 and the unparseable issue"
+        );
+        assert_eq!(first.tickets_failed, 2, "500 and 408 are transient");
+        assert_ticket_buckets(&first);
+        assert_eq!(ticket_cache_keys(data.path()).await, ["GRLD-1", "GRLD-2"]);
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query(
+                "SELECT key FROM tickets WHERE unavailable = 1 ORDER BY key",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut unavailable = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            unavailable.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(unavailable, ["GRLD-1", "GRLD-2"]);
+
+        let second = index_with(repo.path(), data.path(), Some(&jira))
+            .await
+            .unwrap();
+        assert_eq!(second.ticket_hits, 2);
+        assert_eq!(second.tickets_failed, 2);
+        assert_eq!(source.calls_for("GRLD-1"), 1, "never asked again");
+        assert_eq!(source.calls_for("GRLD-2"), 1);
+        assert_eq!(source.calls_for("GRLD-3"), 2);
+        assert_eq!(source.calls_for("GRLD-4"), 2);
     }
 
     #[tokio::test]
@@ -2968,9 +3136,16 @@ public class UserService {
     ) -> IndexStats {
         let store = Store::open(data).await.unwrap();
         let llm = summarizer(&store, backend, cache_only);
-        let stats = build_index(&store, repo, None, &ticket_regex(), jira, Some(&llm))
-            .await
-            .unwrap();
+        let stats = build_index(
+            &store,
+            repo,
+            None,
+            &ticket_regex(),
+            &jira_mode(jira),
+            Some(&llm),
+        )
+        .await
+        .unwrap();
         assert_summary_buckets(&stats);
         stats
     }
@@ -3225,7 +3400,7 @@ public class UserService {
             repo.path(),
             None,
             &ticket_regex(),
-            Some(&jira),
+            &JiraMode::Fetch(jira.clone()),
             Some(&llm),
         )
         .await
@@ -3313,6 +3488,17 @@ public class UserService {
         backend: &Arc<FakeBackend>,
         cache_only: bool,
     ) -> IndexStats {
+        describe_in(repo, data, path, &jira_mode(jira), backend, cache_only).await
+    }
+
+    async fn describe_in(
+        repo: &Path,
+        data: &Path,
+        path: Option<&Path>,
+        jira: &JiraMode,
+        backend: &Arc<FakeBackend>,
+        cache_only: bool,
+    ) -> IndexStats {
         let store = Store::open(data).await.unwrap();
         let config = OllamaConfig {
             url: "http://localhost:11434".to_string(),
@@ -3382,16 +3568,23 @@ public class UserService {
         let prompts = describe_prompts(&backend);
         let prompt = &prompts[0];
         assert!(
-            prompt.contains("Declared in: class com.acme.Service\nKind: method\nSignature: public int value()\nJavadoc: (none)\n"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("        return 1;") || prompt.contains("    return 1;"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("- Created for GRLD-1 (Story): Adds the service.\n  Reason: Users need it.\nCONTEXT>>>"),
-            "GRLD-2 is unavailable and left out: {prompt}"
+            prompt.ends_with(
+                "\
+<<<CONTEXT
+Declared in: class com.acme.Service
+Kind: method
+Javadoc: (none)
+Source:
+public int value() {
+    return 1;
+}
+Change history (the work it was created for, then the most recent changes, newest first):
+- Created for GRLD-1 (Story): Adds the service.
+  Reason: Users need it.
+CONTEXT>>>
+"
+            ),
+            "the source is dedented and GRLD-2 (unavailable) left out: {prompt}"
         );
         assert_eq!(
             what_why(data.path(), "com.acme.Service#value()").await,
@@ -3427,25 +3620,22 @@ public class UserService {
     }
 
     #[tokio::test]
-    async fn member_with_an_unsummarised_ticket_waits_for_its_summary() {
+    async fn invalid_ticket_summary_falls_back_to_the_jira_title() {
         let repo = repo_with_commits(&["GRLD-1 add"]);
         let data = tempfile::tempdir().unwrap();
         let jira = jira_with(&[fake::ticket("GRLD-1")]);
         let backend = FakeBackend::new();
-        backend.reply(&[BLANK, BLANK]);
+        backend.reply(&[BLANK, BLANK, WHAT_WHY]);
 
         let first =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
 
         assert_eq!(first.summaries_invalid, 1);
-        assert_eq!(first.describe_incomplete, 1);
-        assert_eq!(
-            first.describe_llm.chat_calls, 0,
-            "not described without the summary"
-        );
-        assert_eq!(
-            what_why(data.path(), "com.acme.Service#value()").await,
-            (None, None)
+        assert_eq!(first.described, 1, "described from the Jira title");
+        let prompt = &describe_prompts(&backend)[0];
+        assert!(
+            prompt.ends_with("- Created for GRLD-1 (Story): Summary of GRLD-1\nCONTEXT>>>\n"),
+            "{prompt}"
         );
 
         let backend = FakeBackend::new();
@@ -3454,6 +3644,10 @@ public class UserService {
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
 
         assert_eq!(second.described, 1);
+        assert_eq!(
+            second.described_cached, 0,
+            "a valid summary changes the prompt"
+        );
         assert_eq!(
             what_why(data.path(), "com.acme.Service#value()").await,
             (Some("Returns the value.".to_string()), None),
@@ -3465,6 +3659,130 @@ public class UserService {
             .unwrap();
         assert!(output.contains("- what: Returns the value.\n"), "{output}");
         assert!(!output.contains("- why:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn tripped_summaries_serve_cached_members_and_hold_back_the_rest() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        for name in ["A", "B", "C"] {
+            write(
+                repo.path(),
+                &format!("src/main/java/com/acme/{name}.java"),
+                &java_class(name, 1),
+            );
+        }
+        commit(repo.path(), "GRLD-1 add", "2024-01-01T00:00:00+00:00");
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1"), fake::ticket("GRLD-3")]);
+        let backend = FakeBackend::new();
+        backend.always("TicketSummary", BRIEF);
+        backend.always("Description", WHAT_WHY);
+        let first =
+            describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
+        assert_eq!(first.described, 3);
+
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            &java_class("B", 2),
+        );
+        commit(repo.path(), "GRLD-3 change B", "2024-01-02T00:00:00+00:00");
+        write(
+            repo.path(),
+            "src/main/java/com/acme/C.java",
+            &java_class("C", 2),
+        );
+        commit(repo.path(), "Tidy C", "2024-01-03T00:00:00+00:00");
+        let down = FakeBackend::new();
+        let stats = describe_with(repo.path(), data.path(), None, Some(&jira), &down, false).await;
+
+        assert_eq!(stats.summaries_failed, 1, "GRLD-3 trips the breaker");
+        assert_eq!(down.chats().len(), 1, "no chat call after the failure");
+        assert_eq!(stats.described, 1);
+        assert_eq!(stats.described_cached, 1, "A is unchanged");
+        assert_eq!(
+            stats.describe_incomplete, 1,
+            "B chose GRLD-3, which has no summary"
+        );
+        assert_eq!(stats.describe_skipped, 1, "C changed and is not cached");
+        assert_eq!(stats.describe_llm.chat_calls, 0);
+        assert_eq!(
+            what_why(data.path(), "com.acme.A#value()").await.0,
+            Some("Returns the configured value.".to_string())
+        );
+        assert_eq!(
+            what_why(data.path(), "com.acme.B#value()").await,
+            (None, None)
+        );
+        assert_eq!(
+            what_why(data.path(), "com.acme.C#value()").await,
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_streak_does_not_carry_into_the_describe_stage() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            "package com.acme;\nclass Service {\n    int a() { return 1; }\n    int b() { return 2; }\n}\n",
+        );
+        commit(
+            repo.path(),
+            "GRLD-1 GRLD-2 GRLD-3 GRLD-4 add",
+            "2024-01-01T00:00:00+00:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+        let keys = ["GRLD-1", "GRLD-2", "GRLD-3", "GRLD-4"];
+        let jira = jira_with(&keys.map(fake::ticket));
+        let backend = FakeBackend::new();
+        let bad = r#"{"what": " ", "why": ""}"#;
+        backend.reply(&[
+            BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, bad, bad, WHAT_WHY,
+        ]);
+
+        let stats =
+            describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
+
+        assert_eq!(stats.summaries_invalid, MAX_CONSECUTIVE_INVALID - 1);
+        assert_eq!(stats.describe_invalid, 1);
+        assert_eq!(
+            stats.described, 1,
+            "the fifth invalid reply in a row is the stage's first, so b() is still asked"
+        );
+        assert_eq!(stats.describe_skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn without_jira_unfetched_tickets_count_as_unavailable() {
+        let repo = repo_with_commits(&["GRLD-1 add", "Tidy up"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.reply(&[WHAT_WHY]);
+
+        let stats = describe_in(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
+            &backend,
+            false,
+        )
+        .await;
+
+        assert_eq!(stats.tickets_not_fetched, 1);
+        assert_eq!(stats.describe_incomplete, 0);
+        assert_eq!(stats.described, 1);
+        let prompt = &describe_prompts(&backend)[0];
+        assert!(
+            prompt.contains(
+                "Change history (commit messages, newest first):\n- Tidy up\n- GRLD-1 add\nCONTEXT>>>"
+            ),
+            "{prompt}"
+        );
     }
 
     #[tokio::test]

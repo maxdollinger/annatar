@@ -181,8 +181,35 @@ pub enum FetchError {
     InvalidKey(String),
     /// Connection, TLS or timeout failure.
     Transport(reqwest::Error),
-    /// A success response that is not a parseable issue.
+    /// A success response that is JSON but not a parseable issue (e.g. no
+    /// summary).
     Parse(anyhow::Error),
+    /// A success response that is not JSON at all (a proxy or login page).
+    NotJson(anyhow::Error),
+}
+
+impl FetchError {
+    /// Whether asking again cannot help: the issue is unavailable, the key is
+    /// not a Jira key, the issue does not parse, or Jira answered a 4xx other
+    /// than 408, 425 and 429 (401 is [`FetchError::Unauthorized`]). The
+    /// ticket stage caches such keys as unavailable.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::Unavailable { .. } | Self::InvalidKey(_) | Self::Parse(_) => true,
+            Self::Status { status } => {
+                (400..500).contains(status) && !matches!(status, 408 | 425 | 429)
+            }
+            _ => false,
+        }
+    }
+
+    /// The HTTP status behind the error, if a non-success one was received.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Unavailable { status } | Self::Status { status } => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for FetchError {
@@ -224,6 +251,7 @@ impl fmt::Display for FetchError {
             Self::InvalidKey(key) => write!(f, "not a Jira key: {key:?}"),
             Self::Transport(err) => write!(f, "Jira request failed: {err}"),
             Self::Parse(err) => write!(f, "unexpected Jira response: {err:#}"),
+            Self::NotJson(err) => write!(f, "Jira response is not JSON: {err:#}"),
         }
     }
 }
@@ -376,7 +404,7 @@ impl JiraClient {
     pub async fn fetch(&self, key: &str) -> Result<Ticket, FetchError> {
         let body = self.send(self.request(key)?, status_error).await?;
         let json: Value =
-            serde_json::from_slice(&body).map_err(|err| FetchError::Parse(anyhow!(err)))?;
+            serde_json::from_slice(&body).map_err(|err| FetchError::NotJson(anyhow!(err)))?;
         parse_issue(&json, self.epic_link_field.as_deref()).map_err(FetchError::Parse)
     }
 

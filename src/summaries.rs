@@ -4,10 +4,12 @@
 //! [`ticket_prompt`] builds the prompt for one ticket (key, type, title and a
 //! capped description, fenced as data); the model answers with a
 //! [`TicketSummary`], which [`validate_summary`] checks (blank summary,
-//! overlong fields, control characters, text about the ticket itself, a
-//! purpose that restates the summary). The purpose is empty when the ticket
-//! gives no reason, so later stages know there is no "why". The summaries stage in [`crate::indexer`] runs it for every
-//! available ticket and stores the result in the index `tickets` table. Later
+//! overlong fields, control characters, a summary about the ticket itself, a
+//! purpose about its sources or missing information or one that restates the
+//! summary). The purpose is empty when the ticket gives no reason, so later
+//! stages know there is no "why". The summaries stage in [`crate::indexer`]
+//! runs it for every available ticket and stores the result in the index
+//! `tickets` table. Later
 //! prompts (method and type what/why) take these summaries as their "why"
 //! context, so they are short and say why the change was needed.
 //!
@@ -135,34 +137,76 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Phrases that talk about the ticket or about missing information instead
-/// of about the change; such a reply is invalid and asked again.
-const META_PHRASES: &[&str] = &[
-    "the ticket",
+/// Openers of a summary that talk about the ticket instead of the change.
+const SUMMARY_OPENERS: &[&str] = &["this ticket", "the ticket"];
+
+/// Phrases in a reason (a ticket's purpose, a member's `why`) that talk about
+/// the sources or about missing information instead of giving a reason; such
+/// a reply is invalid and asked again. Narrow on purpose, so ordinary domain
+/// text ("the ticket price", "if one is not provided", "for no reason")
+/// passes.
+pub(crate) const REASON_META_PHRASES: &[&str] = &[
     "this ticket",
-    "not stated",
-    "not specified",
-    "not mentioned",
-    "not provided",
-    "no reason",
+    "the ticket does",
+    "the ticket doesn't",
+    "the ticket states",
+    "the ticket says",
+    "the ticket mentions",
+    "the ticket specifies",
+    "the ticket gives",
+    "the ticket provides",
+    "according to the ticket",
+    "the commit",
+    "commit message",
+    "the javadoc",
+    "change history",
+    "not stated in",
+    "not specified in",
+    "not mentioned in",
+    "not provided in",
+    "not given in",
+    "no reason is given",
+    "no reason given",
+    "no reason is stated",
+    "no reason stated",
+    "no specific reason",
     "does not state",
     "doesn't state",
     "does not specify",
     "doesn't specify",
-    "does not mention",
-    "doesn't mention",
+];
+
+/// Whole replies that stand in for "no reason" instead of an empty string.
+const NO_REASON_REPLIES: &[&str] = &[
+    "not stated",
+    "not specified",
+    "not provided",
+    "not mentioned",
+    "no reason",
+    "unknown",
+    "none",
+    "n/a",
 ];
 
 /// Reject a blank summary, an overlong field, control characters other than
-/// whitespace, text about the ticket itself or about missing information, and
-/// a purpose that only restates the summary. An empty purpose is valid (no
-/// reason given). The message goes back to the model.
+/// whitespace, a summary that opens with the ticket itself, a purpose that
+/// talks about its sources or missing information, and a purpose that only
+/// restates the summary. An empty purpose is valid (no reason given). The
+/// message goes back to the model.
 pub fn validate_summary(summary: &TicketSummary) -> Result<(), String> {
     if summary.summary.trim().is_empty() {
         return Err("`summary` is blank".to_string());
     }
     check_field("summary", &summary.summary, MAX_SUMMARY_CHARS)?;
     check_field("purpose", &summary.purpose, MAX_PURPOSE_CHARS)?;
+    let meta = opener(&summary.summary, SUMMARY_OPENERS)
+        .map(|phrase| ("summary", phrase))
+        .or_else(|| reason_meta_phrase(&summary.purpose).map(|phrase| ("purpose", phrase)));
+    if let Some((name, phrase)) = meta {
+        return Err(format!(
+            "`{name}` says \"{phrase}\"; write about the change itself, not about the ticket or what it lacks (leave `purpose` empty if no reason is given)"
+        ));
+    }
     if summary.purpose_text().is_some() && restates(&summary.summary, &summary.purpose) {
         return Err(
             "`purpose` only restates `summary`; give the reason behind the change, or an empty string if there is none"
@@ -172,7 +216,9 @@ pub fn validate_summary(summary: &TicketSummary) -> Result<(), String> {
     Ok(())
 }
 
-fn check_field(name: &str, value: &str, max: usize) -> Result<(), String> {
+/// Reject a field longer than `max` characters or with control characters
+/// other than whitespace.
+pub(crate) fn check_field(name: &str, value: &str, max: usize) -> Result<(), String> {
     let chars = value.chars().count();
     if chars > max {
         return Err(format!(
@@ -182,13 +228,34 @@ fn check_field(name: &str, value: &str, max: usize) -> Result<(), String> {
     if value.chars().any(|c| c.is_control() && !c.is_whitespace()) {
         return Err(format!("`{name}` contains control characters"));
     }
-    let lower = value.to_lowercase();
-    if let Some(phrase) = META_PHRASES.iter().find(|phrase| lower.contains(*phrase)) {
-        return Err(format!(
-            "`{name}` says \"{phrase}\"; write about the change itself, not about the ticket or what it lacks (leave `purpose` empty if no reason is given)"
-        ));
-    }
     Ok(())
+}
+
+/// The one of `openers` that `text` starts with, ignoring case and leading
+/// whitespace.
+pub(crate) fn opener(text: &str, openers: &[&'static str]) -> Option<&'static str> {
+    let lower = text.trim_start().to_lowercase();
+    openers
+        .iter()
+        .copied()
+        .find(|phrase| lower.starts_with(phrase))
+}
+
+/// The meta phrase in `reason`: one of [`REASON_META_PHRASES`] anywhere, or
+/// the whole reply being a stand-in for "no reason" ("Not specified.").
+pub(crate) fn reason_meta_phrase(reason: &str) -> Option<&'static str> {
+    let lower = collapse_whitespace(reason).to_lowercase();
+    let bare = lower.trim_end_matches(['.', '!']);
+    NO_REASON_REPLIES
+        .iter()
+        .copied()
+        .find(|reply| bare == *reply)
+        .or_else(|| {
+            REASON_META_PHRASES
+                .iter()
+                .copied()
+                .find(|phrase| lower.contains(phrase))
+        })
 }
 
 /// Every content word of `purpose` (longer than three letters, compared by
@@ -438,10 +505,36 @@ TICKET>>>
             ("Adds X.", "Not stated."),
             ("This ticket adds X.", ""),
             ("Adds X.", "The reason is not specified in the description."),
+            ("Adds X.", "According to the ticket, users need it."),
+            ("Adds X.", "Unknown"),
         ] {
             let err = validate_summary(&summary(summary_text, purpose))
                 .expect_err("meta-text is invalid");
             assert!(err.contains("not about the ticket"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validation_accepts_domain_text_that_resembles_meta_text() {
+        for (summary_text, purpose) in [
+            (
+                "Shows the ticket price for the given event.",
+                "Customers must see the ticket price before buying.",
+            ),
+            (
+                "Uses the default page size when the size is not specified.",
+                "Clients sent oversized pages that overloaded the database.",
+            ),
+            (
+                "Falls back to the default locale if one is not provided.",
+                "Prevents sessions being revoked for no reason.",
+            ),
+        ] {
+            assert_eq!(
+                validate_summary(&summary(summary_text, purpose)),
+                Ok(()),
+                "{summary_text} / {purpose}"
+            );
         }
     }
 

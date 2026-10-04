@@ -2,7 +2,8 @@
 //!
 //! [`TicketCache`] stores one row per *requested* ticket key in `cache.db`
 //! (`ticket_cache`): the content fields of an available issue, or an
-//! unavailable marker for a 403/404, plus `fetched_at`. Keying by the
+//! unavailable marker for a 403/404 or another permanent failure
+//! ([`FetchError::is_permanent`]), plus `fetched_at`. Keying by the
 //! requested key matters because Jira answers a moved issue with its new key,
 //! and the index looks keys up by what the commits mention. Rows never expire;
 //! dropping the table refreshes them.
@@ -41,7 +42,7 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub enum CachedTicket {
     /// Fetched content. `key` is the requested key, not the one Jira returned.
     Available(Ticket),
-    /// Jira answered 403 or 404.
+    /// Jira answered 403 or 404, or failed permanently.
     Unavailable,
 }
 
@@ -94,14 +95,15 @@ impl<'a> TicketCache<'a> {
         Ok(())
     }
 
-    /// Mark `key` unavailable, recording the HTTP status Jira answered with.
-    pub async fn put_unavailable(&self, key: &str, status: u16) -> Result<()> {
+    /// Mark `key` unavailable, recording the HTTP status Jira answered with
+    /// (`None` for an invalid key or an unparseable issue).
+    pub async fn put_unavailable(&self, key: &str, status: Option<u16>) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO ticket_cache
                     (key, unavailable, status, issue_type, summary, description, parent_key, fetched_at)
                  VALUES (?1, 1, ?2, NULL, NULL, NULL, NULL, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-                params![key, status as i64],
+                params![key, status.map(i64::from)],
             )
             .await
             .with_context(|| format!("caching ticket {key} as unavailable"))?;
@@ -126,6 +128,19 @@ fn decode(key: &str, row: &Row) -> Result<CachedTicket> {
         description: row.get(3).context("reading ticket_cache.description")?,
         parent_key: row.get(4).context("reading ticket_cache.parent_key")?,
     }))
+}
+
+/// How an `index` run may reach Jira.
+#[derive(Clone)]
+pub enum JiraMode {
+    /// Fetch the tickets the cache lacks.
+    Fetch(TicketFetch),
+    /// `--offline`: Jira is configured but not called this run; a later run
+    /// may fetch the tickets the cache lacks.
+    Offline,
+    /// No `[jira]` section or no token: tickets the cache lacks are never
+    /// fetched, so later stages treat them as unavailable.
+    Disabled,
 }
 
 /// A ticket source plus the policy the ticket stage fetches with.
@@ -154,32 +169,42 @@ impl TicketFetch {
         }
     }
 
-    /// The Jira fetcher for an `index` run, or `None` when the ticket stage
-    /// must not call Jira: `offline`, no `[jira]` section, or no token. Each
-    /// skip logs once. A configured section that is otherwise invalid (bad
-    /// `base_url`, zero concurrency) is an error.
-    pub fn from_config(jira: Option<&JiraConfig>, offline: bool) -> Result<Option<Self>> {
+    /// How an `index` run reaches Jira: [`JiraMode::Disabled`] without a
+    /// `[jira]` section or a token (one warning, or an info log under
+    /// `offline`), [`JiraMode::Offline`] when `offline`, otherwise a fetcher.
+    /// A configured section that is otherwise invalid (bad `base_url`, zero
+    /// concurrency) is an error.
+    pub fn from_config(jira: Option<&JiraConfig>, offline: bool) -> Result<JiraMode> {
+        let jira = match jira {
+            None => Err("no [jira] section in the config".to_string()),
+            Some(jira) if jira.token.as_deref().is_none_or(str::is_empty) => {
+                Err(format!("{ENV_JIRA_TOKEN} is not set"))
+            }
+            Some(jira) => Ok(jira),
+        };
+        let jira = match jira {
+            Ok(jira) => jira,
+            Err(missing) => {
+                if offline {
+                    tracing::info!("{missing}; not fetching tickets, using cached tickets only");
+                } else {
+                    tracing::warn!("{missing}; not fetching tickets, using cached tickets only");
+                }
+                return Ok(JiraMode::Disabled);
+            }
+        };
         if offline {
             tracing::info!("--offline: not fetching tickets; using cached tickets only");
-            return Ok(None);
-        }
-        let Some(jira) = jira else {
-            tracing::warn!(
-                "no [jira] section in the config; not fetching tickets, using cached tickets only"
-            );
-            return Ok(None);
-        };
-        if jira.token.as_deref().is_none_or(str::is_empty) {
-            tracing::warn!(
-                "{ENV_JIRA_TOKEN} is not set; not fetching tickets, using cached tickets only"
-            );
-            return Ok(None);
+            return Ok(JiraMode::Offline);
         }
         if jira.concurrency == 0 {
             bail!("jira.concurrency must be at least 1");
         }
         let client = JiraClient::new(jira)?;
-        Ok(Some(Self::new(Arc::new(client), jira.concurrency)))
+        Ok(JiraMode::Fetch(Self::new(
+            Arc::new(client),
+            jira.concurrency,
+        )))
     }
 
     /// The wait before retry number `retry` (0-based) after a 429.
@@ -277,6 +302,8 @@ pub(crate) mod fake {
         ScopeMismatch,
         RateLimited(Option<Duration>),
         Status(u16),
+        /// A JSON response that is not a parseable issue.
+        Parse,
         /// A connection failure.
         Transport,
         /// Never answers, like a request to a host that hangs.
@@ -300,6 +327,7 @@ pub(crate) mod fake {
                 }),
                 Self::RateLimited(retry_after) => Err(FetchError::RateLimited { retry_after }),
                 Self::Status(status) => Err(FetchError::Status { status }),
+                Self::Parse => Err(FetchError::Parse(anyhow::anyhow!("no summary"))),
                 Self::Transport => Err(FetchError::Transport(
                     reqwest::Client::new()
                         .get("http://")
@@ -452,7 +480,7 @@ mod tests {
         moved.parent_key = Some("GRLD-5".to_string());
         moved.description = None;
         cache.put_available("GRLD-1", &moved).await.unwrap();
-        cache.put_unavailable("GRLD-2", 404).await.unwrap();
+        cache.put_unavailable("GRLD-2", Some(404)).await.unwrap();
 
         let Some(CachedTicket::Available(stored)) = cache.get("GRLD-1").await.unwrap() else {
             panic!("GRLD-1 should be cached with content");
@@ -586,32 +614,38 @@ mod tests {
         .unwrap()
     }
 
+    fn fetch_of(mode: JiraMode) -> TicketFetch {
+        match mode {
+            JiraMode::Fetch(fetch) => fetch,
+            _ => panic!("expected a fetcher"),
+        }
+    }
+
     #[test]
-    fn from_config_skips_fetching_without_jira_token_or_when_offline() {
-        assert!(TicketFetch::from_config(None, false).unwrap().is_none());
+    fn from_config_tells_disabled_from_offline() {
+        let disabled = |jira: Option<&JiraConfig>, offline: bool| {
+            matches!(
+                TicketFetch::from_config(jira, offline).unwrap(),
+                JiraMode::Disabled
+            )
+        };
+        assert!(disabled(None, false));
+        assert!(
+            disabled(None, true),
+            "--offline without Jira is still disabled"
+        );
 
         let mut jira = jira_config("");
-        assert!(
-            TicketFetch::from_config(Some(&jira), false)
-                .unwrap()
-                .is_none()
-        );
+        assert!(disabled(Some(&jira), false));
         jira.token = Some(String::new());
-        assert!(
-            TicketFetch::from_config(Some(&jira), false)
-                .unwrap()
-                .is_none()
-        );
+        assert!(disabled(Some(&jira), true));
 
         jira.token = Some("t".to_string());
-        assert!(
-            TicketFetch::from_config(Some(&jira), true)
-                .unwrap()
-                .is_none()
-        );
-        let fetch = TicketFetch::from_config(Some(&jira), false)
-            .unwrap()
-            .expect("configured with a token");
+        assert!(matches!(
+            TicketFetch::from_config(Some(&jira), true).unwrap(),
+            JiraMode::Offline
+        ));
+        let fetch = fetch_of(TicketFetch::from_config(Some(&jira), false).unwrap());
         assert_eq!(fetch.concurrency, 4);
     }
 
@@ -619,9 +653,7 @@ mod tests {
     fn from_config_reads_concurrency_and_rejects_bad_settings() {
         let mut jira = jira_config("concurrency = 2");
         jira.token = Some("t".to_string());
-        let fetch = TicketFetch::from_config(Some(&jira), false)
-            .unwrap()
-            .unwrap();
+        let fetch = fetch_of(TicketFetch::from_config(Some(&jira), false).unwrap());
         assert_eq!(fetch.concurrency, 2);
 
         jira.concurrency = 0;

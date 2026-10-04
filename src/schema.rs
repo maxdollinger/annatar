@@ -16,8 +16,8 @@ use libsql::Connection;
 /// order.
 pub const INDEX_TABLES: &[&str] = &[
     // 1.5 `symbols`. 4.3 adds the chat model's one-line `what` and `why`
-    // for methods and constructors (NULL when not described this run; `why`
-    // is also NULL when the history gives no reason); 4.4 fills them for
+    // for methods and constructors: NULL when not described this run, and
+    // `why` also NULL when the history gives no reason. 4.4 fills them for
     // types.
     "CREATE TABLE symbols (
         id INTEGER PRIMARY KEY,
