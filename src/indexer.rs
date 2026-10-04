@@ -210,8 +210,8 @@ pub struct IndexStats {
 /// `index_tickets` for the other outcomes.
 ///
 /// `llm` summarises the available tickets and describes every method,
-/// constructor and type; `None` (no `[ollama]` section) leaves them without a summary
-/// or description. Its chat model is checked once before the
+/// constructor and type; `None` (no `[ollama]` section) leaves them without
+/// a summary or description. Its chat model is checked once before the
 /// stages run: a model the server does not have fails the run (like rejected
 /// Jira credentials). Other LLM failures never fail the run; see
 /// `index_summaries`, `index_descriptions` and `index_type_descriptions`.
@@ -257,6 +257,12 @@ pub async fn build_index(
         .context("starting index transaction")?;
     let mut stats = IndexStats::default();
     let llm_stats = || llm.map(|llm| llm.client.stats()).unwrap_or_default();
+    let stage_start = || {
+        if let Some(llm) = llm {
+            llm.client.reset_peaks();
+        }
+        llm_stats()
+    };
     let run_before = llm_stats();
 
     let indexed = index_structure(&transaction, repo, &files, &mut stats).await?;
@@ -272,11 +278,11 @@ pub async fn build_index(
         )
         .await?;
         index_tickets(&transaction, store.cache(), jira, &mut stats).await?;
-        let before = llm_stats();
+        let before = stage_start();
         invalid_summaries = index_summaries(&transaction, llm, ticket_regex, &mut stats).await?;
         stats.summary_llm = llm_stats().since(&before);
     }
-    let before = llm_stats();
+    let before = stage_start();
     let unknown_tickets = match jira {
         JiraMode::Disabled => UnknownTickets::Unavailable,
         JiraMode::Fetch(_) | JiraMode::Offline => UnknownTickets::Pending,
@@ -288,10 +294,21 @@ pub async fn build_index(
     };
     let described = index_descriptions(&transaction, &indexed, llm, &inputs, &mut stats).await?;
     stats.describe_llm = llm_stats().since(&before);
-    let before = llm_stats();
+    let before = stage_start();
     index_type_descriptions(&transaction, &indexed, llm, &inputs, described, &mut stats).await?;
     stats.type_llm = llm_stats().since(&before);
     stats.llm = llm_stats().since(&run_before);
+    let stages = [&stats.summary_llm, &stats.describe_llm, &stats.type_llm];
+    stats.llm.peak_prompt_tokens = stages
+        .iter()
+        .map(|s| s.peak_prompt_tokens)
+        .max()
+        .unwrap_or(0);
+    stats.llm.peak_completion_tokens = stages
+        .iter()
+        .map(|s| s.peak_completion_tokens)
+        .max()
+        .unwrap_or(0);
 
     transaction
         .commit()
@@ -335,6 +352,8 @@ pub async fn build_index(
         chat_calls = stats.llm.chat_calls,
         chat_hits = stats.llm.chat_hits,
         chat_retries = stats.llm.chat_retries,
+        peak_prompt_tokens = stats.llm.peak_prompt_tokens,
+        peak_completion_tokens = stats.llm.peak_completion_tokens,
         empty = stats.empty,
         parse_errors = stats.parse_errors,
         unreadable = stats.unreadable,
@@ -905,7 +924,8 @@ async fn write_summary(conn: &Connection, key: &str, summary: &TicketSummary) ->
 }
 
 /// Describe stage: give every method and constructor the structure stage
-/// wrote a description from the chat model, stored on its `symbols` row. Runs after summaries, which it reads from the index `tickets` table.
+/// wrote a description from the chat model, stored on its `symbols` row.
+/// Runs after summaries, which it reads from the index `tickets` table.
 ///
 /// Members are taken in walk and source order and asked one at a time (the
 /// host Ollama serves one request at a time, D-ap). Each prompt is built by
@@ -3418,6 +3438,7 @@ public class UserService {
             embedding_model: "embed".to_string(),
             reasoning_effort: "none".to_string(),
             temperature: 0.0,
+            max_tokens: crate::config::DEFAULT_MAX_TOKENS,
         };
         let client = LlmClient::new(backend.clone(), store.connect_cache().unwrap(), &config);
         Summarizer::new(client, cache_only)
@@ -3826,6 +3847,7 @@ public class UserService {
             embedding_model: "embed".to_string(),
             reasoning_effort: "none".to_string(),
             temperature: 0.0,
+            max_tokens: crate::config::DEFAULT_MAX_TOKENS,
         };
         let client = LlmClient::new(backend.clone(), store.connect_cache().unwrap(), &config);
         let llm = Summarizer::new(client, cache_only).with_describe(describe);
@@ -4143,20 +4165,20 @@ CONTEXT>>>
         let data = tempfile::tempdir().unwrap();
         let jira = jira_with(&[]);
         let backend = FakeBackend::new();
-        backend.reply(&[DESCRIPTION]);
+        backend.always("Description", DESCRIPTION);
+        backend.always("TypeDescription", TYPE_DESCRIBED);
 
         let stats =
             describe_with(repo.path(), data.path(), None, Some(&jira), &backend, false).await;
 
         assert_eq!(stats.summary_tickets, 0);
         assert_eq!(stats.described, 1);
+        assert_eq!(stats.types_described, 1);
+        let history = "Tickets: (none)\nCommits (most recent messages, newest first):\n- Tidy up\n- GRLD-2 change\nCONTEXT>>>";
         let prompt = &describe_prompts(&backend)[0];
-        assert!(
-            prompt.contains(
-                "Tickets: (none)\nCommits (most recent messages, newest first):\n- Tidy up\n- GRLD-2 change\nCONTEXT>>>"
-            ),
-            "{prompt}"
-        );
+        assert!(prompt.contains(history), "{prompt}");
+        let prompt = &type_prompts(&backend)[0];
+        assert!(prompt.contains(history), "a type too: {prompt}");
     }
 
     #[tokio::test]

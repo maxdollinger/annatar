@@ -1,6 +1,6 @@
 # Synthetic golden set for tests/fixtures/sample-project. The format of the
 # real golden sets (kept out of git, see md/state.md D-bl): each question is
-# written from the code, not from generated what/why text; `expect` holds the
+# written from the code, not from generated descriptions; `expect` holds the
 # symbol it is about first, then acceptable alternates.
 
 [[question]]

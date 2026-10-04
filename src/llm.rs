@@ -7,7 +7,8 @@
 //! ([`LlmClient::complete_with`]). An invalid reply is retried once, with the
 //! bad reply and the error appended to the conversation; a second invalid
 //! reply is an [`InvalidOutput`] error and nothing is cached. A reply cut off
-//! at the token limit is logged as a warning and named in that error.
+//! at the token limit (`ollama.max_tokens`, a safety cap against runaway
+//! generation) is invalid too, logged as a warning and named in that error.
 //! [`LlmClient::embed`] returns one vector per text, sending only the texts the
 //! cache does not hold; all vectors of one call must have the same length.
 //!
@@ -17,8 +18,8 @@
 //!
 //! Both go through `cache.db`: `llm_cache` keyed by a hash of chat model,
 //! reasoning effort, temperature, canonical schema and prompt (the prompt is
-//! the full text, input included), `embedding_cache` keyed by a hash of embedding model and
-//! text. A changed key simply misses. Cache faults degrade: an unreadable,
+//! the full text, input included; `ollama.max_tokens` is not part of it),
+//! `embedding_cache` keyed by a hash of embedding model and text. A changed key simply misses. Cache faults degrade: an unreadable,
 //! undecodable or no longer valid row is a miss, a failed write warns and keeps
 //! the result. The client is shared by reference across concurrent tasks; give
 //! it its own connection ([`crate::store::Store::connect_cache`]) so its
@@ -40,7 +41,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -69,6 +70,11 @@ const HTTP_ATTEMPTS: usize = 2;
 
 /// Wait before retrying a transient failure.
 const TRANSIENT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Why a reply cut off at the token limit (`ollama.max_tokens`) is invalid,
+/// even when it parses: it never finished, so it is neither used nor cached.
+const TRUNCATED: &str =
+    "the reply was cut off before it finished; answer again without repeating yourself";
 
 /// Chat attempts per completion: the first and one retry on invalid output.
 pub const MAX_ATTEMPTS: usize = 2;
@@ -116,6 +122,8 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     /// Sampling temperature.
     pub temperature: f64,
+    /// `max_tokens` to send, if any: a safety cap on the reply.
+    pub max_tokens: Option<u32>,
 }
 
 /// One chat completion as the backend returned it.
@@ -342,6 +350,9 @@ fn chat_body(request: &ChatRequest) -> Value {
     if let Some(effort) = &request.reasoning_effort {
         body["reasoning_effort"] = json!(effort);
     }
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
     body
 }
 
@@ -489,11 +500,19 @@ pub struct LlmStats {
     pub embed_texts: usize,
     /// Input texts answered from `embedding_cache`.
     pub embed_hits: usize,
+    /// Most prompt tokens of one chat reply since the last
+    /// [`LlmClient::reset_peaks`] (0 without usage). A value close to the
+    /// model's context size suggests a truncated prompt.
+    pub peak_prompt_tokens: u64,
+    /// Most completion tokens of one chat reply since the last
+    /// [`LlmClient::reset_peaks`].
+    pub peak_completion_tokens: u64,
 }
 
 impl LlmStats {
     /// What happened between `earlier` (a snapshot of the same client) and
-    /// `self`.
+    /// `self`. Peaks are not differences: they are `self`'s, so reset them
+    /// when `earlier` is taken.
     pub fn since(&self, earlier: &LlmStats) -> LlmStats {
         LlmStats {
             chat_calls: self.chat_calls - earlier.chat_calls,
@@ -502,6 +521,8 @@ impl LlmStats {
             embed_calls: self.embed_calls - earlier.embed_calls,
             embed_texts: self.embed_texts - earlier.embed_texts,
             embed_hits: self.embed_hits - earlier.embed_hits,
+            peak_prompt_tokens: self.peak_prompt_tokens,
+            peak_completion_tokens: self.peak_completion_tokens,
         }
     }
 }
@@ -514,6 +535,8 @@ struct Counters {
     embed_calls: AtomicUsize,
     embed_texts: AtomicUsize,
     embed_hits: AtomicUsize,
+    peak_prompt_tokens: AtomicU64,
+    peak_completion_tokens: AtomicU64,
 }
 
 /// The cached, typed client. Share it by reference (or in an `Arc`) across
@@ -533,6 +556,7 @@ pub struct LlmClient {
     embedding_model: String,
     reasoning_effort: Option<String>,
     temperature: f64,
+    max_tokens: Option<u32>,
     counters: Counters,
     cache_only: AtomicBool,
     consecutive_invalid: AtomicUsize,
@@ -553,6 +577,7 @@ impl LlmClient {
             reasoning_effort: Some(config.reasoning_effort.clone())
                 .filter(|effort| !effort.is_empty()),
             temperature: normalized_temperature(config.temperature),
+            max_tokens: Some(config.max_tokens).filter(|max| *max > 0),
             counters: Counters::default(),
             cache_only: AtomicBool::new(false),
             consecutive_invalid: AtomicUsize::new(0),
@@ -575,7 +600,17 @@ impl LlmClient {
             embed_calls: c.embed_calls.load(Ordering::Relaxed),
             embed_texts: c.embed_texts.load(Ordering::Relaxed),
             embed_hits: c.embed_hits.load(Ordering::Relaxed),
+            peak_prompt_tokens: c.peak_prompt_tokens.load(Ordering::Relaxed),
+            peak_completion_tokens: c.peak_completion_tokens.load(Ordering::Relaxed),
         }
+    }
+
+    /// Start the token peaks of [`LlmStats`] from zero, e.g. per stage.
+    pub fn reset_peaks(&self) {
+        self.counters.peak_prompt_tokens.store(0, Ordering::Relaxed);
+        self.counters
+            .peak_completion_tokens
+            .store(0, Ordering::Relaxed);
     }
 
     /// Answer completions from the cache only from now on; no chat calls.
@@ -664,6 +699,7 @@ impl LlmClient {
             schema,
             reasoning_effort: self.reasoning_effort.clone(),
             temperature: self.temperature,
+            max_tokens: self.max_tokens,
         };
         let mut attempt = 1;
         loop {
@@ -685,15 +721,28 @@ impl LlmClient {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "chat reply"
             );
-            if reply.truncated() {
+            let peaks = [
+                (&self.counters.peak_prompt_tokens, reply.prompt_tokens),
+                (
+                    &self.counters.peak_completion_tokens,
+                    reply.completion_tokens,
+                ),
+            ];
+            for (peak, tokens) in peaks {
+                peak.fetch_max(tokens.unwrap_or(0), Ordering::Relaxed);
+            }
+            let checked = if reply.truncated() {
                 tracing::warn!(
                     r#type = %type_name,
                     attempt,
                     completion_tokens = ?reply.completion_tokens,
                     "chat reply was cut off at the token limit"
                 );
-            }
-            match decode(&reply.content) {
+                Err(TRUNCATED.to_string())
+            } else {
+                decode(&reply.content)
+            };
+            match checked {
                 Ok(value) => {
                     self.consecutive_invalid.store(0, Ordering::Relaxed);
                     if let Err(err) = self.store_completion(&key, reply.content.trim()).await {
@@ -1231,8 +1280,8 @@ mod tests {
     #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     struct Summary {
-        what: String,
-        why: String,
+        text: String,
+        note: String,
     }
 
     #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
@@ -1240,12 +1289,12 @@ mod tests {
         ok: bool,
     }
 
-    const SUMMARY: &str = r#"{"what": "Loads users.", "why": "Login needs them."}"#;
+    const SUMMARY: &str = r#"{"text": "Loads users.", "note": "Login needs them."}"#;
 
     fn summary() -> Summary {
         Summary {
-            what: "Loads users.".to_string(),
-            why: "Login needs them.".to_string(),
+            text: "Loads users.".to_string(),
+            note: "Login needs them.".to_string(),
         }
     }
 
@@ -1256,6 +1305,7 @@ mod tests {
             embedding_model: "embed".to_string(),
             reasoning_effort: "none".to_string(),
             temperature: 0.0,
+            max_tokens: crate::config::DEFAULT_MAX_TOKENS,
         }
     }
 
@@ -1320,7 +1370,7 @@ mod tests {
         assert_eq!(request.model, "chat");
         assert_eq!(request.messages, vec![Message::user("prompt")]);
         assert_eq!(request.schema_name, "Summary");
-        assert_eq!(request.schema["required"], json!(["what", "why"]));
+        assert_eq!(request.schema["required"], json!(["text", "note"]));
         assert_eq!(request.schema["additionalProperties"], json!(false));
         assert_eq!(request.reasoning_effort.as_deref(), Some("none"));
 
@@ -1332,7 +1382,79 @@ mod tests {
         );
         assert_eq!(body["reasoning_effort"], "none");
         assert_eq!(body["temperature"], json!(0.0));
+        assert_eq!(body["max_tokens"], json!(crate::config::DEFAULT_MAX_TOKENS));
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn zero_max_tokens_is_not_sent_and_the_cap_is_not_in_the_cache_key() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[SUMMARY]);
+        let mut config = ollama("chat");
+        config.max_tokens = 0;
+        let llm = client(&backend, &store, &config);
+        llm.complete::<Summary>("prompt").await.unwrap();
+
+        let request = &backend.chats()[0];
+        assert_eq!(request.max_tokens, None);
+        assert!(chat_body(request).get("max_tokens").is_none());
+
+        config.max_tokens = 64;
+        let capped = client(&backend, &store, &config);
+        assert_eq!(
+            capped.complete::<Summary>("prompt").await.unwrap(),
+            summary()
+        );
+        assert_eq!(
+            backend.chats().len(),
+            1,
+            "a complete reply is the same under any cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_cut_off_at_the_cap_is_invalid_even_when_it_parses() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply_with(ChatReply {
+            content: SUMMARY.to_string(),
+            finish_reason: Some("length".to_string()),
+            prompt_tokens: Some(700),
+            completion_tokens: Some(1024),
+        });
+        backend.reply_with(ChatReply {
+            content: SUMMARY.to_string(),
+            finish_reason: Some("stop".to_string()),
+            prompt_tokens: Some(900),
+            completion_tokens: Some(20),
+        });
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        assert_eq!(llm.complete::<Summary>("prompt").await.unwrap(), summary());
+        let chats = backend.chats();
+        assert_eq!(chats.len(), 2);
+        assert!(
+            chats[1].messages[2]
+                .content
+                .contains("cut off before it finished"),
+            "{:?}",
+            chats[1].messages
+        );
+        let stats = llm.stats();
+        assert_eq!(stats.chat_retries, 1);
+        assert_eq!(
+            (stats.peak_prompt_tokens, stats.peak_completion_tokens),
+            (900, 1024)
+        );
+        let later = stats;
+        llm.reset_peaks();
+        let stage = llm.stats().since(&later);
+        assert_eq!(
+            (stage.peak_prompt_tokens, stage.peak_completion_tokens),
+            (0, 0)
+        );
+        assert_eq!(count(&store, "llm_cache").await, 1);
     }
 
     #[tokio::test]
@@ -1394,7 +1516,7 @@ mod tests {
     async fn invalid_reply_is_retried_once_with_the_error() {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
-        backend.reply(&[r#"{"what": "Loads users."}"#, SUMMARY]);
+        backend.reply(&[r#"{"text": "Loads users."}"#, SUMMARY]);
         let llm = client(&backend, &store, &ollama("chat"));
 
         assert_eq!(llm.complete::<Summary>("prompt").await.unwrap(), summary());
@@ -1404,10 +1526,10 @@ mod tests {
         let retry = &chats[1].messages;
         assert_eq!(retry.len(), 3);
         assert_eq!(retry[0], Message::user("prompt"));
-        assert_eq!(retry[1], Message::assistant(r#"{"what": "Loads users."}"#));
+        assert_eq!(retry[1], Message::assistant(r#"{"text": "Loads users."}"#));
         assert_eq!(retry[2].role, "user");
         assert!(
-            retry[2].content.contains("missing field `why`"),
+            retry[2].content.contains("missing field `note`"),
             "retry message should carry the error: {}",
             retry[2].content
         );
@@ -1422,7 +1544,7 @@ mod tests {
     async fn two_invalid_replies_fail_and_cache_nothing() {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
-        backend.reply(&["not json", r#"{"what": 1, "why": "x"}"#, SUMMARY]);
+        backend.reply(&["not json", r#"{"text": 1, "note": "x"}"#, SUMMARY]);
         let llm = client(&backend, &store, &ollama("chat"));
 
         let err = llm.complete::<Summary>("prompt").await.unwrap_err();
@@ -1430,7 +1552,7 @@ mod tests {
             .downcast_ref::<InvalidOutput>()
             .expect("an InvalidOutput error");
         assert_eq!(invalid.type_name, "Summary");
-        assert_eq!(invalid.output, r#"{"what": 1, "why": "x"}"#);
+        assert_eq!(invalid.output, r#"{"text": 1, "note": "x"}"#);
         assert!(err.to_string().contains("after 2 attempts"), "{err}");
         assert_eq!(backend.chats().len(), 2);
         assert_eq!(count(&store, "llm_cache").await, 0);
@@ -1662,8 +1784,8 @@ mod tests {
     }
 
     fn not_blank(summary: &Summary) -> Result<(), String> {
-        if summary.what.trim().is_empty() {
-            return Err("`what` is blank".to_string());
+        if summary.text.trim().is_empty() {
+            return Err("`text` is blank".to_string());
         }
         Ok(())
     }
@@ -1673,8 +1795,8 @@ mod tests {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
         backend.reply(&[
-            r#"{"what": "", "why": "x", "extra": 1}"#,
-            r#"{"what": " ", "why": "x"}"#,
+            r#"{"text": "", "note": "x", "extra": 1}"#,
+            r#"{"text": " ", "note": "x"}"#,
         ]);
         let llm = client(&backend, &store, &ollama("chat"));
 
@@ -1683,12 +1805,12 @@ mod tests {
             .await
             .unwrap_err();
         let invalid = err.downcast_ref::<InvalidOutput>().unwrap();
-        assert!(invalid.error.contains("`what` is blank"), "{err}");
+        assert!(invalid.error.contains("`text` is blank"), "{err}");
         let retry = &backend.chats()[1].messages[2].content;
         assert!(retry.contains("unknown field `extra`"), "{retry}");
         assert_eq!(count(&store, "llm_cache").await, 0);
 
-        backend.reply(&[r#"{"what": "", "why": "x"}"#, SUMMARY]);
+        backend.reply(&[r#"{"text": "", "note": "x"}"#, SUMMARY]);
         assert_eq!(
             llm.complete_with::<Summary, _>("prompt", not_blank)
                 .await
@@ -1696,7 +1818,7 @@ mod tests {
             summary()
         );
         let retry = &backend.chats()[3].messages[2].content;
-        assert!(retry.contains("`what` is blank"), "{retry}");
+        assert!(retry.contains("`text` is blank"), "{retry}");
         assert_eq!(count(&store, "llm_cache").await, 1);
     }
 
@@ -1704,7 +1826,7 @@ mod tests {
     async fn cached_reply_failing_the_check_is_a_miss() {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
-        backend.reply(&[r#"{"what": "", "why": "x"}"#, SUMMARY]);
+        backend.reply(&[r#"{"text": "", "note": "x"}"#, SUMMARY]);
         let llm = client(&backend, &store, &ollama("chat"));
         llm.complete::<Summary>("prompt").await.unwrap();
 
@@ -1722,7 +1844,7 @@ mod tests {
     async fn cached_with_never_calls_the_backend() {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
-        backend.reply(&[SUMMARY, r#"{"what": "", "why": "x"}"#]);
+        backend.reply(&[SUMMARY, r#"{"text": "", "note": "x"}"#]);
         let llm = client(&backend, &store, &ollama("chat"));
         llm.complete::<Summary>("prompt").await.unwrap();
         llm.complete::<Summary>("blank").await.unwrap();
@@ -1759,7 +1881,7 @@ mod tests {
         let backend = FakeBackend::new();
         for _ in 0..MAX_ATTEMPTS {
             backend.reply_with(ChatReply {
-                content: r#"{"what": "Loads"#.to_string(),
+                content: r#"{"text": "Loads"#.to_string(),
                 finish_reason: Some("length".to_string()),
                 prompt_tokens: Some(4000),
                 completion_tokens: Some(96),
@@ -1967,19 +2089,19 @@ mod tests {
         let schema = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
-            "properties": {"why": {"type": "string"}, "what": {"type": "string"}},
-            "required": ["what", "why"]
+            "properties": {"note": {"type": "string"}, "text": {"type": "string"}},
+            "required": ["text", "note"]
         });
         let reordered = json!({
-            "required": ["what", "why"],
-            "properties": {"what": {"type": "string"}, "why": {"type": "string"}},
+            "required": ["text", "note"],
+            "properties": {"text": {"type": "string"}, "note": {"type": "string"}},
             "type": "object",
             "$schema": "http://json-schema.org/draft-07/schema#"
         });
         assert_eq!(canonical_schema(&schema), canonical_schema(&reordered));
         assert_eq!(
             canonical_schema(&schema),
-            r#"{"properties":{"what":{"type":"string"},"why":{"type":"string"}},"required":["what","why"],"type":"object"}"#
+            r#"{"properties":{"note":{"type":"string"},"text":{"type":"string"}},"required":["text","note"],"type":"object"}"#
         );
     }
 
@@ -2218,16 +2340,20 @@ mod tests {
             ),
             reasoning_effort: std::env::var("ANNATAR_OLLAMA_REASONING_EFFORT")
                 .ok()
-                .or(file.map(|ollama| ollama.reasoning_effort))
+                .or(file.as_ref().map(|ollama| ollama.reasoning_effort.clone()))
                 .unwrap_or_else(|| crate::config::DEFAULT_REASONING_EFFORT.to_string()),
             temperature: crate::config::DEFAULT_TEMPERATURE,
+            max_tokens: file
+                .as_ref()
+                .map(|ollama| ollama.max_tokens)
+                .unwrap_or(crate::config::DEFAULT_MAX_TOKENS),
         }
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
     struct ClassSummary {
         /// One sentence: what the class does.
-        what: String,
+        description: String,
         /// The Spring stereotype that fits best.
         role: Role,
     }
@@ -2258,9 +2384,9 @@ mod tests {
         let second = llm.complete::<ClassSummary>(prompt).await.unwrap();
         let warm = start.elapsed();
 
-        assert!(!first.what.trim().is_empty());
+        assert!(!first.description.trim().is_empty());
         assert_eq!(first.role, Role::Repository);
-        assert_eq!(second.what, first.what);
+        assert_eq!(second.description, first.description);
         let stats = llm.stats();
         assert_eq!(stats.chat_hits, 1);
         assert_eq!(stats.chat_calls, 1 + stats.chat_retries);

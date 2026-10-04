@@ -24,6 +24,11 @@ pub const DEFAULT_TEMPERATURE: f64 = 0.0;
 /// Highest accepted `ollama.temperature`.
 pub const MAX_TEMPERATURE: f64 = 2.0;
 
+/// Default `max_tokens` sent with chat requests: a safety cap on runaway
+/// generation, far above any real reply (the longest description so far is
+/// about 130 tokens), not a length limit.
+pub const DEFAULT_MAX_TOKENS: u32 = 1024;
+
 /// Default number of Jira requests in flight during the ticket stage.
 pub const DEFAULT_JIRA_CONCURRENCY: usize = 4;
 
@@ -92,8 +97,8 @@ pub struct DescribeConfig {
     /// type's declaration with its members cut out, shown; `0` leaves the
     /// source out (signature and Javadoc only).
     pub body_chars: usize,
-    /// Members and nested types listed with their description in a type's prompt,
-    /// public ones first; the rest are only counted.
+    /// Members and nested types listed with their description in a type's
+    /// prompt, public ones first; the rest are only counted.
     pub type_members: usize,
     /// Most recent tickets shown besides the first one in a type's prompt (a
     /// type's history spans its whole body, so its tickets are about the
@@ -172,6 +177,13 @@ pub struct OllamaConfig {
         deserialize_with = "deserialize_temperature"
     )]
     pub temperature: f64,
+    /// `max_tokens` sent with every chat request: a safety cap that stops a
+    /// looping reply (cut off at the cap, so the reply is invalid). `0` does
+    /// not send it. With a `reasoning_effort` other than `none`, the
+    /// reasoning counts against it too. Not part of the LLM cache key: only
+    /// complete replies are cached, and a cap does not change them.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
 }
 
 impl Config {
@@ -252,6 +264,10 @@ fn deserialize_temperature<'de, D: Deserializer<'de>>(deserializer: D) -> Result
     }
 }
 
+fn default_max_tokens() -> u32 {
+    DEFAULT_MAX_TOKENS
+}
+
 fn default_jira_concurrency() -> usize {
     DEFAULT_JIRA_CONCURRENCY
 }
@@ -323,6 +339,7 @@ embedding_model = "nomic-embed-text"
         assert_eq!(ollama.url, DEFAULT_OLLAMA_URL);
         assert_eq!(ollama.reasoning_effort, DEFAULT_REASONING_EFFORT);
         assert_eq!(ollama.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(ollama.max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(config.describe, DescribeConfig::default());
         assert_eq!(config.describe.recent_tickets, DEFAULT_RECENT_TICKETS);
         assert_eq!(config.describe.commit_subjects, DEFAULT_COMMIT_SUBJECTS);

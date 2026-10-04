@@ -6,8 +6,8 @@
 //! [`TicketSummary`], which [`validate_summary`] checks (blank summary,
 //! overlong fields, control characters, a ticket key, a summary about the
 //! ticket itself, a purpose about its sources or missing information or one
-//! that restates the summary). The purpose is empty when the ticket gives no reason, so later
-//! stages know there is no "why". The summaries stage in [`crate::indexer`]
+//! that restates the summary). The purpose is empty when the ticket gives no
+//! reason, so later stages know the ticket states none. The summaries stage in [`crate::indexer`]
 //! runs it for every available ticket and stores the result in the index
 //! `tickets` table. Later
 //! prompts (method and type descriptions) take these summaries as their
@@ -143,11 +143,13 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
 /// Openers of a summary that talk about the ticket instead of the change.
 const SUMMARY_OPENERS: &[&str] = &["this ticket", "the ticket"];
 
-/// Phrases in a reason (a ticket's purpose; see also [`source_meta_phrase`]) that talk about
-/// the sources or about missing information instead of giving a reason; such
-/// a reply is invalid and asked again. Narrow on purpose, so ordinary domain
-/// text ("the ticket price", "if one is not provided", "for no reason")
-/// passes.
+/// Phrases in a reason (a ticket's purpose) that talk about the sources or
+/// about missing information instead of giving a reason; such a reply is
+/// invalid and asked again. Narrow on purpose, so ordinary domain text ("the
+/// ticket price", "if one is not provided", "for no reason") passes. A symbol
+/// description describes behaviour, where more of these phrases are domain
+/// text, so it has its own list
+/// ([`crate::describe::description_meta_phrase`]).
 pub(crate) const REASON_META_PHRASES: &[&str] = &[
     "this ticket",
     "the ticket does",
@@ -180,7 +182,7 @@ pub(crate) const REASON_META_PHRASES: &[&str] = &[
 ];
 
 /// Whole replies that stand in for "no reason" instead of an empty string.
-const NO_REASON_REPLIES: &[&str] = &[
+pub(crate) const NO_REASON_REPLIES: &[&str] = &[
     "not stated",
     "not specified",
     "not provided",
@@ -289,30 +291,6 @@ pub(crate) fn reason_meta_phrase(reason: &str) -> Option<&'static str> {
         })
 }
 
-/// Phrases besides [`REASON_META_PHRASES`] that talk about a symbol
-/// description's sources.
-const SOURCE_META_PHRASES: &[&str] = &["commit history"];
-
-/// The meta phrase in a symbol description: like [`reason_meta_phrase`], but
-/// "the commit" is domain text there ("publishes the event after the
-/// commit"), and "commit history" counts.
-pub(crate) fn source_meta_phrase(text: &str) -> Option<&'static str> {
-    let lower = collapse_whitespace(text).to_lowercase();
-    let bare = lower.trim_end_matches(['.', '!']);
-    NO_REASON_REPLIES
-        .iter()
-        .copied()
-        .find(|reply| bare == *reply)
-        .or_else(|| {
-            REASON_META_PHRASES
-                .iter()
-                .chain(SOURCE_META_PHRASES)
-                .copied()
-                .filter(|phrase| *phrase != "the commit")
-                .find(|phrase| lower.contains(phrase))
-        })
-}
-
 /// Every content word of `purpose` (longer than three letters, compared by
 /// its first five letters) also appears in `summary`: the purpose adds no
 /// reason.
@@ -361,7 +339,8 @@ impl Summarizer {
     }
 
     /// The summarizer for an `index` run, or `None` without an `[ollama]`
-    /// section (one warning; tickets get no summary, methods and types no description).
+    /// section (one warning; tickets get no summary, methods and types no
+    /// description).
     /// `no_llm` keeps the cached summaries but makes no chat call. The client
     /// gets its own `cache.db` connection.
     pub fn from_config(
@@ -682,6 +661,7 @@ TICKET>>>
             embedding_model: "embed".to_string(),
             reasoning_effort: "none".to_string(),
             temperature: 0.0,
+            max_tokens: crate::config::DEFAULT_MAX_TOKENS,
         };
         let summarizer =
             Summarizer::from_config(Some(&ollama), DescribeConfig::default(), true, &store)
