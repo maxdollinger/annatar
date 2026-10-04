@@ -13,11 +13,22 @@ For this proof of concept, Annatar targets:
 - **Ticket system:** Jira
 - **LLM inference and embeddings:** Ollama, for local inference
 
+## Install
+
+On Linux or macOS (x86_64 or arm64):
+
+```sh
+curl -fsSL https://github.com/maxdollinger/annatar/releases/latest/download/install.sh | sh
+```
+
+This installs the latest [release](https://github.com/maxdollinger/annatar/releases) to `~/.local/bin` and tells you if that folder is not on your `PATH`. To choose the version or folder, pass them to `sh`: `… | ANNATAR_VERSION=v0.1.0 ANNATAR_INSTALL_DIR="$HOME/bin" sh`.
+
+From source, with Rust (stable): `cargo build --release` puts the binary in `target/release/annatar`.
+
 ## Before you start
 
 You need:
 
-- **Rust** (stable) to build Annatar: `cargo build --release` puts the binary in `target/release/annatar`.
 - **git** on `PATH`. The repository to index must be a git checkout (history and ticket keys come from it).
 - **Ollama**, running and reachable, with a chat model and an embedding model pulled:
   ```sh
@@ -32,7 +43,7 @@ You need:
 
 ## First index run
 
-1. **Create `annatar.toml`** (in the repository or anywhere, then pass `--config <file>`; relative paths resolve against the file's folder):
+1. **Create `annatar.toml`** in the folder you run `annatar` from, or pass `--config <file>`. Relative paths resolve against the file's folder:
    ```toml
    repo = "/path/to/your/repo"
    data_dir = ".annatar"           # index.db + cache.db
@@ -52,9 +63,9 @@ You need:
    ```sh
    annatar index
    ```
-   The first run is slow: every class and method is described by the LLM (≈ 2 s per symbol with a local 27B model, ≈ 20 min for 650 symbols). Everything expensive is cached in `cache.db`, so later runs only pay for new or changed code. To try it on one package first: `annatar index --path src/main/java/com/acme/user`.
+   The first run is slow: the LLM describes every class and method (≈ 2 s per symbol with a local 27B model, ≈ 20 min for 650 symbols). To try one package first: `annatar index --path src/main/java/com/acme/user`.
 
-Run `annatar index` again whenever the code changes; it rebuilds the index from scratch, reusing the cache.
+Rerun `annatar index` whenever the code changes. It rebuilds the index from scratch, but LLM results are cached in `cache.db`, so only new or changed code costs time.
 
 ## Using it
 
@@ -65,7 +76,7 @@ annatar show com.acme.token.TokenCleanup        # one symbol: description, ticke
 
 `search` returns files, best first: the class with its description, then its methods with line numbers; matching lines end with `*score`. `--symbols` lists single symbols instead.
 
-For a coding agent, add a few lines to the repository's `CLAUDE.md` / `AGENTS.md`: that `annatar search "<question>"` finds the relevant files, `annatar show <fqn>` explains a symbol with its tickets and commits, and the code itself is still the source of truth.
+For a coding agent, tell it in the repository's `CLAUDE.md` / `AGENTS.md` to use `annatar search "<question>"` to find files and `annatar show <fqn>` to explain a symbol, and that the code stays the source of truth.
 
 Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only), `-v` (logs on stderr). Everything else (output formats, filters, `eval`, how each stage works) is in [`md/reference.md`](./md/reference.md).
 
@@ -89,3 +100,7 @@ Measured on one Java/Spring repository (654 symbols, 69 tickets); details in [`m
 ## Where it fits
 
 Long-lived codebases where the reasoning lives in old tickets and people's heads, teams that onboard often, and teams using coding agents on real repositories.
+
+## Releasing
+
+Run the **release** workflow in GitHub Actions. It builds the Linux and macOS binaries and publishes them with `install.sh`, tagged `v<version>` from `Cargo.toml` unless you give a tag.
