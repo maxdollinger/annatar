@@ -89,6 +89,21 @@ pub enum Role {
 }
 
 impl Role {
+    /// Every role, in declaration order.
+    pub const ALL: [Role; 6] = [
+        Role::Controller,
+        Role::Service,
+        Role::Repository,
+        Role::Component,
+        Role::Configuration,
+        Role::Entity,
+    ];
+
+    /// The role whose [`as_str`](Self::as_str) text is `text`.
+    pub fn parse(text: &str) -> Option<Role> {
+        Self::ALL.into_iter().find(|role| role.as_str() == text)
+    }
+
     /// The stable lowercase text stored in `symbols.role`.
     pub fn as_str(&self) -> &'static str {
         match self {

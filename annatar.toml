@@ -35,7 +35,9 @@ ticket_regex = '\bGRLD-\d+'
 # cached. LLM replies and embeddings are cached in cache.db; changing a model,
 # reasoning_effort or temperature simply misses the cache. `index` fails when
 # the server lacks chat_model or embedding_model. The vector dimension comes
-# from the embedding model's first response, not from this file.
+# from the embedding model's first response, not from this file. `annatar
+# search` embeds its query with embedding_model and refuses an index built
+# with another one.
 # [ollama]
 # Server root (a trailing /v1 is accepted).
 # url = "http://localhost:11434"

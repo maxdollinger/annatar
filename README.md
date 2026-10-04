@@ -29,7 +29,22 @@ annatar index --path src/main/java/com/acme   # only part of the repo
 annatar index --offline                   # no Jira requests; cached tickets only
 annatar index --no-llm                    # no chat or embedding calls; cached summaries, descriptions and embeddings only
 annatar show com.acme.user.UserRepository     # a symbol, its children (with descriptions), commits and tickets (with summaries)
+annatar search "who deletes expired tokens"   # the 10 symbols whose descriptions match best
+annatar search -k 5 --kind method --role repository "delete expired tokens"
 ```
+
+Results go to stdout, logs (`-v`, `RUST_LOG`) to stderr, without colours unless stderr is a terminal. A failing command prints one line, `error: …`, on stderr and exits with 1 (2 for a usage error such as an unknown `--kind`).
+
+`search` embeds the query with `ollama.embedding_model` and prints the most similar symbols, most similar first, two lines each:
+
+```text
+1. 0.770 com.acme.token.TokenCleanup#deleteExpiredTokens() [method] src/main/java/com/acme/token/TokenCleanup.java:32-37
+   Schedules the deletion of expired user tokens every 5 minutes.
+2. 0.758 com.acme.token.TokenCleanup [class] role=service src/main/java/com/acme/token/TokenCleanup.java:18-48
+   Deletes expired user tokens from the database periodically.
+```
+
+rank, cosine similarity (1 = identical), fqn, `[kind]`, `role=<role>` when the symbol has a Spring role, `file:start-end`; then the description on one line, indented by three spaces. `-k/--limit` sets the number of results (default 10, at most 100). `--kind` (`class`, `interface`, `enum`, `record`, `annotation`, `method`, `constructor`) and `--role` (`controller`, `service`, `repository`, `component`, `configuration`, `entity`; a method or constructor matches by its enclosing type's role) filter the results and may be repeated. A filter that matches nothing prints nothing on stdout and a note on stderr. `search` needs the `[ollama]` section and a reachable server; it reads only `index.db` (the query's vector is not cached) and refuses an index without vectors, or one embedded with another `embedding_model` or dimension. Use `show <fqn>` on a result for the detail view (description, parent, children, file and lines, commits, tickets).
 
 `index` fetches every ticket key found in the history from Jira once and caches it in `cache.db` (403/404 and other permanent failures — another 4xx except 408/425/429, an issue that does not parse — are cached as unavailable; 5xx, timeouts, 429 and non-JSON answers are retried next run), so later runs make no Jira requests for known keys; the `tickets:` line of its output counts cached, fetched, unavailable and failed keys and the Jira requests made. Without a `[jira]` section or without `ANNATAR_JIRA_TOKEN` it warns once and uses cached tickets only; `--offline` does the same on purpose. Before fetching, `index` checks the credentials once (`/rest/api/2/myself`, retried on 429 like fetches); rejected credentials fail the run and nothing is cached. If Jira is unreachable or still rate limiting after retries, `index` stops fetching for that run with one warning, counts the remaining keys as not fetched and retries them next run. `show` lists each ticket with its type and summary, or `(unavailable)`.
 

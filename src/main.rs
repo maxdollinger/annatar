@@ -1,20 +1,26 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use clap::builder::PossibleValuesParser;
 use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
+use annatar::search::{self, Filter, QueryEmbedder};
 use annatar::store::{IndexReader, Store};
 use annatar::summaries::Summarizer;
+use annatar::symbols::{Role, SymbolKind};
 use annatar::tickets::TicketFetch;
-use annatar::{indexer, show};
+use annatar::{indexer, show, walk};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
 #[derive(Debug, Parser)]
 #[command(name = "annatar", version, about)]
 struct Cli {
     /// Limit the run to paths under this prefix, for fast iteration. `index`
-    /// still replaces the whole index.db, which then holds only this prefix.
+    /// still replaces the whole index.db, which then holds only this prefix;
+    /// `search` returns only symbols in files under it.
     #[arg(long, global = true, value_name = "PREFIX")]
     path: Option<PathBuf>,
 
@@ -53,18 +59,63 @@ enum Command {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
         fqn: String,
     },
-    /// Search symbol descriptions by meaning.
+    /// Search symbol descriptions by meaning: the most similar symbols, each
+    /// as `rank. score fqn [kind] role=… file:start-end` with its description
+    /// on the next line.
     Search {
         /// Plain-language query.
         query: String,
+        /// Only symbols of this kind (repeatable).
+        #[arg(long, value_name = "KIND", value_parser = PossibleValuesParser::new(SymbolKind::ALL.map(|kind| kind.as_str())))]
+        kind: Vec<String>,
+        /// Only types with this Spring role and their methods and
+        /// constructors (repeatable).
+        #[arg(long, value_name = "ROLE", value_parser = PossibleValuesParser::new(Role::ALL.map(|role| role.as_str())))]
+        role: Vec<String>,
+        /// Number of results.
+        #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_limit)]
+        limit: usize,
     },
 }
 
+/// `--path` for `search`: the prefix relative to the repository, with `/`
+/// separators like `symbols.file`.
+fn search_path(repo: &std::path::Path, prefix: &std::path::Path) -> Result<String> {
+    let relative = walk::relative_prefix(repo, prefix).with_context(|| {
+        format!(
+            "--path {} is outside the repository {}",
+            prefix.display(),
+            repo.display()
+        )
+    })?;
+    Ok(relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+fn parse_limit(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(limit) if (1..=search::MAX_LIMIT).contains(&limit) => Ok(limit),
+        _ => Err(format!("expected a number from 1 to {}", search::MAX_LIMIT)),
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging(cli.verbose);
+    match run(&cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {}", format!("{err:#}").replace('\n', " "));
+            ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run(cli: &Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
     tracing::debug!(
         repo = %config.repo.display(),
@@ -171,14 +222,39 @@ async fn main() -> Result<()> {
             let reader = IndexReader::open(&config.data_dir).await?;
             print!("{}", show::render(reader.connection(), fqn).await?);
         }
-        Command::Search { query } => not_implemented(&format!("search {query}")),
+        Command::Search {
+            query,
+            kind,
+            role,
+            limit,
+        } => {
+            let ollama = config
+                .ollama
+                .as_ref()
+                .context("search needs an [ollama] section with the embedding_model the index was built with")?;
+            let filter = Filter {
+                kinds: kind
+                    .iter()
+                    .filter_map(|kind| SymbolKind::parse(kind))
+                    .collect(),
+                roles: role.iter().filter_map(|role| Role::parse(role)).collect(),
+                path: cli
+                    .path
+                    .as_deref()
+                    .map(|prefix| search_path(&config.repo, prefix))
+                    .transpose()?,
+            };
+            let reader = IndexReader::open(&config.data_dir).await?;
+            let embedder = QueryEmbedder::from_config(ollama).await?;
+            let hits =
+                search::search(reader.connection(), &embedder, query, &filter, *limit).await?;
+            if hits.is_empty() {
+                eprintln!("no symbol matches the filter");
+            }
+            print!("{}", search::format_hits(&hits));
+        }
     }
     Ok(())
-}
-
-fn not_implemented(command: &str) {
-    tracing::warn!(command, "not implemented yet");
-    println!("{command}: not implemented yet");
 }
 
 fn init_logging(verbose: u8) {
@@ -191,5 +267,9 @@ fn init_logging(verbose: u8) {
         _ => "trace",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
 }

@@ -7,6 +7,7 @@ pub mod indexer;
 pub mod jira;
 pub mod llm;
 pub mod schema;
+pub mod search;
 pub mod show;
 pub mod store;
 pub mod summaries;
