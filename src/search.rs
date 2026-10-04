@@ -398,13 +398,20 @@ pub struct FileHits {
 /// at most `files` of them. Hits stop at the first hit of a file beyond the
 /// `files`th, so every file keeps the hits that rank above the last file's
 /// best hit — the symbols a symbol search would have listed to fill
-/// `files` files.
+/// `files` files. When the hits run out before such a file (a narrow
+/// filter, or few files among the hits), nothing bounds them, so a file
+/// keeps only its best hit and those among the [`DEFAULT_LIMIT`] best
+/// overall.
 pub fn group_by_file(hits: &[Hit], files: usize) -> Vec<FileHits> {
     let mut groups: Vec<FileHits> = Vec::new();
+    let mut cut = false;
     for hit in hits {
         match groups.iter().position(|group| group.file == hit.file) {
             Some(index) => groups[index].hits.push(hit.clone()),
-            None if groups.len() == files => break,
+            None if groups.len() == files => {
+                cut = true;
+                break;
+            }
             None => groups.push(FileHits {
                 file: hit.file.clone(),
                 score: hit.score,
@@ -412,7 +419,49 @@ pub fn group_by_file(hits: &[Hit], files: usize) -> Vec<FileHits> {
             }),
         }
     }
+    if !cut {
+        let top: HashSet<&str> = hits
+            .iter()
+            .take(DEFAULT_LIMIT)
+            .map(|hit| hit.fqn.as_str())
+            .collect();
+        for group in &mut groups {
+            let mut best = true;
+            group
+                .hits
+                .retain(|hit| std::mem::take(&mut best) || top.contains(hit.fqn.as_str()));
+        }
+    }
     groups
+}
+
+/// The files of a file-level search ([`search_files`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileSearch {
+    pub groups: Vec<FileHits>,
+    /// Files asked for (`-k`).
+    pub files: usize,
+    /// Symbol hits the files were grouped from, at most [`MAX_LIMIT`].
+    pub hits: usize,
+}
+
+impl FileSearch {
+    /// A note for stderr when the search found no file, or fewer files than
+    /// asked for because the [`MAX_LIMIT`] hits ran out (more files may
+    /// match further down).
+    pub fn note(&self) -> Option<String> {
+        if self.groups.is_empty() {
+            Some("no symbol matches the filter".to_string())
+        } else if self.groups.len() < self.files && self.hits >= MAX_LIMIT {
+            Some(format!(
+                "files found: {} of the {} asked for; the {MAX_LIMIT} nearest symbols are in no other file",
+                self.groups.len(),
+                self.files
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// One symbol of a file shown by a file-level search.
@@ -478,9 +527,13 @@ pub async fn search_files(
     query: &str,
     filter: &Filter,
     files: usize,
-) -> Result<Vec<FileHits>> {
+) -> Result<FileSearch> {
     let hits = search(conn, embedder, query, filter, MAX_LIMIT).await?;
-    Ok(group_by_file(&hits, files))
+    Ok(FileSearch {
+        groups: group_by_file(&hits, files),
+        files,
+        hits: hits.len(),
+    })
 }
 
 /// Every symbol of the files of `groups`, for [`format_files`].
@@ -509,7 +562,8 @@ pub async fn group_symbols(conn: &Connection, groups: &[FileHits]) -> Result<Vec
 /// without a description, indented two spaces per level. A symbol among the
 /// group's hits ends with `*score`. A file with more than `member_lines`
 /// member and nested-type lines shows its hits and the first lines in
-/// source order up to `member_lines`, then `… N more`.
+/// source order up to `member_lines`; each top-level type with hidden lines
+/// ends with `… N more`, N counting its own.
 pub fn format_files(groups: &[FileHits], symbols: &[FileSymbol], member_lines: usize) -> String {
     let mut out = String::new();
     for (rank, group) in groups.iter().enumerate() {
@@ -605,8 +659,10 @@ fn format_file(group: &FileHits, symbols: &[FileSymbol], member_lines: usize, ou
         }
         let mut list = Vec::new();
         descendants(root, &children, 1, &mut list);
+        let mut hidden = 0;
         for (symbol, depth) in list {
             if !shown.contains(&symbol.id) {
+                hidden += 1;
                 continue;
             }
             let parent = symbol
@@ -633,10 +689,9 @@ fn format_file(group: &FileHits, symbols: &[FileSymbol], member_lines: usize, ou
                 score(symbol)
             ));
         }
-    }
-    let hidden = members.len() - shown.len();
-    if hidden > 0 {
-        out.push_str(&format!("     … {hidden} more\n"));
+        if hidden > 0 {
+            out.push_str(&format!("     … {hidden} more\n"));
+        }
     }
 }
 
@@ -1164,6 +1219,82 @@ mod tests {
         assert!(group_by_file(&[], 5).is_empty());
     }
 
+    #[test]
+    fn hits_that_run_out_mark_each_files_best_and_the_overall_top() {
+        let mut hits = vec![hit_in(0.99, "a.B#top()", "B.java")];
+        for n in 0..12 {
+            hits.push(hit_in(
+                0.9 - f64::from(n) / 100.0,
+                &format!("a.A#m{n}()"),
+                "A.java",
+            ));
+        }
+        hits.push(hit_in(0.5, "a.C", "C.java"));
+        hits.push(hit_in(0.4, "a.B", "B.java"));
+
+        let groups = group_by_file(&hits, 3);
+
+        let a: Vec<String> = (0..9).map(|n| format!("a.A#m{n}()")).collect();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.file.as_str(), fqns(&group.hits)))
+                .collect::<Vec<_>>(),
+            [
+                ("B.java", vec!["a.B#top()"]),
+                ("A.java", a.iter().map(String::as_str).collect()),
+                ("C.java", vec!["a.C"]),
+            ]
+        );
+        let cut = group_by_file(&hits, 2);
+        assert_eq!(cut[1].hits.len(), 12);
+        assert_eq!(fqns(&cut[0].hits), ["a.B#top()"]);
+    }
+
+    #[test]
+    fn tied_hits_keep_their_order_across_files() {
+        let hits = [
+            hit_in(0.8, "a.A", "A.java"),
+            hit_in(0.8, "a.B", "B.java"),
+            hit_in(0.8, "a.A#run()", "A.java"),
+            hit_in(0.8, "a.C", "C.java"),
+        ];
+
+        let groups = group_by_file(&hits, 2);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.file.as_str(), fqns(&group.hits)))
+                .collect::<Vec<_>>(),
+            [
+                ("A.java", vec!["a.A", "a.A#run()"]),
+                ("B.java", vec!["a.B"])
+            ]
+        );
+    }
+
+    #[test]
+    fn file_search_notes_no_match_and_too_few_files() {
+        let group = token_group(&[(0.9, "a.Token")]);
+        let found = |groups: Vec<FileHits>, files, hits| FileSearch {
+            groups,
+            files,
+            hits,
+        };
+
+        assert_eq!(
+            found(vec![], 5, 0).note().as_deref(),
+            Some("no symbol matches the filter")
+        );
+        assert_eq!(
+            found(vec![group.clone()], 5, MAX_LIMIT).note().as_deref(),
+            Some("files found: 1 of the 5 asked for; the 100 nearest symbols are in no other file")
+        );
+        assert_eq!(found(vec![group.clone()], 5, 40).note(), None);
+        assert_eq!(found(vec![group], 1, MAX_LIMIT).note(), None);
+    }
+
     fn symbol(
         id: i64,
         parent_id: Option<i64>,
@@ -1268,16 +1399,25 @@ mod tests {
      #<init>(Repo) :10-14
      enum Mode [component] :40-55
        record Pair :50-54 *0.900
+     … 3 more
    class a.TokenHelper :62-70
      a.TokenHelper does things.
      #help() :64-69 *0.800
-     … 3 more
 "
         );
         let group = token_group(&[(0.9, "a.Token")]);
-        assert!(format_files(&[group], &token_file(), 0).ends_with(
-            "   class a.TokenHelper :62-70\n     a.TokenHelper does things.\n     … 7 more\n"
-        ));
+        assert_eq!(
+            format_files(&[group], &token_file(), 0),
+            "\
+1. 0.900 src/a/Token.java
+   class a.Token [service] :3-60 *0.900
+     a.Token does things.
+     … 6 more
+   class a.TokenHelper :62-70
+     a.TokenHelper does things.
+     … 1 more
+"
+        );
     }
 
     #[tokio::test]
@@ -1288,9 +1428,12 @@ mod tests {
             .await
             .unwrap();
         // vector_for("a") = [1, 97, 1]: the service file first.
-        let groups = search_files(reader.connection(), &embedder, "a", &Filter::default(), 5)
+        let found = search_files(reader.connection(), &embedder, "a", &Filter::default(), 5)
             .await
             .unwrap();
+        assert_eq!((found.files, found.hits), (5, ROWS.len()));
+        assert_eq!(found.note(), None);
+        let groups = found.groups;
         let symbols = group_symbols(reader.connection(), &groups).await.unwrap();
         assert_eq!(
             groups
@@ -1323,7 +1466,8 @@ mod tests {
         };
         let groups = search_files(reader.connection(), &embedder, "a", &controllers, 5)
             .await
-            .unwrap();
+            .unwrap()
+            .groups;
         let symbols = group_symbols(reader.connection(), &groups).await.unwrap();
         let text = format_files(&groups, &symbols, MEMBER_LINES);
         assert!(
@@ -1338,7 +1482,8 @@ mod tests {
         };
         let groups = search_files(reader.connection(), &embedder, "a", &constructors, 5)
             .await
-            .unwrap();
+            .unwrap()
+            .groups;
         let symbols = group_symbols(reader.connection(), &groups).await.unwrap();
         assert_eq!(fqns(&groups[0].hits), ["com.acme.UserService#<init>()"]);
         let text = format_files(&groups, &symbols, MEMBER_LINES);
