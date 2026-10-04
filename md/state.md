@@ -17,6 +17,14 @@ the decisions taken, and the tradeoffs behind them.
 
 ### Done
 
+- **README rewrite (setup guide).** The README is now a short guide:
+  prerequisites (Rust, git, Ollama with a chat and an embedding model, an
+  optional Jira token in the environment), the first index run (config,
+  `.gitignore`, `annatar index`, expected duration) and basic use of
+  `search`/`show` for people and agents. The detailed CLI reference (output
+  formats, filters, stages, `eval`) moved unchanged to `md/reference.md`;
+  references to "README" in earlier decisions now mean that file. Docs only.
+
 - **5.5 trial re-run (file-level search).** One commit (`docs(trial)`):
   `run.py --with-prompt files|symbols` (default `files`; `symbols` is the
   5.4 prompt byte for byte; the variant is written to each run's
