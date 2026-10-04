@@ -30,7 +30,7 @@ Everything that doesn't help answer these three questions is in **Later**, at th
 
 **0.1 CLI, config, logging**
 *Goal:* a binary that loads a validated configuration and exposes the subcommands later steps fill in.
-Binary `annatar` with `clap` subcommands `index`, `show`, `search` (stubs; a `serve` stub was dropped when MCP left the POC, `state.md` D-ax), `--path` and `-v`. Load `annatar.toml`: repo path, data directory, ticket key regex (default `\bGRLD-\d+\b`), Jira base URL and auth, Ollama URL, chat model, embedding model. Secrets from environment variables. Logging with `tracing`.
+Binary `annatar` with `clap` subcommands `index`, `show`, `search` (stubs; a `serve` stub was dropped when MCP left the POC, `state.md` D-ax), `--path` and `-v`. Load `annatar.toml`: repo path, data directory, ticket key regex (default `\bGRLD-\d+`; no trailing `\b`, so `GRLD-123_Fix` matches, `state.md` D-ay), Jira base URL and auth, Ollama URL, chat model, embedding model. Secrets from environment variables. Logging with `tracing`.
 *Done when:* `--help` works; config tests cover defaults and a missing required value.
 
 **0.2 Database files**

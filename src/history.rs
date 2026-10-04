@@ -540,6 +540,29 @@ mod tests {
     }
 
     #[test]
+    fn default_regex_finds_keys_followed_by_an_underscore() {
+        let regex = Regex::new(crate::config::DEFAULT_TICKET_REGEX).unwrap();
+
+        assert_eq!(
+            ticket_keys(
+                &regex,
+                "GRLD-98595_Fix_login, feature/GRLD-7-retry (GRLD-12)"
+            ),
+            vec![
+                "GRLD-98595".to_string(),
+                "GRLD-7".to_string(),
+                "GRLD-12".to_string()
+            ]
+        );
+        assert_eq!(
+            ticket_keys(&regex, "GRLD-123 and GRLD-1234"),
+            vec!["GRLD-123".to_string(), "GRLD-1234".to_string()],
+            "the digits are matched greedily, so a key is never cut short"
+        );
+        assert!(ticket_keys(&regex, "XGRLD-1 GRLD-x").is_empty());
+    }
+
+    #[test]
     fn ticket_keys_ignores_zero_width_matches() {
         let empty = Regex::new("").unwrap();
         assert!(
