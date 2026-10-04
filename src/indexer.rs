@@ -20,10 +20,13 @@
 //! 5. **describe** (`index_descriptions`) gives every method and constructor
 //!    a one-line `what` and a `why` from the chat model, built from its code,
 //!    its enclosing type and its tickets' summaries (or commit subjects);
-//!    runs after summaries, also on a repository without git (code only).
+//!    runs after summaries, also on a repository without git (code only);
+//! 6. **types** (`index_type_descriptions`) gives every type a `what` and a
+//!    `why` the same way, bottom-up (nested types first), from its
+//!    declaration, its members' and nested types' `what` lines and its
+//!    tickets; runs after describe.
 //!
-//! The type what/why stage slots in after describe the same way. A stage
-//! never commits: the transaction commits and the temporary file is
+//! A stage never commits: the transaction commits and the temporary file is
 //! atomically renamed over `index.db` exactly once, after the last stage. Any
 //! stage error drops the transaction and the build, leaving the previous index
 //! untouched.
@@ -43,16 +46,18 @@ use anyhow::{Context, Result};
 use libsql::{Connection, Transaction, params};
 use regex::Regex;
 
+use crate::config::DescribeConfig;
 use crate::describe::{
-    Description, Member, MemberCommit, MemberTicket, Parent, Summary, TicketState, member_prompt,
-    select_history, validate_description,
+    ChildWhat, Description, Member, MemberCommit, MemberTicket, Parent, Summary, TicketState,
+    TypeChild, TypeContext, TypeDescription, is_public, member_prompt, outline, select_children,
+    select_history, type_prompt, validate_description, validate_type_description,
 };
 use crate::history::{self, Commit, HistoryCache};
 use crate::jira::{FetchError, Ticket};
 use crate::llm::{InvalidOutput, LlmStats, LlmUnavailable};
 use crate::store::Store;
 use crate::summaries::{Summarizer, TicketSummary, ticket_prompt, validate_summary};
-use crate::symbols::{JavaParser, Symbol};
+use crate::symbols::{JavaParser, Symbol, SymbolKind};
 use crate::tickets::{
     CachedTicket, Fetched, JiraMode, TicketCache, TicketFetch, check_auth_with_retry,
     fetch_with_retry,
@@ -142,6 +147,29 @@ pub struct IndexStats {
     pub describe_skipped: usize,
     /// LLM client counters of the describe stage.
     pub describe_llm: LlmStats,
+    /// Types indexed. When an LLM stage runs, `types_described +
+    /// types_invalid + types_failed + types_incomplete + types_skipped ==
+    /// type_symbols`.
+    pub type_symbols: usize,
+    /// Types given a `what` (and maybe a `why`), from the LLM cache or the
+    /// model.
+    pub types_described: usize,
+    /// Of `types_described`, those answered from the LLM cache.
+    pub types_described_cached: usize,
+    /// Types whose reply was still invalid after the retry; not cached,
+    /// asked again next run.
+    pub types_invalid: usize,
+    /// Types whose chat call failed (backend error; trips the breaker).
+    pub types_failed: usize,
+    /// Types held back because their input is incomplete this run: a chosen
+    /// ticket was not fetched yet or has no summary, or a listed member or
+    /// nested type has no `what` this run. Described on a later run.
+    pub types_incomplete: usize,
+    /// Types not sent to the model: no `[ollama]` section, or not in the LLM
+    /// cache with `--no-llm` or after the circuit breaker tripped.
+    pub types_skipped: usize,
+    /// LLM client counters of the type stage.
+    pub type_llm: LlmStats,
     /// LLM client counters for this run (all stages); `llm.chat_calls` is
     /// zero on a fully cached run.
     pub llm: LlmStats,
@@ -183,12 +211,12 @@ pub struct IndexStats {
 /// ones as unavailable). Bad Jira credentials abort the run; see
 /// `index_tickets` for the other outcomes.
 ///
-/// `llm` summarises the available tickets and describes every method and
-/// constructor; `None` (no `[ollama]` section) leaves them without a summary
+/// `llm` summarises the available tickets and describes every method,
+/// constructor and type; `None` (no `[ollama]` section) leaves them without a summary
 /// or what/why. Its chat model is checked once before the
 /// stages run: a model the server does not have fails the run (like rejected
 /// Jira credentials). Other LLM failures never fail the run; see
-/// `index_summaries` and `index_descriptions`.
+/// `index_summaries`, `index_descriptions` and `index_type_descriptions`.
 pub async fn build_index(
     store: &Store,
     repo: &Path,
@@ -255,7 +283,7 @@ pub async fn build_index(
         JiraMode::Disabled => UnknownTickets::Unavailable,
         JiraMode::Fetch(_) | JiraMode::Offline => UnknownTickets::Pending,
     };
-    index_descriptions(
+    let whats = index_descriptions(
         &transaction,
         &indexed,
         llm,
@@ -265,6 +293,18 @@ pub async fn build_index(
     )
     .await?;
     stats.describe_llm = llm_stats().since(&before);
+    let before = llm_stats();
+    index_type_descriptions(
+        &transaction,
+        &indexed,
+        llm,
+        &invalid_summaries,
+        unknown_tickets,
+        whats,
+        &mut stats,
+    )
+    .await?;
+    stats.type_llm = llm_stats().since(&before);
     stats.llm = llm_stats().since(&run_before);
 
     transaction
@@ -299,6 +339,13 @@ pub async fn build_index(
         describe_failed = stats.describe_failed,
         describe_incomplete = stats.describe_incomplete,
         describe_skipped = stats.describe_skipped,
+        type_symbols = stats.type_symbols,
+        types_described = stats.types_described,
+        types_described_cached = stats.types_described_cached,
+        types_invalid = stats.types_invalid,
+        types_failed = stats.types_failed,
+        types_incomplete = stats.types_incomplete,
+        types_skipped = stats.types_skipped,
         chat_calls = stats.llm.chat_calls,
         chat_hits = stats.llm.chat_hits,
         chat_retries = stats.llm.chat_retries,
@@ -882,7 +929,8 @@ async fn index_descriptions(
     invalid_summaries: &HashSet<String>,
     unknown_tickets: UnknownTickets,
     stats: &mut IndexStats,
-) -> Result<()> {
+) -> Result<HashMap<i64, ChildWhat>> {
+    let mut whats = HashMap::new();
     let members: Vec<(&IndexedFile, &IndexedSymbol)> = files
         .iter()
         .flat_map(|file| file.symbols.iter().map(move |symbol| (file, symbol)))
@@ -891,7 +939,7 @@ async fn index_descriptions(
     stats.describe_members = members.len();
     let Some(llm) = llm else {
         stats.describe_skipped += members.len();
-        return Ok(());
+        return Ok(whats);
     };
     let types: HashMap<&str, &Symbol> = files
         .iter()
@@ -958,6 +1006,7 @@ async fn index_descriptions(
                     "no valid what/why; skipping the member this run"
                 );
                 stats.describe_invalid += 1;
+                whats.insert(indexed.id, ChildWhat::Invalid);
                 continue;
             }
             Err(err) => {
@@ -972,6 +1021,7 @@ async fn index_descriptions(
             }
         };
         write_description(transaction, indexed.id, &description).await?;
+        whats.insert(indexed.id, ChildWhat::Described(description.what_text()));
         stats.described += 1;
         if llm.client.stats().chat_hits > hits {
             stats.described_cached += 1;
@@ -1003,7 +1053,245 @@ async fn index_descriptions(
             "some methods got no what/why this run; they are asked again next run"
         );
     }
+    Ok(whats)
+}
+
+/// Type stage: give every type the structure stage wrote a `what` and a
+/// `why` from the chat model, stored on its `symbols` row. Runs after the
+/// describe stage, whose members' `what` lines (`whats`, by symbol id) it
+/// lists.
+///
+/// Types are taken bottom-up: the most deeply nested first, then by walk and
+/// source order, so an outer type lists its nested types' `what` lines. Each
+/// prompt is built by [`type_prompt`] from the type's own file and history:
+/// its declaration with members and nested types cut out (capped at
+/// `describe.body_chars`), up to `describe.type_members` children with their
+/// `what` (public ones first; the rest only counted) and its first plus
+/// `describe.type_recent_tickets` most recent tickets, chosen like a
+/// member's. A listed child without a `what` this run holds the type back
+/// (`types_incomplete`, which in turn holds back its outer type), so nothing
+/// built from partial input is cached; a child whose reply was invalid is
+/// listed without one. Ticket blocking, the title fallback, invalid replies,
+/// backend failures and the circuit breaker behave as in
+/// `index_descriptions`. Without a summarizer every type is `types_skipped`.
+/// Only an index write error fails the stage.
+async fn index_type_descriptions(
+    transaction: &Transaction,
+    files: &[IndexedFile],
+    llm: Option<&Summarizer>,
+    invalid_summaries: &HashSet<String>,
+    unknown_tickets: UnknownTickets,
+    mut whats: HashMap<i64, ChildWhat>,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let types: HashMap<&str, &IndexedSymbol> = files
+        .iter()
+        .flat_map(|file| &file.symbols)
+        .filter(|indexed| indexed.symbol.kind.is_type())
+        .map(|indexed| (indexed.symbol.fqn.as_str(), indexed))
+        .collect();
+    let depth = |symbol: &Symbol| {
+        let mut depth = 0;
+        let mut parent = symbol.parent.as_deref();
+        while let Some(fqn) = parent {
+            depth += 1;
+            parent = types
+                .get(fqn)
+                .and_then(|indexed| indexed.symbol.parent.as_deref());
+        }
+        depth
+    };
+    let mut order: Vec<(usize, &IndexedFile, &IndexedSymbol)> = files
+        .iter()
+        .flat_map(|file| file.symbols.iter().map(move |indexed| (file, indexed)))
+        .filter(|(_, indexed)| indexed.symbol.kind.is_type())
+        .map(|(file, indexed)| (depth(&indexed.symbol), file, indexed))
+        .collect();
+    order.sort_by_key(|(depth, _, _)| std::cmp::Reverse(*depth));
+    stats.type_symbols = order.len();
+    let Some(llm) = llm else {
+        stats.types_skipped += order.len();
+        return Ok(());
+    };
+    let mut children: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+    for indexed in files.iter().flat_map(|file| &file.symbols) {
+        if let Some(parent) = indexed.symbol.parent.as_deref() {
+            children.entry(parent).or_default().push(indexed);
+        }
+    }
+    let mut tickets = member_tickets(transaction, invalid_summaries, unknown_tickets).await?;
+    let mut commits = member_commits(transaction).await?;
+    let config = &llm.describe;
+    let history_config = DescribeConfig {
+        recent_tickets: config.type_recent_tickets,
+        ..*config
+    };
+    let mut blocking = HashSet::new();
+    let mut held_back = 0;
+    llm.client.reset_invalid_streak();
+    let started = std::time::Instant::now();
+    for (done, (_, file, indexed)) in order.iter().enumerate() {
+        let symbol = &indexed.symbol;
+        let history = match select_history(
+            &tickets.remove(&indexed.id).unwrap_or_default(),
+            &commits.remove(&indexed.id).unwrap_or_default(),
+            &history_config,
+        ) {
+            Ok(history) => history,
+            Err(incomplete) => {
+                tracing::debug!(fqn = %symbol.fqn, reason = %incomplete, "type input incomplete; not described this run");
+                blocking.extend(incomplete.keys().cloned());
+                stats.types_incomplete += 1;
+                continue;
+            }
+        };
+        let own: &[&IndexedSymbol] = children
+            .get(symbol.fqn.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let in_interface = matches!(symbol.kind, SymbolKind::Interface | SymbolKind::Annotation);
+        let listed: Vec<TypeChild> = own
+            .iter()
+            .map(|child| TypeChild {
+                kind: child.symbol.kind.as_str().to_string(),
+                name: child_name(symbol, &child.symbol),
+                public: is_public(&child.symbol.signature, in_interface),
+                what: whats.get(&child.id).cloned().unwrap_or(ChildWhat::Missing),
+            })
+            .collect();
+        let listed = match select_children(&listed, config.type_members) {
+            Ok(listed) => listed,
+            Err(missing) => {
+                tracing::debug!(fqn = %symbol.fqn, missing = missing.join(", "), "members without what/why this run; type not described");
+                held_back += 1;
+                stats.types_incomplete += 1;
+                continue;
+            }
+        };
+        let cuts: Vec<std::ops::Range<usize>> = own
+            .iter()
+            .map(|child| declaration_start(&file.source, &child.symbol)..child.symbol.end_byte)
+            .collect();
+        let context = TypeContext {
+            kind: symbol.kind.as_str().to_string(),
+            fqn: symbol.fqn.clone(),
+            role: symbol.role.map(|role| role.as_str().to_string()),
+            signature: symbol.signature.clone(),
+            javadoc: symbol.javadoc.clone(),
+            outline: outline(&file.source, symbol.start_byte..symbol.end_byte, &cuts),
+            enclosing: symbol
+                .parent
+                .as_deref()
+                .and_then(|fqn| types.get(fqn))
+                .map(|parent| Parent {
+                    fqn: parent.symbol.fqn.clone(),
+                    kind: parent.symbol.kind.as_str().to_string(),
+                    role: parent.symbol.role.map(|role| role.as_str().to_string()),
+                }),
+        };
+        let prompt = type_prompt(&context, &listed, &history, config.body_chars);
+        let hits = llm.client.stats().chat_hits;
+        let description = match llm
+            .client
+            .complete_with::<TypeDescription, _>(&prompt, validate_type_description)
+            .await
+        {
+            Ok(description) => Description::from(description),
+            Err(err) if err.downcast_ref::<LlmUnavailable>().is_some() => {
+                stats.types_skipped += 1;
+                continue;
+            }
+            Err(err) if err.downcast_ref::<InvalidOutput>().is_some() => {
+                tracing::warn!(
+                    fqn = %symbol.fqn,
+                    error = format!("{err:#}"),
+                    "no valid what/why; skipping the type this run"
+                );
+                stats.types_invalid += 1;
+                whats.insert(indexed.id, ChildWhat::Invalid);
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    fqn = %symbol.fqn,
+                    error = format!("{err:#}"),
+                    remaining = order.len() - done - 1,
+                    "the chat model failed; remaining types use cached what/why only"
+                );
+                stats.types_failed += 1;
+                continue;
+            }
+        };
+        write_description(transaction, indexed.id, &description).await?;
+        whats.insert(indexed.id, ChildWhat::Described(description.what_text()));
+        stats.types_described += 1;
+        if llm.client.stats().chat_hits > hits {
+            stats.types_described_cached += 1;
+        }
+        tracing::debug!(
+            fqn = %symbol.fqn,
+            done = done + 1,
+            total = order.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "type described"
+        );
+    }
+    tracing::info!(
+        types = order.len(),
+        described = stats.types_described,
+        cached = stats.types_described_cached,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "type what/why done"
+    );
+    if stats.types_invalid + stats.types_failed + stats.types_incomplete > 0 {
+        tracing::warn!(
+            types = order.len(),
+            described = stats.types_described,
+            invalid = stats.types_invalid,
+            failed = stats.types_failed,
+            incomplete = stats.types_incomplete,
+            waiting_for_members = held_back,
+            skipped = stats.types_skipped,
+            blocking_tickets = key_list(&blocking),
+            "some types got no what/why this run; they are asked again next run"
+        );
+    }
     Ok(())
+}
+
+/// How a type's prompt names its `child`: `find(Long)` for a method,
+/// `UserService(Repo)` for a constructor of `UserService`, the simple name
+/// for a nested type.
+fn child_name(parent: &Symbol, child: &Symbol) -> String {
+    let member = child.fqn.rsplit_once('#').map(|(_, member)| member);
+    match (child.kind, member) {
+        (SymbolKind::Constructor, Some(member)) => {
+            format!("{}{}", parent.name, member.trim_start_matches("<init>"))
+        }
+        (_, Some(member)) => member.to_string(),
+        (_, None) => child.name.clone(),
+    }
+}
+
+/// Where `symbol`'s declaration starts for cutting it out of its type's
+/// outline: the start of its Javadoc's first line, unless code precedes it
+/// on that line (then the declaration itself).
+fn declaration_start(source: &str, symbol: &Symbol) -> usize {
+    let line_start = source
+        .match_indices('\n')
+        .nth(symbol.history_start_line.saturating_sub(2))
+        .map(|(index, _)| index + 1)
+        .filter(|_| symbol.history_start_line > 1)
+        .unwrap_or(0);
+    let prefix = source
+        .get(line_start..symbol.start_byte)
+        .unwrap_or_default()
+        .trim_start();
+    if line_start <= symbol.start_byte && (prefix.is_empty() || prefix.starts_with("/**")) {
+        line_start
+    } else {
+        symbol.start_byte
+    }
 }
 
 /// Every member's tickets with what the index `tickets` table knows about
@@ -3110,12 +3398,14 @@ public class UserService {
 
     const BRIEF: &str = r#"{"summary": "Adds the service.", "purpose": "Users need it."}"#;
     const DESCRIBED: &str = r#"{"what": "Returns the value.", "why": ""}"#;
+    const TYPE_DESCRIBED: &str = r#"{"what": "Serves the values.", "why": ""}"#;
     const BLANK: &str = r#"{"summary": " ", "purpose": "Users need it."}"#;
 
     /// A summarizer over `backend`; the summary tests' describe stage gets
     /// [`DESCRIBED`] for every member.
     fn summarizer(store: &Store, backend: &Arc<FakeBackend>, cache_only: bool) -> Summarizer {
         backend.always("Description", DESCRIBED);
+        backend.always("TypeDescription", TYPE_DESCRIBED);
         let config = OllamaConfig {
             url: "http://localhost:11434".to_string(),
             chat_model: "chat".to_string(),
@@ -3499,6 +3789,30 @@ public class UserService {
         backend: &Arc<FakeBackend>,
         cache_only: bool,
     ) -> IndexStats {
+        backend.always("TypeDescription", TYPE_DESCRIBED);
+        run_llm_stages(
+            repo,
+            data,
+            path,
+            jira,
+            backend,
+            cache_only,
+            DescribeConfig::default(),
+        )
+        .await
+    }
+
+    /// An index run with an LLM over `backend` (no standing replies added)
+    /// and `describe` as the prompt settings.
+    async fn run_llm_stages(
+        repo: &Path,
+        data: &Path,
+        path: Option<&Path>,
+        jira: &JiraMode,
+        backend: &Arc<FakeBackend>,
+        cache_only: bool,
+        describe: DescribeConfig,
+    ) -> IndexStats {
         let store = Store::open(data).await.unwrap();
         let config = OllamaConfig {
             url: "http://localhost:11434".to_string(),
@@ -3508,7 +3822,7 @@ public class UserService {
             temperature: 0.0,
         };
         let client = LlmClient::new(backend.clone(), store.connect_cache().unwrap(), &config);
-        let llm = Summarizer::new(client, cache_only);
+        let llm = Summarizer::new(client, cache_only).with_describe(describe);
         let stats = build_index(&store, repo, path, &ticket_regex(), jira, Some(&llm))
             .await
             .unwrap();
@@ -3524,6 +3838,15 @@ public class UserService {
                 + stats.describe_incomplete
                 + stats.describe_skipped,
             stats.describe_members,
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.types_described
+                + stats.types_invalid
+                + stats.types_failed
+                + stats.types_incomplete
+                + stats.types_skipped,
+            stats.type_symbols,
             "{stats:?}"
         );
     }
@@ -3564,7 +3887,8 @@ public class UserService {
         assert_eq!(cold.described_cached, 0);
         assert_eq!(cold.describe_llm.chat_calls, 1);
         assert_eq!(cold.summary_llm.chat_calls, 1);
-        assert_eq!(cold.llm.chat_calls, 2);
+        assert_eq!(cold.type_llm.chat_calls, 1);
+        assert_eq!(cold.llm.chat_calls, 3);
         let prompts = describe_prompts(&backend);
         let prompt = &prompts[0];
         assert!(
@@ -3869,6 +4193,7 @@ CONTEXT>>>
 
         assert_eq!(narrow.describe_members, 1);
         assert_eq!(narrow.described_cached, 1, "same prompt as in the full run");
+        assert_eq!(narrow.types_described_cached, 1, "same type prompt too");
         assert!(quiet.chats().is_empty());
     }
 
@@ -3917,5 +4242,337 @@ CONTEXT>>>
         assert_eq!(stats.describe_llm.chat_retries, 1);
         let prompt = &describe_prompts(&backend)[0];
         assert!(prompt.contains("one Java constructor"), "{prompt}");
+    }
+
+    const ORDERS: &str = "\
+package com.acme;
+
+/** Order book. */
+@Service
+public class Orders extends Base {
+    private final Repo repo;
+
+    /** Creates it. */
+    public Orders(Repo repo) {
+        this.repo = repo;
+    }
+
+    private int helper() { return 1; }
+
+    public static class Line {
+        private int amount;
+
+        public int amount() { return amount; }
+
+        enum Kind { A, B }
+    }
+}
+";
+
+    fn type_reply(what: &str) -> String {
+        format!(r#"{{"what": "{what}", "why": "Billing needs it."}}"#)
+    }
+
+    /// The prompts of the type requests `backend` received.
+    fn type_prompts(backend: &FakeBackend) -> Vec<String> {
+        backend
+            .chats()
+            .into_iter()
+            .filter(|chat| chat.schema_name == "TypeDescription")
+            .map(|chat| chat.messages[0].content.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn types_are_described_bottom_up_from_their_members_and_a_rerun_makes_no_chat_calls() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main/java/com/acme/Orders.java", ORDERS);
+        commit(
+            repo.path(),
+            "GRLD-1 add orders",
+            "2024-01-01T00:00:00+00:00",
+        );
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1")]);
+        let backend = FakeBackend::new();
+        backend.always("TicketSummary", BRIEF);
+        backend.always("Description", DESCRIBED);
+        let replies = [
+            type_reply("Lists the kinds."),
+            type_reply("Holds one order line."),
+            type_reply("Keeps the order book."),
+        ];
+        backend.reply(&replies.iter().map(String::as_str).collect::<Vec<_>>());
+
+        let cold = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &jira_mode(Some(&jira)),
+            &backend,
+            false,
+            DescribeConfig::default(),
+        )
+        .await;
+
+        assert_eq!(cold.type_symbols, 3);
+        assert_eq!(cold.types_described, 3);
+        assert_eq!(cold.type_llm.chat_calls, 3);
+        let prompts = type_prompts(&backend);
+        let kinds: Vec<&str> = prompts
+            .iter()
+            .map(|prompt| {
+                let start = prompt.find("\nType: ").unwrap() + 7;
+                &prompt[start..start + prompt[start..].find('\n').unwrap()]
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "enum com.acme.Orders.Line.Kind",
+                "class com.acme.Orders.Line",
+                "class com.acme.Orders (Spring service)",
+            ],
+            "deepest first"
+        );
+        assert!(
+            prompts[1].contains(
+                "\
+Nested in: class com.acme.Orders
+Javadoc: (none)
+Declaration (members and nested types are cut out and listed below):
+public static class Line {
+    private int amount;
+}
+Members and nested types (what each does):
+- method amount(): Returns the value.
+- enum Kind: Lists the kinds.
+"
+            ),
+            "{}",
+            prompts[1]
+        );
+        assert!(
+            prompts[2].ends_with(
+                "\
+<<<CONTEXT
+Type: class com.acme.Orders (Spring service)
+Javadoc:
+Order book.
+Declaration (members and nested types are cut out and listed below):
+@Service
+public class Orders extends Base {
+    private final Repo repo;
+}
+Members and nested types (what each does):
+- constructor Orders(Repo): Returns the value.
+- method helper(): Returns the value.
+- class Line: Holds one order line.
+Change history (the work it was created for, then the most recent changes, newest first):
+- Created for GRLD-1 (Story): Adds the service.
+  Reason: Users need it.
+CONTEXT>>>
+"
+            ),
+            "{}",
+            prompts[2]
+        );
+
+        let quiet = FakeBackend::new();
+        let warm = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &jira_mode(Some(&jira)),
+            &quiet,
+            false,
+            DescribeConfig::default(),
+        )
+        .await;
+        assert_eq!(warm.llm.chat_calls, 0, "a rerun makes no LLM calls");
+        assert_eq!(warm.types_described_cached, 3);
+        assert!(quiet.chats().is_empty());
+
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let output = crate::show::render(reader.connection(), "com.acme.Orders")
+            .await
+            .unwrap();
+        assert!(
+            output.starts_with(
+                "\
+com.acme.Orders [class] role=service
+  - file: src/main/java/com/acme/Orders.java:4-22
+  - signature: public class Orders extends Base
+  - what: Keeps the order book.
+  - why: Billing needs it.
+"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "
+  com.acme.Orders.Line [class]
+    - file: src/main/java/com/acme/Orders.java:15-21
+    - signature: public static class Line
+    - what: Holds one order line.
+    - why: Billing needs it.
+"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "
+    com.acme.Orders.Line.Kind [enum]
+      - file: src/main/java/com/acme/Orders.java:20-20
+      - signature: enum Kind
+      - what: Lists the kinds.
+"
+            ),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn type_lists_public_members_first_up_to_the_cap() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Orders.java", ORDERS);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.always("Description", DESCRIBED);
+        backend.always("TypeDescription", TYPE_DESCRIBED);
+        let config = DescribeConfig {
+            type_members: 1,
+            ..DescribeConfig::default()
+        };
+
+        run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
+            &backend,
+            false,
+            config,
+        )
+        .await;
+
+        let prompts = type_prompts(&backend);
+        assert!(
+            prompts[2].contains(
+                "\
+Members and nested types (what each does):
+- constructor Orders(Repo): Returns the value.
+- (2 more not listed)
+Change history: (none)
+"
+            ),
+            "{}",
+            prompts[2]
+        );
+        assert!(
+            prompts[1].contains("- method amount(): Returns the value.\n- (1 more not listed)\n"),
+            "{}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_member_is_listed_bare_and_a_missing_one_holds_its_types_back() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Orders.java", ORDERS);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.always("TypeDescription", TYPE_DESCRIBED);
+        let blank = r#"{"what": " ", "why": ""}"#;
+        backend.reply(&[DESCRIBED, DESCRIBED, blank, blank]);
+
+        let first = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
+            &backend,
+            false,
+            DescribeConfig::default(),
+        )
+        .await;
+
+        assert_eq!(first.describe_invalid, 1, "Line#amount() is invalid");
+        assert_eq!(first.types_described, 3);
+        let prompts = type_prompts(&backend);
+        assert!(
+            prompts[1].contains("- method amount(): (not described)\n"),
+            "{}",
+            prompts[1]
+        );
+
+        let quiet = FakeBackend::new();
+        let cache_only = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
+            &quiet,
+            true,
+            DescribeConfig::default(),
+        )
+        .await;
+
+        assert_eq!(cache_only.describe_skipped, 1, "the invalid one is a miss");
+        assert_eq!(cache_only.types_described, 1, "Kind lists no members");
+        assert_eq!(
+            cache_only.types_incomplete, 2,
+            "Line waits for amount(), Orders for Line"
+        );
+        assert!(quiet.chats().is_empty());
+        assert_eq!(
+            what_why(data.path(), "com.acme.Orders.Line").await,
+            (None, None)
+        );
+        assert_eq!(what_why(data.path(), "com.acme.Orders").await, (None, None));
+        assert_eq!(
+            what_why(data.path(), "com.acme.Orders.Line.Kind").await.0,
+            Some("Serves the values.".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn type_with_an_unfetched_chosen_ticket_waits() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.always("Description", DESCRIBED);
+        backend.always("TypeDescription", TYPE_DESCRIBED);
+
+        let stats = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Offline,
+            &backend,
+            false,
+            DescribeConfig::default(),
+        )
+        .await;
+
+        assert_eq!(stats.describe_incomplete, 1);
+        assert_eq!(stats.types_incomplete, 1);
+        assert_eq!(stats.type_llm.chat_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_summarizer_types_are_skipped() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Orders.java", ORDERS);
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = index_with(repo.path(), data.path(), None).await.unwrap();
+
+        assert_eq!(stats.type_symbols, 3);
+        assert_eq!(stats.types_skipped, 3);
+        assert_describe_buckets(&stats);
     }
 }
