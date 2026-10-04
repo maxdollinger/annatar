@@ -33,8 +33,9 @@ enum TicketInfo {
     Available {
         issue_type: String,
         summary: String,
-        /// The model's summary and purpose, when the ticket has them.
-        brief: Option<(String, String)>,
+        /// The model's summary, when the ticket has one, and its purpose
+        /// (`None` when the ticket gives no reason).
+        brief: Option<(String, Option<String>)>,
     },
     Unavailable,
 }
@@ -185,7 +186,7 @@ async fn load_ticket_info(conn: &Connection) -> Result<HashMap<String, TicketInf
             (0, Some(issue_type), Some(summary)) => TicketInfo::Available {
                 issue_type,
                 summary,
-                brief: llm_summary.zip(llm_purpose),
+                brief: llm_summary.map(|summary| (summary, llm_purpose)),
             },
             (0, _, _) => anyhow::bail!("tickets row for {key} has content missing"),
             _ => TicketInfo::Unavailable,
@@ -263,7 +264,9 @@ fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut Stri
             ));
             if let Some((summary, purpose)) = brief {
                 out.push_str(&format!("{field}    summary: {summary}\n"));
-                out.push_str(&format!("{field}    purpose: {purpose}\n"));
+                if let Some(purpose) = purpose {
+                    out.push_str(&format!("{field}    purpose: {purpose}\n"));
+                }
             }
         }
     }

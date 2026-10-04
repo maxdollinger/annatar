@@ -29,13 +29,18 @@
 //! implements it with `reqwest` and retries a 503 or a failed connection once,
 //! tests use a fake. [`LlmStats`] counts backend calls and cache hits, so a
 //! caller can show that a rerun made no LLM calls.
+//!
+//! The client is also the run's circuit breaker for the chat model (see
+//! [`LlmClient`]): once tripped, or with `--no-llm`, every stage gets cached
+//! completions only. [`LlmClient::check_chat_model`] fails a run whose chat
+//! model does not exist.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -70,6 +75,10 @@ pub const MAX_ATTEMPTS: usize = 2;
 
 /// Texts per embedding request.
 pub const EMBED_BATCH: usize = 64;
+
+/// Completions in a row that end in [`InvalidOutput`] before the client stops
+/// calling the chat model for the run.
+pub const MAX_CONSECUTIVE_INVALID: usize = 5;
 
 /// One chat message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -149,10 +158,16 @@ pub trait LlmBackend: Send + Sync {
     /// One vector per text, in input order. `texts` is never empty.
     fn embed<'a>(&'a self, model: &'a str, texts: &'a [String])
     -> BackendFuture<'a, Vec<Vec<f32>>>;
+
+    /// Whether the server has `model`: `Ok(false)` when it answers that the
+    /// model does not exist, `Err` when it cannot tell (unreachable, other
+    /// errors).
+    fn has_model<'a>(&'a self, model: &'a str) -> BackendFuture<'a, bool>;
 }
 
 /// Ollama's OpenAI-compatible API: `/v1/chat/completions` and
-/// `/v1/embeddings`.
+/// `/v1/embeddings`, plus the native `/api/show` to check that a model exists
+/// (it accepts every model name, including ones with a `/`).
 pub struct OllamaBackend {
     http: reqwest::Client,
     base_url: String,
@@ -186,14 +201,14 @@ impl OllamaBackend {
         format!("{}/v1/{path}", self.base_url)
     }
 
-    /// `POST` `body` to `path` and return the JSON of a 2xx answer; any other
-    /// status is an error carrying Ollama's message. A transient failure (see
-    /// [`transient_status`]) is retried once after a short backoff.
-    async fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = self.url(path);
+    /// `POST` `body` to `url` and return the JSON of a 2xx answer; any other
+    /// status is an [`HttpError`] carrying Ollama's message. A transient
+    /// failure (see [`transient_status`]) is retried once after a short
+    /// backoff.
+    async fn post(&self, url: &str, body: &Value) -> Result<Value> {
         let mut attempt = 1;
         loop {
-            match self.post_once(&url, body).await {
+            match self.post_once(url, body).await {
                 Err((err, true)) if attempt < HTTP_ATTEMPTS => {
                     tracing::warn!(attempt, "transient Ollama failure, retrying: {err:#}");
                     tokio::time::sleep(self.retry_backoff).await;
@@ -230,15 +245,37 @@ impl OllamaBackend {
             error_body.extend_from_slice(&chunk[..take]);
         }
         Err((
-            anyhow!(
-                "{url} answered HTTP {}: {}",
-                status.as_u16(),
-                error_message(&error_body)
-            ),
+            HttpError {
+                url: url.to_string(),
+                status: status.as_u16(),
+                message: error_message(&error_body),
+            }
+            .into(),
             transient_status(status),
         ))
     }
 }
+
+/// A non-success HTTP answer from Ollama.
+#[derive(Debug)]
+pub struct HttpError {
+    pub url: String,
+    pub status: u16,
+    /// Ollama's error message, else the start of the body.
+    pub message: String,
+}
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} answered HTTP {}: {}",
+            self.url, self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for HttpError {}
 
 /// Statuses worth one retry: Ollama answers 503 while it is overloaded or
 /// loading. Client errors (4xx) and other server errors are not retried.
@@ -249,7 +286,9 @@ fn transient_status(status: reqwest::StatusCode) -> bool {
 impl LlmBackend for OllamaBackend {
     fn chat<'a>(&'a self, request: &'a ChatRequest) -> BackendFuture<'a, ChatReply> {
         Box::pin(async move {
-            let response = self.post("chat/completions", &chat_body(request)).await?;
+            let response = self
+                .post(&self.url("chat/completions"), &chat_body(request))
+                .await?;
             parse_chat_response(&response)
         })
     }
@@ -261,8 +300,25 @@ impl LlmBackend for OllamaBackend {
     ) -> BackendFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
             let body = json!({ "model": model, "input": texts });
-            let response = self.post("embeddings", &body).await?;
+            let response = self.post(&self.url("embeddings"), &body).await?;
             parse_embeddings_response(&response, texts.len())
+        })
+    }
+
+    fn has_model<'a>(&'a self, model: &'a str) -> BackendFuture<'a, bool> {
+        Box::pin(async move {
+            let url = format!("{}/api/show", self.base_url);
+            match self.post(&url, &json!({ "model": model })).await {
+                Ok(_) => Ok(true),
+                Err(err)
+                    if err
+                        .downcast_ref::<HttpError>()
+                        .is_some_and(|err| err.status == 404) =>
+                {
+                    Ok(false)
+                }
+                Err(err) => Err(err),
+            }
         })
     }
 }
@@ -290,7 +346,8 @@ fn chat_body(request: &ChatRequest) -> Value {
 }
 
 /// The reply of a chat completion. A thinking model's reasoning arrives in
-/// `message.reasoning` and is ignored.
+/// `message.reasoning` and is ignored. A missing or `null` content is an empty
+/// reply: invalid output the client retries, not a backend failure.
 fn parse_chat_response(response: &Value) -> Result<ChatReply> {
     let choice = response
         .pointer("/choices/0")
@@ -298,7 +355,7 @@ fn parse_chat_response(response: &Value) -> Result<ChatReply> {
     let content = choice
         .pointer("/message/content")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("chat response has no message content"))?;
+        .unwrap_or_default();
     Ok(ChatReply {
         content: content.to_string(),
         finish_reason: choice
@@ -400,6 +457,22 @@ impl fmt::Display for InvalidOutput {
 
 impl std::error::Error for InvalidOutput {}
 
+/// The completion is not in the LLM cache and the client makes no chat calls
+/// this run: `--no-llm`, or its circuit breaker tripped.
+#[derive(Debug)]
+pub struct LlmUnavailable;
+
+impl fmt::Display for LlmUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "not in the LLM cache, and the chat model is not called this run"
+        )
+    }
+}
+
+impl std::error::Error for LlmUnavailable {}
+
 /// Counters for one [`LlmClient`]. `chat_calls` and `embed_calls` are backend
 /// requests; a fully cached rerun leaves both at zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -445,6 +518,13 @@ struct Counters {
 
 /// The cached, typed client. Share it by reference (or in an `Arc`) across
 /// concurrent tasks; cache writes are serialised internally.
+///
+/// It carries the run's circuit breaker: after a backend failure of a chat
+/// call (the backend already retried a transient one) or
+/// [`MAX_CONSECUTIVE_INVALID`] invalid completions in a row it warns once and
+/// becomes cache-only, like `--no-llm` ([`LlmClient::set_cache_only`]): every
+/// later completion, in any stage, is answered from the cache or fails with
+/// [`LlmUnavailable`].
 pub struct LlmClient {
     backend: Arc<dyn LlmBackend>,
     cache: Connection,
@@ -454,6 +534,8 @@ pub struct LlmClient {
     reasoning_effort: Option<String>,
     temperature: f64,
     counters: Counters,
+    cache_only: AtomicBool,
+    consecutive_invalid: AtomicUsize,
 }
 
 impl LlmClient {
@@ -470,8 +552,10 @@ impl LlmClient {
             embedding_model: config.embedding_model.clone(),
             reasoning_effort: Some(config.reasoning_effort.clone())
                 .filter(|effort| !effort.is_empty()),
-            temperature: config.temperature,
+            temperature: normalized_temperature(config.temperature),
             counters: Counters::default(),
+            cache_only: AtomicBool::new(false),
+            consecutive_invalid: AtomicUsize::new(0),
         }
     }
 
@@ -494,10 +578,54 @@ impl LlmClient {
         }
     }
 
+    /// Answer completions from the cache only from now on; no chat calls.
+    pub fn set_cache_only(&self) {
+        self.cache_only.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the client makes no chat calls (`--no-llm` or a tripped
+    /// breaker).
+    pub fn is_cache_only(&self) -> bool {
+        self.cache_only.load(Ordering::Relaxed)
+    }
+
+    /// Trip the circuit breaker: cache-only from now on, one warning.
+    fn trip(&self, reason: &str) {
+        if !self.cache_only.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "{reason}; no further chat calls this run, completions come from the LLM cache only"
+            );
+        }
+    }
+
+    /// Check once, before the first LLM stage, that the server has the chat
+    /// model. A missing model is an error (a misconfigured run would
+    /// otherwise finish with no summaries at all); an unreachable server or
+    /// another failure trips the breaker and the run goes on cache-only. A
+    /// cache-only client makes no request.
+    pub async fn check_chat_model(&self) -> Result<()> {
+        if self.is_cache_only() {
+            return Ok(());
+        }
+        match self.backend.has_model(&self.chat_model).await {
+            Ok(true) => Ok(()),
+            Ok(false) => bail!(
+                "the chat model {:?} does not exist on the Ollama server; pull it (`ollama pull {}`) or fix ollama.chat_model",
+                self.chat_model,
+                self.chat_model
+            ),
+            Err(err) => {
+                self.trip(&format!("checking the chat model failed: {err:#}"));
+                Ok(())
+            }
+        }
+    }
+
     /// Answer `prompt` with a `T`, from the cache or the chat model. See the
     /// module docs for retries and caching. A reply that is still invalid
     /// after the retry is an [`InvalidOutput`] error; backend failures are
-    /// returned as is (the backend retries a transient one itself).
+    /// returned as is (the backend retries a transient one itself) and trip
+    /// the breaker. A cache miss on a cache-only client is [`LlmUnavailable`].
     pub async fn complete<T: DeserializeOwned + JsonSchema>(&self, prompt: &str) -> Result<T> {
         self.complete_with(prompt, accept::<T>).await
     }
@@ -518,6 +646,9 @@ impl LlmClient {
         if let Some(value) = self.decode_hit(cached, &type_name, decode) {
             return Ok(value);
         }
+        if self.is_cache_only() {
+            return Err(LlmUnavailable.into());
+        }
 
         let mut request = ChatRequest {
             model: self.chat_model.clone(),
@@ -531,11 +662,13 @@ impl LlmClient {
         loop {
             self.counters.chat_calls.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
-            let reply = self
-                .backend
-                .chat(&request)
-                .await
-                .context("chat completion")?;
+            let reply = match self.backend.chat(&request).await {
+                Ok(reply) => reply,
+                Err(err) => {
+                    self.trip(&format!("the chat model failed: {err:#}"));
+                    return Err(err.context("chat completion"));
+                }
+            };
             tracing::debug!(
                 r#type = %type_name,
                 attempt,
@@ -555,6 +688,7 @@ impl LlmClient {
             }
             match decode(&reply.content) {
                 Ok(value) => {
+                    self.consecutive_invalid.store(0, Ordering::Relaxed);
                     if let Err(err) = self.store_completion(&key, reply.content.trim()).await {
                         tracing::warn!("writing llm cache: {err:#}");
                     }
@@ -568,6 +702,12 @@ impl LlmClient {
                     attempt += 1;
                 }
                 Err(err) => {
+                    let invalid = self.consecutive_invalid.fetch_add(1, Ordering::Relaxed) + 1;
+                    if invalid >= MAX_CONSECUTIVE_INVALID {
+                        self.trip(&format!(
+                            "{invalid} completions in a row were invalid after a retry"
+                        ));
+                    }
                     return Err(InvalidOutput {
                         type_name: type_name.into_owned(),
                         error: err,
@@ -883,6 +1023,11 @@ fn sorted_keys(value: &Value) -> Value {
     }
 }
 
+/// `temperature` with `-0.0` as `0.0`: the same request, one cache key.
+fn normalized_temperature(temperature: f64) -> f64 {
+    if temperature == 0.0 { 0.0 } else { temperature }
+}
+
 /// `llm_cache` key: chat model, reasoning effort, temperature, canonical
 /// schema and prompt.
 fn completion_key(
@@ -896,7 +1041,7 @@ fn completion_key(
         "completion",
         model,
         reasoning_effort.unwrap_or(""),
-        &temperature.to_string(),
+        &normalized_temperature(temperature).to_string(),
         schema,
         prompt,
     ])
@@ -940,15 +1085,35 @@ pub(crate) mod fake {
     /// It records every chat request and embedding batch.
     #[derive(Default)]
     pub struct FakeBackend {
+        model: Mutex<ModelCheck>,
+        model_checks: Mutex<Vec<String>>,
         replies: Mutex<VecDeque<ChatReply>>,
         chats: Mutex<Vec<ChatRequest>>,
         batches: Mutex<Vec<Vec<String>>>,
         short: Mutex<Vec<String>>,
     }
 
+    /// How [`FakeBackend::has_model`] answers.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub enum ModelCheck {
+        #[default]
+        Found,
+        Missing,
+        Fails,
+    }
+
     impl FakeBackend {
         pub fn new() -> Arc<Self> {
             Arc::new(Self::default())
+        }
+
+        pub fn model(&self, check: ModelCheck) {
+            *self.model.lock().unwrap() = check;
+        }
+
+        /// The model names checked so far.
+        pub fn model_checks(&self) -> Vec<String> {
+            self.model_checks.lock().unwrap().clone()
         }
 
         pub fn reply(&self, replies: &[&str]) {
@@ -1017,6 +1182,17 @@ pub(crate) mod fake {
                     .collect())
             })
         }
+
+        fn has_model<'a>(&'a self, model: &'a str) -> BackendFuture<'a, bool> {
+            Box::pin(async move {
+                self.model_checks.lock().unwrap().push(model.to_string());
+                match *self.model.lock().unwrap() {
+                    ModelCheck::Found => Ok(true),
+                    ModelCheck::Missing => Ok(false),
+                    ModelCheck::Fails => Err(anyhow!("server down")),
+                }
+            })
+        }
     }
 }
 
@@ -1026,7 +1202,7 @@ mod tests {
 
     use serde::Deserialize;
 
-    use super::fake::{FakeBackend, vector_for};
+    use super::fake::{FakeBackend, ModelCheck, vector_for};
     use super::*;
     use crate::config::Config;
     use crate::store::Store;
@@ -1253,6 +1429,168 @@ mod tests {
         assert!(err.downcast_ref::<InvalidOutput>().is_none());
         assert_eq!(backend.chats().len(), 1);
         assert_eq!(count(&store, "llm_cache").await, 0);
+    }
+
+    fn is_unavailable(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<LlmUnavailable>().is_some()
+    }
+
+    #[tokio::test]
+    async fn backend_failure_trips_the_breaker_for_every_later_completion() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[SUMMARY]);
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.complete::<Summary>("cached").await.unwrap();
+
+        assert!(llm.complete::<Summary>("fails").await.is_err());
+        assert!(llm.is_cache_only());
+        backend.reply(&[SUMMARY]);
+        let err = llm.complete::<Summary>("later").await.unwrap_err();
+        assert!(is_unavailable(&err), "{err:#}");
+        let err = llm.complete::<Verdict>("another stage").await.unwrap_err();
+        assert!(is_unavailable(&err), "{err:#}");
+        assert_eq!(
+            llm.complete::<Summary>("cached").await.unwrap(),
+            summary(),
+            "cached completions are still served"
+        );
+        assert_eq!(backend.chats().len(), 2, "no chat call after the failure");
+    }
+
+    #[tokio::test]
+    async fn backend_failure_on_the_retry_is_a_failure_not_invalid_output() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&["not json"]);
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        let err = llm.complete::<Summary>("prompt").await.unwrap_err();
+
+        assert!(err.downcast_ref::<InvalidOutput>().is_none(), "{err:#}");
+        assert!(format!("{err:#}").contains("no scripted reply"), "{err:#}");
+        assert_eq!(backend.chats().len(), 2);
+        assert_eq!(llm.stats().chat_retries, 1);
+        assert!(llm.is_cache_only(), "the failed retry trips the breaker");
+        assert_eq!(count(&store, "llm_cache").await, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_reply_is_invalid_output_and_retried() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply_with(ChatReply::stop(""));
+        backend.reply(&[SUMMARY]);
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        assert_eq!(llm.complete::<Summary>("prompt").await.unwrap(), summary());
+        assert_eq!(llm.stats().chat_retries, 1);
+        assert!(!llm.is_cache_only());
+    }
+
+    #[tokio::test]
+    async fn consecutive_invalid_completions_trip_the_breaker() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        for round in 0..MAX_CONSECUTIVE_INVALID - 1 {
+            backend.reply(&["x", "x"]);
+            let err = llm
+                .complete::<Summary>(&format!("bad {round}"))
+                .await
+                .unwrap_err();
+            assert!(err.downcast_ref::<InvalidOutput>().is_some(), "{err:#}");
+        }
+        backend.reply(&[SUMMARY]);
+        llm.complete::<Summary>("good").await.unwrap();
+        assert!(!llm.is_cache_only(), "a valid reply resets the count");
+
+        for round in 0..MAX_CONSECUTIVE_INVALID {
+            assert!(!llm.is_cache_only());
+            backend.reply(&["x", "x"]);
+            let err = llm
+                .complete::<Summary>(&format!("worse {round}"))
+                .await
+                .unwrap_err();
+            assert!(err.downcast_ref::<InvalidOutput>().is_some(), "{err:#}");
+        }
+        assert!(llm.is_cache_only());
+        let calls = backend.chats().len();
+        let err = llm.complete::<Summary>("next").await.unwrap_err();
+        assert!(is_unavailable(&err), "{err:#}");
+        assert_eq!(backend.chats().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn cache_only_client_never_calls_the_backend() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        backend.reply(&[SUMMARY]);
+        client(&backend, &store, &ollama("chat"))
+            .complete::<Summary>("cached")
+            .await
+            .unwrap();
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.set_cache_only();
+        backend.reply(&[SUMMARY]);
+
+        assert_eq!(llm.complete::<Summary>("cached").await.unwrap(), summary());
+        let err = llm.complete::<Summary>("missing").await.unwrap_err();
+        assert!(is_unavailable(&err), "{err:#}");
+        llm.check_chat_model().await.unwrap();
+        assert!(backend.model_checks().is_empty());
+        assert_eq!(backend.chats().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_model_check_fails_on_a_missing_model_and_trips_on_errors() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.check_chat_model().await.unwrap();
+        assert!(!llm.is_cache_only());
+        assert_eq!(backend.model_checks(), vec!["chat".to_string()]);
+
+        backend.model(ModelCheck::Missing);
+        let err = llm.check_chat_model().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the chat model \"chat\" does not exist"),
+            "{err:#}"
+        );
+
+        backend.model(ModelCheck::Fails);
+        llm.check_chat_model().await.unwrap();
+        assert!(
+            llm.is_cache_only(),
+            "an unreachable server trips the breaker"
+        );
+    }
+
+    #[test]
+    fn negative_zero_temperature_is_the_same_key() {
+        assert_eq!(
+            completion_key("m", None, -0.0, "{}", "p"),
+            completion_key("m", None, 0.0, "{}", "p")
+        );
+        assert_ne!(
+            completion_key("m", None, 0.5, "{}", "p"),
+            completion_key("m", None, 0.0, "{}", "p")
+        );
+        let mut config = ollama("chat");
+        config.temperature = -0.0;
+        assert!(normalized_temperature(config.temperature).is_sign_positive());
+    }
+
+    #[tokio::test]
+    async fn backend_checks_a_model_with_api_show() {
+        let missing = r#"{"error": "model 'nope:latest' not found"}"#;
+        let (url, served) = serve(vec![(200, "{}"), (404, missing), (500, BUSY)]);
+        let backend = quick_backend(&url);
+        assert!(backend.has_model("chat").await.unwrap());
+        assert!(!backend.has_model("nope").await.unwrap());
+        let err = backend.has_model("chat").await.unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP 500"), "{err:#}");
+        assert_eq!(served.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1752,7 +2090,11 @@ mod tests {
         assert!(cut.truncated());
         assert_eq!(cut.prompt_tokens, None);
         assert!(parse_chat_response(&json!({"choices": []})).is_err());
-        assert!(parse_chat_response(&json!({"choices": [{"message": {}}]})).is_err());
+        for message in [json!({}), json!({"content": null})] {
+            let reply = parse_chat_response(&json!({"choices": [{"message": message}]}))
+                .expect("no content is an empty reply, not a backend failure");
+            assert_eq!(reply.content, "");
+        }
     }
 
     #[test]

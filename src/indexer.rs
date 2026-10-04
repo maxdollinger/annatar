@@ -41,7 +41,7 @@ use regex::Regex;
 
 use crate::history::{self, Commit, HistoryCache};
 use crate::jira::{FetchError, Ticket};
-use crate::llm::{InvalidOutput, LlmStats};
+use crate::llm::{InvalidOutput, LlmStats, LlmUnavailable};
 use crate::store::Store;
 use crate::summaries::{Summarizer, TicketSummary, ticket_prompt, validate_summary};
 use crate::symbols::{JavaParser, Symbol};
@@ -146,7 +146,9 @@ pub struct IndexStats {
 /// other outcomes.
 ///
 /// `llm` summarises the available tickets; `None` (no `[ollama]` section)
-/// leaves them without a summary. LLM failures never fail the run; see
+/// leaves them without a summary. Its chat model is checked once before the
+/// stages run: a model the server does not have fails the run (like rejected
+/// Jira credentials). Other LLM failures never fail the run; see
 /// `index_summaries`.
 pub async fn build_index(
     store: &Store,
@@ -176,6 +178,10 @@ pub async fn build_index(
             index = %store.index_path().display(),
             "--path run: the index will be replaced by one holding only this prefix"
         );
+    }
+
+    if let Some(llm) = llm {
+        llm.client.check_chat_model().await?;
     }
 
     let build = store.begin_index().await?;
@@ -621,21 +627,21 @@ async fn fetch_tickets(
 /// Summaries stage: every available ticket in the index `tickets` table (read
 /// on the build transaction, in key order) gets an English summary and
 /// purpose from the chat model, through the LLM cache, written to
-/// `llm_summary` / `llm_purpose`. Unavailable tickets are left alone.
+/// `llm_summary` / `llm_purpose` (`NULL` purpose when the ticket gives no
+/// reason). Unavailable tickets are left alone. The prompt depends on the
+/// ticket alone, so a `--path` run hits the same cache rows.
 ///
 /// Calls are sequential: the host Ollama answers one request at a time, so
 /// concurrency only queues (open #23). Outcomes per ticket: a cached or valid
 /// reply → written; a reply still invalid after the client's retry → one
 /// warning, `summaries_invalid`, nothing cached, retried next run; a backend
-/// failure (after the client's own transient retry) → `summaries_failed` and
-/// the circuit breaker trips on that first failure: one warning, no further
-/// chat call this run, and the remaining tickets still get the summaries the
-/// LLM cache already holds (the rest count as `summaries_skipped`). A down or
-/// hung server would otherwise cost every remaining ticket the connect retry
-/// or the full request timeout. `cache_only` (`--no-llm`) behaves as if the
-/// breaker had tripped before the first ticket. Without a summarizer every
-/// available ticket is `summaries_skipped`. Only an index write error fails
-/// the stage.
+/// failure (after the client's own transient retry) → `summaries_failed`. The
+/// circuit breaker lives on the client (it trips on a backend failure or on
+/// [`crate::llm::MAX_CONSECUTIVE_INVALID`] invalid replies in a row, and
+/// `--no-llm` starts it tripped): from then on, in this and every later LLM
+/// stage, only cached summaries are used and the rest count as
+/// `summaries_skipped`. Without a summarizer every available ticket is
+/// `summaries_skipped`. Only an index write error fails the stage.
 async fn index_summaries(
     transaction: &Transaction,
     llm: Option<&Summarizer>,
@@ -647,54 +653,38 @@ async fn index_summaries(
         stats.summaries_skipped += tickets.len();
         return Ok(());
     };
-    let titles: HashMap<&str, &str> = tickets
-        .iter()
-        .map(|ticket| (ticket.key.as_str(), ticket.summary.as_str()))
-        .collect();
     let started = std::time::Instant::now();
-    let mut cache_only = llm.cache_only;
     for (done, ticket) in tickets.iter().enumerate() {
-        let parent_title = ticket
-            .parent_key
-            .as_deref()
-            .and_then(|parent| titles.get(parent).copied());
-        let prompt = ticket_prompt(ticket, parent_title);
-        let summary = if cache_only {
-            llm.client
-                .cached_with::<TicketSummary, _>(&prompt, validate_summary)
-                .await?
-        } else {
-            match llm
-                .client
-                .complete_with::<TicketSummary, _>(&prompt, validate_summary)
-                .await
-            {
-                Ok(summary) => Some(summary),
-                Err(err) if err.downcast_ref::<InvalidOutput>().is_some() => {
-                    tracing::warn!(
-                        key = ticket.key,
-                        error = format!("{err:#}"),
-                        "no valid ticket summary; skipping it this run"
-                    );
-                    stats.summaries_invalid += 1;
-                    continue;
-                }
-                Err(err) => {
-                    stats.summaries_failed += 1;
-                    cache_only = true;
-                    tracing::warn!(
-                        key = ticket.key,
-                        error = format!("{err:#}"),
-                        remaining = tickets.len() - done - 1,
-                        "the chat model failed; no further chat calls this run, remaining tickets use cached summaries only"
-                    );
-                    continue;
-                }
+        let prompt = ticket_prompt(ticket);
+        let summary = match llm
+            .client
+            .complete_with::<TicketSummary, _>(&prompt, validate_summary)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(err) if err.downcast_ref::<LlmUnavailable>().is_some() => {
+                stats.summaries_skipped += 1;
+                continue;
             }
-        };
-        let Some(summary) = summary else {
-            stats.summaries_skipped += 1;
-            continue;
+            Err(err) if err.downcast_ref::<InvalidOutput>().is_some() => {
+                tracing::warn!(
+                    key = ticket.key,
+                    error = format!("{err:#}"),
+                    "no valid ticket summary; skipping it this run"
+                );
+                stats.summaries_invalid += 1;
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    key = ticket.key,
+                    error = format!("{err:#}"),
+                    remaining = tickets.len() - done - 1,
+                    "the chat model failed; remaining tickets use cached summaries only"
+                );
+                stats.summaries_failed += 1;
+                continue;
+            }
         };
         write_summary(transaction, &ticket.key, &summary).await?;
         stats.summaries += 1;
@@ -711,6 +701,16 @@ async fn index_summaries(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "ticket summaries done"
     );
+    if stats.summaries_invalid + stats.summaries_failed > 0 {
+        tracing::warn!(
+            tickets = tickets.len(),
+            summaries = stats.summaries,
+            invalid = stats.summaries_invalid,
+            failed = stats.summaries_failed,
+            skipped = stats.summaries_skipped,
+            "some tickets got no summary this run; they are asked again next run"
+        );
+    }
     Ok(())
 }
 
@@ -737,11 +737,12 @@ async fn available_tickets(conn: &Connection) -> Result<Vec<Ticket>> {
     Ok(tickets)
 }
 
-/// Store one ticket's summary and purpose in the index `tickets` table.
+/// Store one ticket's summary and purpose (whitespace collapsed, an empty
+/// purpose as `NULL`) in the index `tickets` table.
 async fn write_summary(conn: &Connection, key: &str, summary: &TicketSummary) -> Result<()> {
     conn.execute(
         "UPDATE tickets SET llm_summary = ?2, llm_purpose = ?3 WHERE key = ?1",
-        params![key, summary.summary.trim(), summary.purpose.trim()],
+        params![key, summary.summary_text(), summary.purpose_text()],
     )
     .await
     .with_context(|| format!("writing the summary of ticket {key}"))?;
@@ -1062,7 +1063,8 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_TICKET_REGEX, OllamaConfig};
     use crate::llm::LlmClient;
-    use crate::llm::fake::FakeBackend;
+    use crate::llm::MAX_CONSECUTIVE_INVALID;
+    use crate::llm::fake::{FakeBackend, ModelCheck};
     use crate::store::IndexReader;
     use crate::test_support::{commit, init_repo};
     use crate::tickets::fake::{self, Answer, FakeSource};
@@ -2797,11 +2799,8 @@ public class UserService {
         assert_eq!(cold.llm.chat_hits, 0);
         let chats = backend.chats();
         let prompt = &chats[1].messages[0].content;
-        assert!(prompt.contains("Ticket: GRLD-3\n"), "{prompt}");
-        assert!(
-            prompt.contains("Parent: GRLD-1 (Summary of GRLD-1)\n"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("Key: GRLD-3\n"), "{prompt}");
+        assert!(!prompt.contains("GRLD-1"), "{prompt}");
         assert!(prompt.contains("Description of GRLD-3"), "{prompt}");
         let expected = vec![
             summarised("GRLD-1", "Adds the service.", "Users need it."),
@@ -2952,5 +2951,97 @@ public class UserService {
                 unsummarised("GRLD-2"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn missing_chat_model_fails_the_run_unless_no_llm() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1")]);
+        let backend = FakeBackend::new();
+        backend.model(ModelCheck::Missing);
+        let store = Store::open(data.path()).await.unwrap();
+        let llm = summarizer(&store, &backend, false);
+
+        let err = build_index(
+            &store,
+            repo.path(),
+            None,
+            &ticket_regex(),
+            Some(&jira),
+            Some(&llm),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
+        assert!(backend.chats().is_empty());
+        assert!(!store.index_path().exists(), "no index was written");
+
+        let stats = summarise_with(repo.path(), data.path(), Some(&jira), &backend, true).await;
+        assert_eq!(stats.summaries_skipped, 1);
+        assert_eq!(backend.model_checks().len(), 1, "--no-llm skips the check");
+    }
+
+    #[tokio::test]
+    async fn unreachable_model_server_runs_cache_only() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1")]);
+        let backend = FakeBackend::new();
+        backend.model(ModelCheck::Fails);
+
+        let stats = summarise_with(repo.path(), data.path(), Some(&jira), &backend, false).await;
+
+        assert_eq!(stats.summaries_skipped, 1);
+        assert_eq!(stats.summaries_failed, 0);
+        assert!(backend.chats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consecutive_invalid_summaries_stop_the_chat_calls() {
+        let keys = ["GRLD-1", "GRLD-2", "GRLD-3", "GRLD-4", "GRLD-5", "GRLD-6"];
+        let messages = keys.map(|key| format!("{key} change"));
+        let repo = repo_with_commits(&messages.each_ref().map(String::as_str));
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&keys.map(fake::ticket));
+        let backend = FakeBackend::new();
+        backend.reply(&[BLANK; 12]);
+
+        let stats = summarise_with(repo.path(), data.path(), Some(&jira), &backend, false).await;
+
+        assert_eq!(stats.summaries_invalid, MAX_CONSECUTIVE_INVALID);
+        assert_eq!(stats.summaries_skipped, 1);
+        assert_eq!(stats.llm.chat_calls, 2 * MAX_CONSECUTIVE_INVALID);
+    }
+
+    #[tokio::test]
+    async fn empty_purpose_is_stored_as_null_and_not_shown() {
+        let repo = repo_with_commits(&["GRLD-1 add"]);
+        let data = tempfile::tempdir().unwrap();
+        let jira = jira_with(&[fake::ticket("GRLD-1")]);
+        let backend = FakeBackend::new();
+        backend.reply(&[r#"{"summary": "Adds\nthe service.", "purpose": ""}"#]);
+
+        let stats = summarise_with(repo.path(), data.path(), Some(&jira), &backend, false).await;
+
+        assert_eq!(stats.summaries, 1);
+        assert_eq!(
+            indexed_summaries(data.path()).await,
+            vec![(
+                "GRLD-1".to_string(),
+                Some("Adds the service.".to_string()),
+                None
+            )]
+        );
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let output = crate::show::render(reader.connection(), "com.acme.Service#value()")
+            .await
+            .unwrap();
+        assert!(
+            output.contains("      summary: Adds the service.\n"),
+            "{output}"
+        );
+        assert!(!output.contains("purpose:"), "{output}");
     }
 }
