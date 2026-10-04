@@ -18,9 +18,10 @@
 //! the tickets, never by paraphrasing the generated what/why text, so the
 //! benchmark does not reward the model for matching its own wording.
 //! [`GoldenSet::parse`] validates the file (non-empty, distinct texts, fqn
-//! shape, kind consistent with the fqn) and [`check_index`] reports expected
-//! symbols an index does not hold (a renamed symbol), so a stale question
-//! fails loudly instead of counting as a retrieval miss.
+//! shape without whitespace, kind consistent with the fqn) and
+//! [`check_index`] reports expected symbols an index does not hold (a renamed
+//! symbol), so a stale question fails loudly instead of counting as a
+//! retrieval miss.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -34,64 +35,93 @@ use serde::Deserialize;
 use crate::summaries::collapse_whitespace;
 use crate::symbols::SymbolKind;
 
-/// A whole golden set, in file order.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A whole golden set, in file order. Only [`GoldenSet::parse`] and
+/// [`GoldenSet::load`] build one, so every set is validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoldenSet {
-    /// The `[[question]]` tables.
-    #[serde(rename = "question", default)]
-    pub questions: Vec<Question>,
+    questions: Vec<Question>,
 }
 
 /// One question and the symbols that answer it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
-    /// The question as a developer would ask it.
-    pub text: String,
-    /// The fqn the question is about, then acceptable alternates.
-    pub expect: Vec<String>,
-    /// The kind of the first expected symbol (`class`, `method`, …).
+    text: String,
+    expect: Vec<String>,
+    kind: Option<SymbolKind>,
+    note: Option<String>,
+}
+
+/// The file as written, before validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSet {
+    #[serde(rename = "question", default)]
+    questions: Vec<RawQuestion>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQuestion {
+    text: String,
+    expect: Vec<String>,
     #[serde(default)]
-    pub kind: Option<String>,
-    /// Free text for the reader (why these symbols, what makes it hard).
+    kind: Option<String>,
     #[serde(default)]
-    pub note: Option<String>,
+    note: Option<String>,
 }
 
 impl Question {
+    /// The question as a developer would ask it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The fqn the question is about, then acceptable alternates (never empty).
+    pub fn expect(&self) -> &[String] {
+        &self.expect
+    }
+
     /// The symbol the question is about.
     pub fn primary(&self) -> &str {
         &self.expect[0]
     }
+
+    /// The kind of the first expected symbol, when the file names it.
+    pub fn kind(&self) -> Option<SymbolKind> {
+        self.kind
+    }
+
+    /// Free text for the reader (why these symbols, what makes it hard).
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
 }
 
 /// A type fqn (`com.acme.Orders.Line`) or a member fqn (`com.acme.Orders#find(Long)`,
-/// `com.acme.Orders#<init>()`), parameter types as written.
+/// `com.acme.Orders#<init>()`), parameter types as the index stores them:
+/// as written, without whitespace.
 static FQN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*(#(<init>|[A-Za-z_$][\w$]*)\([\w$.<>,\[\]? ]*\))?$",
+        r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*(#(<init>|[A-Za-z_$][\w$]*)\([\w$.<>,\[\]?]*\))?$",
     )
     .expect("the fqn pattern is valid")
 });
 
-/// The kinds stored in `symbols.kind`.
-const KINDS: &[SymbolKind] = &[
-    SymbolKind::Class,
-    SymbolKind::Interface,
-    SymbolKind::Enum,
-    SymbolKind::Record,
-    SymbolKind::Annotation,
-    SymbolKind::Method,
-    SymbolKind::Constructor,
-];
+/// `kind` with its indefinite article ("a class", "an interface").
+fn with_article(kind: &str) -> String {
+    let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    format!("{article} {kind}")
+}
 
 impl GoldenSet {
     /// Parse and validate a golden set from TOML text.
     pub fn parse(text: &str) -> Result<Self> {
-        let set: GoldenSet = toml::from_str(text).context("parsing the golden set")?;
-        set.validate()?;
-        Ok(set)
+        let raw: RawSet = toml::from_str(text).context("parsing the golden set")?;
+        Self::validate(raw)
     }
 
     /// Read, parse and validate the golden set at `path`.
@@ -101,16 +131,23 @@ impl GoldenSet {
         Self::parse(&text).with_context(|| format!("in golden set {}", path.display()))
     }
 
+    /// The questions, in file order.
+    pub fn questions(&self) -> &[Question] {
+        &self.questions
+    }
+
     /// Reject an empty set, a blank or repeated question (compared ignoring
     /// case and whitespace), a question without expected symbols, a
-    /// malformed or repeated fqn, and a `kind` that is unknown or does not
-    /// fit the first fqn (a member has `#`, a constructor `#<init>(`).
-    fn validate(&self) -> Result<()> {
-        if self.questions.is_empty() {
+    /// malformed (including any whitespace) or repeated fqn, and a `kind`
+    /// that is unknown or does not fit the first fqn (a member has `#`, a
+    /// constructor `#<init>(`).
+    fn validate(raw: RawSet) -> Result<Self> {
+        if raw.questions.is_empty() {
             anyhow::bail!("the golden set has no questions");
         }
         let mut texts = HashSet::new();
-        for (index, question) in self.questions.iter().enumerate() {
+        let mut questions = Vec::with_capacity(raw.questions.len());
+        for (index, question) in raw.questions.into_iter().enumerate() {
             let number = index + 1;
             let text = collapse_whitespace(&question.text).to_lowercase();
             if text.is_empty() {
@@ -119,9 +156,9 @@ impl GoldenSet {
             if !texts.insert(text) {
                 anyhow::bail!("question {number} repeats an earlier question");
             }
-            if question.expect.is_empty() {
+            let Some(primary) = question.expect.first() else {
                 anyhow::bail!("question {number} expects no symbol");
-            }
+            };
             let mut fqns = HashSet::new();
             for fqn in &question.expect {
                 if !FQN.is_match(fqn) {
@@ -131,28 +168,39 @@ impl GoldenSet {
                     anyhow::bail!("question {number} expects {fqn} twice");
                 }
             }
-            if let Some(kind) = &question.kind {
-                let kind = KINDS
-                    .iter()
-                    .find(|known| known.as_str() == kind)
-                    .with_context(|| {
+            let kind = match &question.kind {
+                None => None,
+                Some(name) => {
+                    let kind = SymbolKind::parse(name).with_context(|| {
                         format!(
-                            "question {number}: unknown kind {kind:?} (expected one of {:?})",
-                            KINDS.iter().map(SymbolKind::as_str).collect::<Vec<_>>()
+                            "question {number}: unknown kind {name:?} (expected one of {:?})",
+                            SymbolKind::ALL.map(|kind| kind.as_str())
                         )
                     })?;
-                let primary = question.primary();
-                let fits = match kind {
-                    SymbolKind::Constructor => primary.contains("#<init>("),
-                    SymbolKind::Method => primary.contains('#') && !primary.contains("#<init>("),
-                    _ => !primary.contains('#'),
-                };
-                if !fits {
-                    anyhow::bail!("question {number}: {primary} is not a {}", kind.as_str());
+                    let fits = match kind {
+                        SymbolKind::Constructor => primary.contains("#<init>("),
+                        SymbolKind::Method => {
+                            primary.contains('#') && !primary.contains("#<init>(")
+                        }
+                        _ => !primary.contains('#'),
+                    };
+                    if !fits {
+                        anyhow::bail!(
+                            "question {number}: {primary} is not {}",
+                            with_article(kind.as_str())
+                        );
+                    }
+                    Some(kind)
                 }
-            }
+            };
+            questions.push(Question {
+                text: question.text,
+                expect: question.expect,
+                kind,
+                note: question.note,
+            });
         }
-        Ok(())
+        Ok(GoldenSet { questions })
     }
 }
 
@@ -181,7 +229,12 @@ impl std::fmt::Display for IndexProblem {
                 fqn,
                 expected,
                 actual,
-            } => write!(f, "{fqn} is a {actual}, not a {expected} ({question:?})"),
+            } => write!(
+                f,
+                "{fqn} is {}, not {} ({question:?})",
+                with_article(actual),
+                with_article(expected)
+            ),
         }
     }
 }
@@ -205,13 +258,13 @@ pub async fn check_index(conn: &Connection, set: &GoldenSet) -> Result<Vec<Index
                 continue;
             };
             let actual: String = row.get(0)?;
-            if let Some(expected) = question.kind.as_ref().filter(|_| position == 0)
-                && *expected != actual
+            if let Some(expected) = question.kind.filter(|_| position == 0)
+                && expected.as_str() != actual
             {
                 problems.push(IndexProblem::WrongKind {
                     question: question.text.clone(),
                     fqn: fqn.clone(),
-                    expected: expected.clone(),
+                    expected: expected.as_str().to_string(),
                     actual,
                 });
             }
@@ -239,17 +292,22 @@ mod tests {
     fn loads_the_sample_fixture() {
         let set = GoldenSet::load(&fixture()).unwrap();
 
-        assert_eq!(set.questions.len(), 5);
-        let first = &set.questions[0];
+        assert_eq!(set.questions().len(), 5);
+        let first = &set.questions()[0];
         assert_eq!(first.primary(), "com.acme.sample.UserController#list()");
-        assert_eq!(first.kind.as_deref(), Some("method"));
+        assert_eq!(first.kind(), Some(SymbolKind::Method));
+        assert!(!first.text().is_empty());
         let alternates = set
-            .questions
+            .questions()
             .iter()
-            .find(|question| question.expect.len() > 1)
+            .find(|question| question.expect().len() > 1)
             .expect("a question with an alternate");
-        assert!(alternates.note.is_some());
-        assert!(set.questions.iter().any(|question| question.kind.is_none()));
+        assert!(alternates.note().is_some());
+        assert!(
+            set.questions()
+                .iter()
+                .any(|question| question.kind().is_none())
+        );
     }
 
     #[test]
@@ -263,14 +321,14 @@ expect = [
   "com.acme.Orders.Line",
   "com.acme.Orders#find(Long)",
   "com.acme.Orders#<init>()",
-  "com.acme.Orders#put(Map<UUID, Set<String>>,JwtUtils.JwtInfo,byte[],List<?>)",
+  "com.acme.Orders#put(Map<UUID,Set<String>>,JwtUtils.JwtInfo,byte[],List<?>)",
   "Default",
 ]
 "#,
         )
         .unwrap();
 
-        assert_eq!(set.questions[0].expect.len(), 6);
+        assert_eq!(set.questions()[0].expect().len(), 6);
     }
 
     #[test]
@@ -303,6 +361,9 @@ expect = [\"a.C\"]
             "com.acme.B#find(Long",
             "com.acme.B:12",
             "com.acme.B#a()#b()",
+            "com.acme.B#put(Map<UUID, Set<String>>)",
+            "com.acme.B#find( Long)",
+            " com.acme.B",
         ] {
             let text = format!("[[question]]\ntext = \"q\"\nexpect = [{fqn:?}]");
             assert!(
@@ -340,6 +401,10 @@ expect = [\"a.C\"]
         assert!(
             format!("{:#}", with("method", "a.B#<init>()").unwrap_err())
                 .contains("is not a method")
+        );
+        assert!(
+            format!("{:#}", with("interface", "a.B#b()").unwrap_err())
+                .contains("is not an interface")
         );
         assert!(
             format!("{:#}", with("constructor", "a.B#b()").unwrap_err())
@@ -421,22 +486,20 @@ kind = "class"
         );
         assert_eq!(
             problems[2].to_string(),
-            "a.C is a interface, not a class (\"wrong kind\")"
+            "a.C is an interface, not a class (\"wrong kind\")"
         );
     }
 
     /// Checks a real golden set against a real index: `ANNATAR_GOLDEN_SET`
-    /// (default `.annatar-local/golden-argus.toml`, kept out of git) and
-    /// `ANNATAR_GOLDEN_DATA_DIR` (the data directory holding `index.db`, from
-    /// a full run without `--path`).
+    /// (the set's TOML file, kept out of git) and `ANNATAR_GOLDEN_DATA_DIR`
+    /// (the data directory holding `index.db`, from a full run without
+    /// `--path`).
     #[tokio::test]
     #[ignore = "needs a real golden set and a full index"]
     async fn real_golden_set_matches_the_real_index() {
         let set_path = std::env::var_os("ANNATAR_GOLDEN_SET")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".annatar-local/golden-argus.toml")
-            });
+            .expect("set ANNATAR_GOLDEN_SET to a golden set file");
         let data_dir = std::env::var_os("ANNATAR_GOLDEN_DATA_DIR")
             .map(PathBuf::from)
             .expect("set ANNATAR_GOLDEN_DATA_DIR to the data directory of a full index");
@@ -446,13 +509,13 @@ kind = "class"
         let problems = check_index(reader.connection(), &set).await.unwrap();
 
         let fqns: usize = set
-            .questions
+            .questions()
             .iter()
-            .map(|question| question.expect.len())
+            .map(|question| question.expect().len())
             .sum();
         println!(
             "{} questions, {fqns} expected fqns, {} problems",
-            set.questions.len(),
+            set.questions().len(),
             problems.len()
         );
         assert!(

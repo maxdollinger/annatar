@@ -34,6 +34,22 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [SymbolKind; 7] = [
+        SymbolKind::Class,
+        SymbolKind::Interface,
+        SymbolKind::Enum,
+        SymbolKind::Record,
+        SymbolKind::Annotation,
+        SymbolKind::Method,
+        SymbolKind::Constructor,
+    ];
+
+    /// The kind whose [`as_str`](Self::as_str) text is `text`.
+    pub fn parse(text: &str) -> Option<SymbolKind> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == text)
+    }
+
     /// The stable lowercase text stored in `symbols.kind`.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -722,6 +738,24 @@ fn text(node: Node<'_>, source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_kinds_are_listed_once_and_round_trip() {
+        let position = |kind: SymbolKind| match kind {
+            SymbolKind::Class => 0,
+            SymbolKind::Interface => 1,
+            SymbolKind::Enum => 2,
+            SymbolKind::Record => 3,
+            SymbolKind::Annotation => 4,
+            SymbolKind::Method => 5,
+            SymbolKind::Constructor => 6,
+        };
+        for (index, kind) in SymbolKind::ALL.into_iter().enumerate() {
+            assert_eq!(position(kind), index);
+            assert_eq!(SymbolKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(SymbolKind::parse("type"), None);
+    }
 
     fn parsed(source: &str) -> ParsedFile {
         JavaParser::new()
