@@ -8,9 +8,14 @@
 //! and returns at most about 200 rows. Every hit is scored with the exact
 //! cosine similarity, highest first.
 //!
+//! 5.5 groups the hits by file ([`group_by_file`]) and prints each file
+//! with its types and members ([`format_files`]), the default output of
+//! `annatar search`; [`format_hits`] is the `--symbols` output.
+//!
 //! Search reads `index.db` only. The query's embedding is cached in memory
 //! for the call, never in `cache.db`, so a search creates and writes no file.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -365,6 +370,288 @@ pub fn format_hits(hits: &[Hit]) -> String {
         }
     }
     out
+}
+
+/// Files shown when `--limit` is not given (file-level output, 5.5).
+pub const DEFAULT_FILES: usize = 5;
+
+/// Largest accepted `--limit` for the file-level output: files are ranked
+/// from the [`MAX_LIMIT`] nearest symbols, which on `argus` span 33–54
+/// files, so 20 files never run short of hits.
+pub const MAX_FILES: usize = 20;
+
+/// Member and nested-type lines shown per file before the rest is cut to
+/// `… N more`; hits are always shown.
+pub const MEMBER_LINES: usize = 40;
+
+/// One file of a file-level search: the file of the best symbol hits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileHits {
+    pub file: String,
+    /// The best score of the file's hits.
+    pub score: f64,
+    /// The file's hits, best first.
+    pub hits: Vec<Hit>,
+}
+
+/// Group `hits` (best first) by file: files in the order of their best hit,
+/// at most `files` of them. Hits stop at the first hit of a file beyond the
+/// `files`th, so every file keeps the hits that rank above the last file's
+/// best hit — the symbols a symbol search would have listed to fill
+/// `files` files.
+pub fn group_by_file(hits: &[Hit], files: usize) -> Vec<FileHits> {
+    let mut groups: Vec<FileHits> = Vec::new();
+    for hit in hits {
+        match groups.iter().position(|group| group.file == hit.file) {
+            Some(index) => groups[index].hits.push(hit.clone()),
+            None if groups.len() == files => break,
+            None => groups.push(FileHits {
+                file: hit.file.clone(),
+                score: hit.score,
+                hits: vec![hit.clone()],
+            }),
+        }
+    }
+    groups
+}
+
+/// One symbol of a file shown by a file-level search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileSymbol {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub kind: String,
+    pub role: Option<String>,
+    pub fqn: String,
+    pub file: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub description: Option<String>,
+}
+
+/// Every symbol of `files`, in no particular order.
+pub async fn file_symbols(conn: &Connection, files: &[&str]) -> Result<Vec<FileSymbol>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=files.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values: Vec<Value> = files
+        .iter()
+        .map(|file| Value::Text(file.to_string()))
+        .collect();
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT id, parent_id, kind, role, fqn, file, start_line, end_line, description
+                 FROM symbols WHERE file IN ({placeholders})"
+            ),
+            values,
+        )
+        .await
+        .context("reading the files' symbols")?;
+    let mut symbols = Vec::new();
+    while let Some(row) = rows.next().await.context("reading symbols row")? {
+        symbols.push(FileSymbol {
+            id: row.get(0).context("reading symbols.id")?,
+            parent_id: row.get(1).context("reading symbols.parent_id")?,
+            kind: row.get(2).context("reading symbols.kind")?,
+            role: row.get(3).context("reading symbols.role")?,
+            fqn: row.get(4).context("reading symbols.fqn")?,
+            file: row.get(5).context("reading symbols.file")?,
+            start_line: row.get(6).context("reading symbols.start_line")?,
+            end_line: row.get(7).context("reading symbols.end_line")?,
+            description: row.get(8).context("reading symbols.description")?,
+        });
+    }
+    Ok(symbols)
+}
+
+/// Search like [`search`], but return the `files` files of the best hits:
+/// [`group_by_file`] over the [`MAX_LIMIT`] nearest symbols matching
+/// `filter`.
+pub async fn search_files(
+    conn: &Connection,
+    embedder: &QueryEmbedder,
+    query: &str,
+    filter: &Filter,
+    files: usize,
+) -> Result<Vec<FileHits>> {
+    let hits = search(conn, embedder, query, filter, MAX_LIMIT).await?;
+    Ok(group_by_file(&hits, files))
+}
+
+/// Every symbol of the files of `groups`, for [`format_files`].
+pub async fn group_symbols(conn: &Connection, groups: &[FileHits]) -> Result<Vec<FileSymbol>> {
+    let files: Vec<&str> = groups.iter().map(|group| group.file.as_str()).collect();
+    file_symbols(conn, &files).await
+}
+
+/// The file-level results as text:
+///
+/// ```text
+/// 1. 0.770 src/main/java/com/acme/token/TokenCleanup.java
+///    class com.acme.token.TokenCleanup [service] :18-48 *0.758
+///      Deletes expired user tokens from the database periodically.
+///      #<init>(TokenRepository) :24-27
+///      #deleteExpiredTokens() :32-37 *0.770
+///      enum Mode :40-47
+///        #isStrict() :44-46
+/// ```
+///
+/// per file its rank, best score and path; then each top-level type in
+/// source order as `kind fqn [role] :start-end` with its description on the
+/// next line (whitespace collapsed); under it its members and nested types
+/// in source order, each as the part of its fqn after its parent's
+/// (`#name(params)`, a nested type's `kind Name [role]`) and `:start-end`,
+/// without a description, indented two spaces per level. A symbol among the
+/// group's hits ends with `*score`. A file with more than `member_lines`
+/// member and nested-type lines shows its hits and the first lines in
+/// source order up to `member_lines`, then `… N more`.
+pub fn format_files(groups: &[FileHits], symbols: &[FileSymbol], member_lines: usize) -> String {
+    let mut out = String::new();
+    for (rank, group) in groups.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {:.3} {}\n",
+            rank + 1,
+            group.score,
+            group.file
+        ));
+        format_file(group, symbols, member_lines, &mut out);
+    }
+    out
+}
+
+fn format_file(group: &FileHits, symbols: &[FileSymbol], member_lines: usize, out: &mut String) {
+    let in_file: Vec<&FileSymbol> = symbols
+        .iter()
+        .filter(|symbol| symbol.file == group.file)
+        .collect();
+    let by_id: HashMap<i64, &FileSymbol> =
+        in_file.iter().map(|symbol| (symbol.id, *symbol)).collect();
+    let mut children: HashMap<i64, Vec<&FileSymbol>> = HashMap::new();
+    let mut roots = Vec::new();
+    for symbol in &in_file {
+        match symbol.parent_id.filter(|parent| by_id.contains_key(parent)) {
+            Some(parent) => children.entry(parent).or_default().push(symbol),
+            None => roots.push(*symbol),
+        }
+    }
+    let order = |symbol: &&FileSymbol| (symbol.start_line, symbol.id);
+    roots.sort_by_key(order);
+    for list in children.values_mut() {
+        list.sort_by_key(order);
+    }
+    let scores: HashMap<&str, f64> = group
+        .hits
+        .iter()
+        .map(|hit| (hit.fqn.as_str(), hit.score))
+        .collect();
+
+    let mut members = Vec::new();
+    for root in &roots {
+        descendants(root, &children, 1, &mut members);
+    }
+    let mut shown = HashSet::new();
+    for (symbol, _) in &members {
+        if scores.contains_key(symbol.fqn.as_str()) {
+            let mut current = Some(*symbol);
+            while let Some(symbol) = current {
+                if roots.iter().any(|root| root.id == symbol.id) {
+                    break;
+                }
+                shown.insert(symbol.id);
+                current = symbol
+                    .parent_id
+                    .and_then(|parent| by_id.get(&parent).copied());
+            }
+        }
+    }
+    for (symbol, _) in &members {
+        if shown.len() >= member_lines {
+            break;
+        }
+        shown.insert(symbol.id);
+    }
+
+    let score = |symbol: &FileSymbol| {
+        scores
+            .get(symbol.fqn.as_str())
+            .map_or(String::new(), |score| format!(" *{score:.3}"))
+    };
+    let role = |symbol: &FileSymbol| {
+        symbol
+            .role
+            .as_ref()
+            .map_or(String::new(), |role| format!(" [{role}]"))
+    };
+    for root in &roots {
+        out.push_str(&format!(
+            "   {} {}{} :{}-{}{}\n",
+            root.kind,
+            root.fqn,
+            role(root),
+            root.start_line,
+            root.end_line,
+            score(root)
+        ));
+        if let Some(description) = &root.description {
+            let line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !line.is_empty() {
+                out.push_str(&format!("     {line}\n"));
+            }
+        }
+        let mut list = Vec::new();
+        descendants(root, &children, 1, &mut list);
+        for (symbol, depth) in list {
+            if !shown.contains(&symbol.id) {
+                continue;
+            }
+            let parent = symbol
+                .parent_id
+                .and_then(|parent| by_id.get(&parent))
+                .map_or("", |parent| parent.fqn.as_str());
+            let name = symbol.fqn.strip_prefix(parent).unwrap_or(&symbol.fqn);
+            let indent = "  ".repeat(depth);
+            let is_type = SymbolKind::parse(&symbol.kind).is_some_and(SymbolKind::is_type);
+            if is_type {
+                out.push_str(&format!(
+                    "   {indent}{} {}{}",
+                    symbol.kind,
+                    name.strip_prefix('.').unwrap_or(name),
+                    role(symbol)
+                ));
+            } else {
+                out.push_str(&format!("   {indent}{name}"));
+            }
+            out.push_str(&format!(
+                " :{}-{}{}\n",
+                symbol.start_line,
+                symbol.end_line,
+                score(symbol)
+            ));
+        }
+    }
+    let hidden = members.len() - shown.len();
+    if hidden > 0 {
+        out.push_str(&format!("     … {hidden} more\n"));
+    }
+}
+
+/// `symbol`'s descendants in source order, depth first, each with its depth
+/// below the top-level type (`depth` for the children).
+fn descendants<'a>(
+    symbol: &FileSymbol,
+    children: &HashMap<i64, Vec<&'a FileSymbol>>,
+    depth: usize,
+    out: &mut Vec<(&'a FileSymbol, usize)>,
+) {
+    for child in children.get(&symbol.id).into_iter().flatten() {
+        out.push((child, depth));
+        descendants(child, children, depth + 1, out);
+    }
 }
 
 #[cfg(test)]
@@ -834,5 +1121,232 @@ mod tests {
 "
         );
         assert_eq!(format_hits(&[]), "");
+    }
+
+    fn hit_in(score: f64, fqn: &str, file: &str) -> Hit {
+        Hit {
+            score,
+            fqn: fqn.to_string(),
+            kind: if fqn.contains('#') { "method" } else { "class" }.to_string(),
+            role: None,
+            file: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn hits_group_by_file_in_the_order_of_their_best_hit() {
+        let hits = [
+            hit_in(0.9, "a.A#run()", "A.java"),
+            hit_in(0.8, "a.B", "B.java"),
+            hit_in(0.7, "a.A", "A.java"),
+            hit_in(0.6, "a.C", "C.java"),
+            hit_in(0.5, "a.B#go()", "B.java"),
+        ];
+
+        let groups = group_by_file(&hits, 2);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.file.as_str(), group.score, fqns(&group.hits)))
+                .collect::<Vec<_>>(),
+            [
+                ("A.java", 0.9, vec!["a.A#run()", "a.A"]),
+                ("B.java", 0.8, vec!["a.B"]),
+            ]
+        );
+        let all = group_by_file(&hits, 5);
+        assert_eq!(all.len(), 3);
+        assert_eq!(fqns(&all[1].hits), ["a.B", "a.B#go()"]);
+        assert!(group_by_file(&[], 5).is_empty());
+    }
+
+    fn symbol(
+        id: i64,
+        parent_id: Option<i64>,
+        kind: &str,
+        fqn: &str,
+        lines: (i64, i64),
+    ) -> FileSymbol {
+        FileSymbol {
+            id,
+            parent_id,
+            kind: kind.to_string(),
+            role: None,
+            fqn: fqn.to_string(),
+            file: "src/a/Token.java".to_string(),
+            start_line: lines.0,
+            end_line: lines.1,
+            description: Some(format!("{fqn} does\n  things.")),
+        }
+    }
+
+    /// `Token.java`: a service class with a constructor, two methods and a
+    /// nested enum with a method and a nested-nested record, listed out of
+    /// source order; then a second top-level class.
+    fn token_file() -> Vec<FileSymbol> {
+        let mut service = symbol(1, None, "class", "a.Token", (3, 60));
+        service.role = Some("service".to_string());
+        let mut mode = symbol(5, Some(1), "enum", "a.Token.Mode", (40, 55));
+        mode.role = Some("component".to_string());
+        vec![
+            symbol(4, Some(1), "method", "a.Token#delete(Long)", (30, 38)),
+            service,
+            symbol(2, Some(1), "constructor", "a.Token#<init>(Repo)", (10, 14)),
+            symbol(3, Some(1), "method", "a.Token#find(Long)", (16, 28)),
+            mode,
+            symbol(7, Some(5), "record", "a.Token.Mode.Pair", (50, 54)),
+            symbol(6, Some(5), "method", "a.Token.Mode#strict()", (44, 48)),
+            symbol(8, None, "class", "a.TokenHelper", (62, 70)),
+            symbol(9, Some(8), "method", "a.TokenHelper#help()", (64, 69)),
+        ]
+    }
+
+    fn token_group(hits: &[(f64, &str)]) -> FileHits {
+        FileHits {
+            file: "src/a/Token.java".to_string(),
+            score: hits[0].0,
+            hits: hits
+                .iter()
+                .map(|(score, fqn)| hit_in(*score, fqn, "src/a/Token.java"))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn files_format_as_types_with_descriptions_and_members_with_lines() {
+        let group = token_group(&[(0.8123, "a.Token.Mode#strict()"), (0.75, "a.Token")]);
+        let mut other = symbol(10, None, "interface", "b.Other", (1, 9));
+        other.file = "src/b/Other.java".to_string();
+        other.description = None;
+        let mut symbols = token_file();
+        symbols.push(other);
+        let groups = [
+            group,
+            FileHits {
+                file: "src/b/Other.java".to_string(),
+                score: 0.5,
+                hits: vec![hit_in(0.5, "b.Other", "src/b/Other.java")],
+            },
+        ];
+
+        assert_eq!(
+            format_files(&groups, &symbols, MEMBER_LINES),
+            "\
+1. 0.812 src/a/Token.java
+   class a.Token [service] :3-60 *0.750
+     a.Token does things.
+     #<init>(Repo) :10-14
+     #find(Long) :16-28
+     #delete(Long) :30-38
+     enum Mode [component] :40-55
+       #strict() :44-48 *0.812
+       record Pair :50-54
+   class a.TokenHelper :62-70
+     a.TokenHelper does things.
+     #help() :64-69
+2. 0.500 src/b/Other.java
+   interface b.Other :1-9 *0.500
+"
+        );
+        assert_eq!(format_files(&[], &symbols, MEMBER_LINES), "");
+    }
+
+    #[test]
+    fn long_files_keep_their_hits_and_the_first_members() {
+        let group = token_group(&[(0.9, "a.Token.Mode.Pair"), (0.8, "a.TokenHelper#help()")]);
+
+        assert_eq!(
+            format_files(&[group], &token_file(), 4),
+            "\
+1. 0.900 src/a/Token.java
+   class a.Token [service] :3-60
+     a.Token does things.
+     #<init>(Repo) :10-14
+     enum Mode [component] :40-55
+       record Pair :50-54 *0.900
+   class a.TokenHelper :62-70
+     a.TokenHelper does things.
+     #help() :64-69 *0.800
+     … 3 more
+"
+        );
+        let group = token_group(&[(0.9, "a.Token")]);
+        assert!(format_files(&[group], &token_file(), 0).ends_with(
+            "   class a.TokenHelper :62-70\n     a.TokenHelper does things.\n     … 7 more\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_search_ranks_files_by_filtered_hits_and_shows_whole_files() {
+        let data = index(true, META).await;
+        let reader = IndexReader::open(data.path()).await.unwrap();
+        let embedder = QueryEmbedder::new(FakeBackend::new(), &ollama(MODEL))
+            .await
+            .unwrap();
+        // vector_for("a") = [1, 97, 1]: the service file first.
+        let groups = search_files(reader.connection(), &embedder, "a", &Filter::default(), 5)
+            .await
+            .unwrap();
+        let symbols = group_symbols(reader.connection(), &groups).await.unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.file.as_str(), fqns(&group.hits)))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "src/web2/UserService.java",
+                    vec![
+                        "com.acme.UserService",
+                        "com.acme.UserService#find(Long)",
+                        "com.acme.UserService#<init>()"
+                    ]
+                ),
+                (
+                    "src/web/UserController.java",
+                    vec![
+                        "com.acme.UserController#get(Long)",
+                        "com.acme.UserController"
+                    ]
+                ),
+            ]
+        );
+        assert_eq!(symbols.len(), ROWS.len());
+
+        let controllers = Filter {
+            roles: vec![Role::Controller],
+            ..Filter::default()
+        };
+        let groups = search_files(reader.connection(), &embedder, "a", &controllers, 5)
+            .await
+            .unwrap();
+        let symbols = group_symbols(reader.connection(), &groups).await.unwrap();
+        let text = format_files(&groups, &symbols, MEMBER_LINES);
+        assert!(
+            text.starts_with("1. ") && text.contains("src/web/UserController.java\n"),
+            "{text}"
+        );
+        assert!(!text.contains("UserService"), "{text}");
+
+        let constructors = Filter {
+            kinds: vec![SymbolKind::Constructor],
+            ..Filter::default()
+        };
+        let groups = search_files(reader.connection(), &embedder, "a", &constructors, 5)
+            .await
+            .unwrap();
+        let symbols = group_symbols(reader.connection(), &groups).await.unwrap();
+        assert_eq!(fqns(&groups[0].hits), ["com.acme.UserService#<init>()"]);
+        let text = format_files(&groups, &symbols, MEMBER_LINES);
+        assert!(
+            text.contains("     #find(Long) :4-5\n")
+                && text.contains("     #<init>() :5-6 *")
+                && text.contains("   class com.acme.UserService [service] :3-4\n"),
+            "{text}"
+        );
     }
 }
