@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
                 &config.repo,
                 cli.path.as_deref(),
                 &config.ticket_regex,
-                jira.as_ref(),
+                &jira,
                 llm.as_ref(),
             )
             .await?;

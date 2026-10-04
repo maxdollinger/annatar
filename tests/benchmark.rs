@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use annatar::config::DEFAULT_TICKET_REGEX;
 use annatar::indexer::{self, IndexStats};
 use annatar::store::Store;
+use annatar::tickets::JiraMode;
 use regex::Regex;
 
 #[path = "../src/test_support.rs"]
@@ -89,7 +90,7 @@ fn generate(repo: &Path) {
 async fn time_run(repo: &Path, data: &Path, regex: &Regex) -> (IndexStats, Duration) {
     let store = Store::open(data).await.unwrap();
     let start = Instant::now();
-    let stats = indexer::build_index(&store, repo, None, regex, None, None)
+    let stats = indexer::build_index(&store, repo, None, regex, &JiraMode::Disabled, None)
         .await
         .unwrap();
     (stats, start.elapsed())
