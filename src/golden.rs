@@ -15,7 +15,7 @@
 //! `expect` holds the symbol the question is about first, then optional
 //! acceptable alternates; `kind` (optional) is the kind of that first symbol;
 //! `note` is free text for the reader. Questions are written from the code and
-//! the tickets, never by paraphrasing the generated what/why text, so the
+//! the tickets, never by paraphrasing the generated descriptions, so the
 //! benchmark does not reward the model for matching its own wording.
 //! [`GoldenSet::parse`] validates the file (non-empty, distinct texts, fqn
 //! shape without whitespace, kind consistent with the fqn) and

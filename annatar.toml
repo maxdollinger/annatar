@@ -45,6 +45,13 @@ ticket_regex = '\bGRLD-\d+'
 # Sampling temperature sent with chat requests, 0.0 (default: greedy, so a
 # regenerated record matches the cached one) to 2.0. Part of the LLM cache key.
 # temperature = 0.0
+# max_tokens sent with chat requests (default 1024; 0 = not sent): a safety
+# cap that stops a looping reply, far above any real one, not a length limit.
+# A reply cut off at the cap is invalid (retried once, never cached). With a
+# reasoning_effort other than "none" the reasoning counts against it, so raise
+# it then. Not part of the LLM cache key (a complete reply is the same under
+# any cap).
+# max_tokens = 1024
 
 # What goes into the method, constructor and type description prompts. Optional;
 # every value changes the prompts, so changing one misses the LLM cache.
@@ -53,7 +60,8 @@ ticket_regex = '\bGRLD-\d+'
 # (default 3); each with its summary and purpose from the ticket summaries.
 # recent_tickets = 3
 # Most recent commit subjects shown for every member and type, besides its
-# tickets (default 5; merge commits left out).
+# tickets (default 5; merge commits, subjects starting with "Merge " or
+# "Merged ", left out).
 # commit_subjects = 5
 # Characters of the member's source (declaration and body), or of a type's
 # declaration with its members cut out, shown (default 1500); 0 sends only the

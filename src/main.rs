@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
                 stats.jira_requests
             );
             println!(
-                "summaries: {} tickets, {} summarised, {} invalid, {} failed, {} skipped; {} chat calls, {} cache hits, {} retries",
+                "summaries: {} tickets, {} summarised, {} invalid, {} failed, {} skipped; {} chat calls, {} cache hits, {} retries; max {} prompt / {} completion tokens",
                 stats.summary_tickets,
                 stats.summaries,
                 stats.summaries_invalid,
@@ -120,10 +120,12 @@ async fn main() -> Result<()> {
                 stats.summaries_skipped,
                 stats.summary_llm.chat_calls,
                 stats.summary_llm.chat_hits,
-                stats.summary_llm.chat_retries
+                stats.summary_llm.chat_retries,
+                stats.summary_llm.peak_prompt_tokens,
+                stats.summary_llm.peak_completion_tokens
             );
             println!(
-                "describe: {} methods, {} described ({} from cache), {} invalid, {} failed, {} incomplete, {} skipped; {} chat calls, {} cache hits, {} retries",
+                "describe: {} methods, {} described ({} from cache), {} invalid, {} failed, {} incomplete, {} skipped; {} chat calls, {} cache hits, {} retries; max {} prompt / {} completion tokens",
                 stats.describe_members,
                 stats.described,
                 stats.described_cached,
@@ -133,10 +135,12 @@ async fn main() -> Result<()> {
                 stats.describe_skipped,
                 stats.describe_llm.chat_calls,
                 stats.describe_llm.chat_hits,
-                stats.describe_llm.chat_retries
+                stats.describe_llm.chat_retries,
+                stats.describe_llm.peak_prompt_tokens,
+                stats.describe_llm.peak_completion_tokens
             );
             println!(
-                "types: {} types, {} described ({} from cache), {} invalid, {} failed, {} incomplete, {} skipped; {} chat calls, {} cache hits, {} retries",
+                "types: {} types, {} described ({} from cache), {} invalid, {} failed, {} incomplete, {} skipped; {} chat calls, {} cache hits, {} retries; max {} prompt / {} completion tokens",
                 stats.type_symbols,
                 stats.types_described,
                 stats.types_described_cached,
@@ -146,7 +150,9 @@ async fn main() -> Result<()> {
                 stats.types_skipped,
                 stats.type_llm.chat_calls,
                 stats.type_llm.chat_hits,
-                stats.type_llm.chat_retries
+                stats.type_llm.chat_retries,
+                stats.type_llm.peak_prompt_tokens,
+                stats.type_llm.peak_completion_tokens
             );
         }
         Command::Show { fqn } => {

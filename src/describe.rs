@@ -16,8 +16,10 @@
 //!
 //! The model answers with a [`Description`], which [`validate_description`]
 //! checks (blank, control characters, a ticket key, an opener such as "This
-//! method", talk about its sources or missing information). There is no
-//! length limit: the prompt asks for a description as short as possible. The
+//! method", a clearly meta phrase about its sources or missing information).
+//! There is no length limit: the prompt asks for a description as short as
+//! possible without losing information, keeping any reason the code or
+//! history gives for this symbol (product owner, 4.6 follow-up). The
 //! describe stage in [`crate::indexer`] stores it on the member's `symbols`
 //! row.
 //!
@@ -36,10 +38,11 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use crate::config::DescribeConfig;
 use crate::summaries::{
-    check_control_chars, check_no_ticket_key, collapse_whitespace, opener, source_meta_phrase,
+    NO_REASON_REPLIES, check_control_chars, check_no_ticket_key, collapse_whitespace, opener,
 };
 
 /// Longest Javadoc, in characters, that goes into a prompt.
@@ -49,8 +52,9 @@ pub const MAX_JAVADOC_CHARS: usize = 2000;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Description {
-    /// In English, as short as possible: what the code does and, where its
-    /// history explains it, why it exists.
+    /// In English, as short as possible without losing information: what
+    /// the code does and, where its code or history gives one, why it was
+    /// created or changed.
     pub description: String,
 }
 
@@ -237,7 +241,7 @@ pub fn select_history(
             break;
         }
         let subject = collapse_whitespace(&commit.subject);
-        if !subject.is_empty() && !subject.starts_with("Merge ") && !subjects.contains(&subject) {
+        if !subject.is_empty() && !is_merge(&subject) && !subjects.contains(&subject) {
             subjects.push(subject);
         }
     }
@@ -245,6 +249,18 @@ pub fn select_history(
         tickets: chosen,
         commits: subjects,
     })
+}
+
+/// Prefixes of the subjects git ("Merge branch …", "Merge pull request …")
+/// and Bitbucket ("Merged in …", "Merged master into …") give merge commits.
+const MERGE_PREFIXES: &[&str] = &["Merge ", "Merged "];
+
+/// `subject` is a merge commit's: it says which branches met, not what
+/// changed.
+fn is_merge(subject: &str) -> bool {
+    MERGE_PREFIXES
+        .iter()
+        .any(|prefix| subject.starts_with(prefix))
 }
 
 /// The prompt entry of a chosen ticket, or `None` with the key recorded in
@@ -341,15 +357,21 @@ Your description is shown next to the code and used to find it.
 Always answer in English. Use only the information below and do not invent behaviour or reasons. \
 Keep identifiers exactly as written.
 
-Answer with one field, description: describe the {kind} as short as possible, in plain sentences. \
-Say concretely what it does: the domain objects it works on and its important effects or results. \
-When the tickets or commits below say why this {kind} was created or changed, \
-add that reason briefly: the feature, business need or problem it serves. \
-Many changes touched whole files at once (a feature built around it, an upgrade, a migration, a refactoring), \
-so leave the reason out when it would fit every member of the enclosing type equally, \
-when the history only names a project, initiative or upgrade (for example \"a proof of concept for X\"), \
-and for getters, setters, equals, hashCode, toString and constructors that only store their arguments. \
-Do not read a meaning into names alone.
+Answer with one field, description: describe the {kind} as short as possible without losing information. \
+Say concretely what it does and its important effects or results. \
+Where a collective term carries the same information, use it instead of listing items one by one \
+(for example \"the user's profile data\" instead of every field), \
+but keep the details that set this {kind} apart, such as conditions, limits, roles and targets. \
+When the code, Javadoc, tickets or commits below give a reason why this {kind} was created or changed \
+(the feature, business need or problem it serves), keep that reason: never drop it to make the description shorter. \
+Leave out only reasons that are not about this {kind}: many changes touched whole files at once \
+(a feature built around it, an upgrade, a migration, a refactoring), \
+so a reason that would fit every member of the enclosing type equally, \
+or a history that only names a project, initiative or upgrade (for example \"a proof of concept for X\"), \
+does not explain this {kind}. \
+Getters, setters, equals, hashCode, toString and constructors that only store their arguments \
+rarely have a reason of their own: give them one only when the history explains this very {kind} or its field. \
+Do not read a meaning or a reason into names alone.
 Start with a verb (for example \"Returns\", \"Validates\", \"Creates\"); \
 do not start with \"This {kind}\" and do not just repeat its name.
 
@@ -479,8 +501,9 @@ fn dedent(source: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypeDescription {
-    /// In English, as short as possible: what the type is responsible for
-    /// and, where its history explains it, why it exists.
+    /// In English, as short as possible without losing information: what
+    /// the type is responsible for and, where its code or history gives one,
+    /// why it was created or changed.
     pub description: String,
 }
 
@@ -731,18 +754,18 @@ Your description is shown next to the code and used to find it.
 Always answer in English. Use only the information below and do not invent behaviour or reasons. \
 Keep identifiers exactly as written.
 
-Answer with one field, description: describe the {kind} as short as possible, in plain sentences. \
-Say concretely what it is responsible for: the domain objects it works on, \
+Answer with one field, description: describe the {kind} as short as possible without losing information. \
+Say concretely what it is responsible for, \
 summing up its members into one responsibility instead of listing them. \
 Say only what the declaration, Javadoc, members and history below show: \
 do not guess a meaning, platform or use that only a name suggests, and do not expand abbreviations or parts of names \
 that nothing below explains. \
-When the tickets or commits below say why this {kind} was created, \
-add that reason briefly: the feature, business need or problem it serves. \
-The history lists every change to any part of the {kind}, and many of them touched whole files at once \
-(an upgrade, a migration, a refactoring, a feature built mostly elsewhere), \
-so leave the reason out when the history only names a project, initiative or upgrade \
-(for example \"a proof of concept for X\") or explains other parts of the code.{nested}
+When the code, Javadoc, tickets or commits below give a reason why this {kind} was created or changed \
+(the feature, business need or problem it serves), keep that reason: never drop it to make the description shorter. \
+Leave out only reasons that are not about this {kind}: the history lists every change to any part of the {kind}, \
+and many of them touched whole files at once (an upgrade, a migration, a refactoring, a feature built mostly elsewhere), \
+so a history that only names a project, initiative or upgrade (for example \"a proof of concept for X\") \
+or explains other parts of the code does not explain this {kind}.{nested}
 Start with a verb (for example \"Manages\", \"Stores\", \"Exposes\", \"Validates\"); \
 do not start with \"This {kind}\" and do not just repeat its name.
 
@@ -813,11 +836,95 @@ const TYPE_OPENERS: &[&str] = &[
     "this type",
 ];
 
+/// The sources a description could talk about instead of the code, as
+/// singular and plural nouns.
+const DESCRIPTION_SOURCES: &[(&str, bool)] = &[
+    ("ticket", false),
+    ("tickets", true),
+    ("commit", false),
+    ("commits", true),
+    ("commit message", false),
+    ("commit messages", true),
+    ("commit history", false),
+    ("change history", false),
+    ("history", false),
+    ("javadoc", false),
+];
+
+/// What a description could say a source does: "the ticket says", "the
+/// commits do not explain", …
+const SOURCE_VERBS: &[&str] = &["say", "state", "show", "mention", "explain"];
+
+/// What a description could say a source does not do: "the javadoc does not
+/// specify", …
+const NEGATED_VERBS: &[&str] = &["say", "state", "mention", "specify", "explain", "give"];
+
+/// How a description could say that a source lacks something: "not stated
+/// in the ticket", …
+const MISSING_VERBS: &[&str] = &["stated", "specified", "mentioned", "given", "provided"];
+
+/// Phrases of a description that talk about its sources or about missing
+/// information: "according to the {source}", "the {source} says", "the
+/// {source} does not specify", "not stated in the {source}" and "no reason
+/// (is) given/stated/provided". Clearly meta phrases only: a description
+/// describes behaviour, where "does not specify", "the change history",
+/// "the commit message", "the Javadoc settings" or "this ticket" are domain
+/// text.
+static DESCRIPTION_META_PHRASES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut phrases = Vec::new();
+    for &(source, plural) in DESCRIPTION_SOURCES {
+        phrases.push(format!("according to the {source}"));
+        for verb in SOURCE_VERBS {
+            let verb = if plural {
+                verb.to_string()
+            } else {
+                format!("{verb}s")
+            };
+            phrases.push(format!("the {source} {verb}"));
+        }
+        let negations: &[&str] = if plural {
+            &["do not", "don't"]
+        } else {
+            &["does not", "doesn't"]
+        };
+        for negation in negations {
+            for verb in NEGATED_VERBS {
+                phrases.push(format!("the {source} {negation} {verb}"));
+            }
+        }
+        for missing in MISSING_VERBS {
+            phrases.push(format!("not {missing} in the {source}"));
+        }
+    }
+    for given in ["given", "stated", "provided"] {
+        phrases.push(format!("no reason is {given}"));
+        phrases.push(format!("no reason {given}"));
+    }
+    phrases
+});
+
+/// The meta phrase in a symbol description: one of
+/// [`DESCRIPTION_META_PHRASES`] anywhere, or the whole reply being a
+/// stand-in such as "Not specified." or "Unknown".
+pub(crate) fn description_meta_phrase(text: &str) -> Option<&'static str> {
+    let lower = collapse_whitespace(text).to_lowercase();
+    let bare = lower.trim_end_matches(['.', '!']);
+    NO_REASON_REPLIES
+        .iter()
+        .copied()
+        .find(|reply| bare == *reply)
+        .or_else(|| {
+            DESCRIPTION_META_PHRASES
+                .iter()
+                .find(|phrase| lower.contains(phrase.as_str()))
+                .map(String::as_str)
+        })
+}
+
 /// Reject a blank description, control characters other than whitespace, a
 /// ticket key (`ticket_regex`), an opener such as "This method", and talk
-/// about its sources or missing information
-/// ([`crate::summaries::source_meta_phrase`]). There is no length limit. The
-/// message goes back to the model.
+/// about its sources or missing information ([`description_meta_phrase`]).
+/// There is no length limit. The message goes back to the model.
 pub fn validate_description(description: &Description, ticket_regex: &Regex) -> Result<(), String> {
     validate_text(
         &description.description,
@@ -847,7 +954,7 @@ fn validate_text(
     }
     check_control_chars("description", text)?;
     check_no_ticket_key("description", text, ticket_regex)?;
-    if let Some(phrase) = opener(text, openers).or_else(|| source_meta_phrase(text)) {
+    if let Some(phrase) = opener(text, openers).or_else(|| description_meta_phrase(text)) {
         return Err(format!(
             "`description` says \"{phrase}\"; write about what the code does, not about the {subject}, its sources or what they lack"
         ));
@@ -1043,15 +1150,19 @@ mod tests {
                 "2023-01-01T00:00:00+00:00",
             ),
         ];
-        let commits = vec![
+        let mut commits = vec![
             commit("2024-01-01T00:00:00+00:00", "b"),
             commit("2024-01-01T00:00:00+00:00", "a"),
+            commit("2024-01-01T01:00:00+02:00", "c"),
+            commit("2025-01-01T00:00:00+00:00", "d"),
         ];
         let forward = select_history(&tickets, &commits, &config(1)).unwrap();
         tickets.reverse();
+        commits.reverse();
         let backward = select_history(&tickets, &commits, &config(1)).unwrap();
         assert_eq!(forward, backward);
         assert_eq!(keys(&forward), ["GRLD-1", "GRLD-2"]);
+        assert_eq!(forward.commits, ["d", "a", "b"], "c is the oldest in UTC");
         assert_eq!(
             member_prompt(&member(), &forward, 0),
             member_prompt(&member(), &backward, 0)
@@ -1109,6 +1220,11 @@ mod tests {
                 "Merge branch 'feature/GRLD-1' into master",
             ),
             commit("2024-07-01T00:00:00+00:00", "Merge pull request #12 from x"),
+            commit(
+                "2024-08-01T00:00:00+00:00",
+                "Merged in GRLD-1-fix (pull request #283)",
+            ),
+            commit("2024-09-01T00:00:00+00:00", "Merged master into GRLD-1-fix"),
             commit("2023-01-01T00:00:00+00:00", "Initial"),
         ];
         let subjects = vec![
@@ -1296,12 +1412,15 @@ CONTEXT>>>
 
         assert!(prompt.contains("one Java method"), "{prompt}");
         assert!(
-            prompt.contains("describe the method as short as possible")
-                && prompt.contains("say why this method was created or changed")
+            prompt.contains("describe the method as short as possible without losing information")
+                && prompt.contains("instead of listing items one by one")
+                && prompt.contains("give a reason why this method was created or changed")
+                && prompt.contains("keep that reason: never drop it")
                 && prompt.contains("would fit every member of the enclosing type")
                 && prompt.contains("\"a proof of concept for X\")")
-                && prompt.contains("for getters, setters, equals, hashCode, toString")
-                && prompt.contains("Do not read a meaning into names alone"),
+                && prompt.contains("Getters, setters, equals, hashCode, toString")
+                && prompt.contains("when the history explains this very method or its field")
+                && prompt.contains("Do not read a meaning or a reason into names alone"),
             "{prompt}"
         );
         assert!(
@@ -1471,6 +1590,10 @@ CONTEXT>>>
             "Returns the user as the commit history shows.",
             "Returns the user as the Javadoc says.",
             "Returns the user. No reason is given in the history.",
+            "Returns the user; the tickets do not explain why.",
+            "Returns the user, a detail not mentioned in the Javadoc.",
+            "Returns the user. The commits don't say why.",
+            "None",
         ] {
             let err = validate(&description(text)).expect_err(text);
             assert!(err.contains("not about the method"), "{err}");
@@ -1482,8 +1605,26 @@ CONTEXT>>>
             "Checks the session before revoking it, preventing sessions being revoked for no reason.",
             "Publishes the event after the commit of the transaction.",
             "Returns the user. This method exists for admins.",
+            "Uses defaults for fields not specified in the request.",
+            "Returns null when the request does not specify a locale.",
+            "Rejects the request when the header does not state a tenant.",
+            "Records the change history of an order.",
+            "Loads the commit history of a repository.",
+            "Parses the commit message of a build.",
+            "Closes this ticket and notifies the assignee.",
+            "Represents the Javadoc settings of the generator.",
+            "Rolls back when the commit does not succeed.",
+            "Returns the commit state of the transaction.",
+            "Returns null if the order history does not contain the entry.",
         ] {
             assert_eq!(validate(&description(text)), Ok(()), "{text}");
+            assert_eq!(
+                validate_type(&TypeDescription {
+                    description: text.to_string(),
+                }),
+                Ok(()),
+                "{text}"
+            );
         }
         let err = validate(&description("Returns\u{0} X.")).expect_err("NUL");
         assert_eq!(err, "`description` contains control characters");
@@ -1527,7 +1668,9 @@ CONTEXT>>>
             assert_eq!(schema["required"], serde_json::json!(["description"]));
             assert_eq!(schema["additionalProperties"], serde_json::json!(false));
             assert!(
-                schema.to_string().contains("as short as possible"),
+                schema
+                    .to_string()
+                    .contains("as short as possible without losing information"),
                 "{schema}"
             );
         }
@@ -1817,9 +1960,10 @@ public record Point(int x, int y) {
             "{prompt}"
         );
         assert!(
-            prompt.contains("describe the class as short as possible")
+            prompt.contains("describe the class as short as possible without losing information")
                 && prompt.contains("do not expand abbreviations or parts of names")
-                && prompt.contains("say why this class was created")
+                && prompt.contains("give a reason why this class was created or changed")
+                && prompt.contains("keep that reason: never drop it")
                 && prompt.contains("\"a proof of concept for X\")")
                 && prompt
                     .contains("A nested type shares the history of the type it is declared in"),
