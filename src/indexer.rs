@@ -6,7 +6,9 @@
 //!
 //! 1. **structure** (`index_structure`) walks the production files, parses
 //!    each one with a single reusable [`crate::symbols::JavaParser`] and writes
-//!    every symbol to `symbols`;
+//!    every symbol to `symbols`; then **edges** (`index_edges`) resolves the
+//!    type usages between the written symbols over the same parsed trees
+//!    ([`crate::usages`]) and writes them to `edges`;
 //! 2. **history** (`index_history`) attaches each written symbol's commits
 //!    and ticket keys (`symbol_commits`, `symbol_tickets`); skipped when the
 //!    repository is not a git work tree;
@@ -45,6 +47,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libsql::{Connection, Transaction, params};
@@ -63,11 +66,12 @@ use crate::llm::{InvalidOutput, LlmStats, LlmUnavailable, encode_vector};
 use crate::schema;
 use crate::store::Store;
 use crate::summaries::{Summarizer, TicketSummary, ticket_prompt, validate_summary};
-use crate::symbols::{JavaParser, Symbol, SymbolKind};
+use crate::symbols::{Import, JavaParser, ParsedFile, Symbol, SymbolKind, TypeFacts};
 use crate::tickets::{
     CachedTicket, Fetched, JiraMode, TicketCache, TicketFetch, check_auth_with_retry,
     fetch_with_retry,
 };
+use crate::usages::{self, EdgeKind, SourceFile};
 use crate::walk;
 
 /// A summary of one index run.
@@ -203,6 +207,28 @@ pub struct IndexStats {
     pub parse_errors: usize,
     /// Files whose contents could not be read.
     pub unreadable: usize,
+    /// `extends` rows written to `edges`.
+    pub edges_extends: usize,
+    /// `implements` rows written to `edges`.
+    pub edges_implements: usize,
+    /// `instantiate` rows written to `edges`.
+    pub edges_instantiate: usize,
+    /// `reference` rows written to `edges`.
+    pub edges_reference: usize,
+    /// Mentions of type names that resolve to no indexed type (JDK,
+    /// libraries, names outside a `--path` prefix); no edge.
+    pub unresolved_types: usize,
+    /// Distinct names among `unresolved_types`.
+    pub unresolved_type_names: usize,
+    /// Wall time of the edges stage.
+    pub edges_time: Duration,
+}
+
+impl IndexStats {
+    /// Rows written to `edges`, all kinds.
+    pub fn edges(&self) -> usize {
+        self.edges_extends + self.edges_implements + self.edges_instantiate + self.edges_reference
+    }
 }
 
 /// Index every production Java file under `repo` into a fresh `index.db`.
@@ -268,7 +294,7 @@ pub async fn build_index(
             prefix = %prefix.display(),
             files = files.len(),
             index = %store.index_path().display(),
-            "--path run: the index will be replaced by one holding only this prefix"
+            "--path run: the index will be replaced by one holding only this prefix; usages from outside it are missing"
         );
     }
 
@@ -292,7 +318,8 @@ pub async fn build_index(
     };
     let run_before = llm_stats();
 
-    let indexed = index_structure(&transaction, repo, &files, &mut stats).await?;
+    let mut indexed = index_structure(&transaction, repo, &files, &mut stats).await?;
+    index_edges(&transaction, &mut indexed, &mut stats).await?;
     let mut invalid_summaries = HashSet::new();
     if is_repo {
         index_history(
@@ -394,17 +421,29 @@ pub async fn build_index(
         empty = stats.empty,
         parse_errors = stats.parse_errors,
         unreadable = stats.unreadable,
+        edges_extends = stats.edges_extends,
+        edges_implements = stats.edges_implements,
+        edges_instantiate = stats.edges_instantiate,
+        edges_reference = stats.edges_reference,
+        unresolved_types = stats.unresolved_types,
+        unresolved_type_names = stats.unresolved_type_names,
+        edges_ms = stats.edges_time.as_millis() as u64,
         "indexed repository"
     );
     Ok(stats)
 }
 
 /// One file the structure stage parsed, with its source and the rows it
-/// wrote (none if every fqn was a duplicate).
+/// wrote (none if every fqn was a duplicate), and the facts and tree the
+/// edges stage resolves (the tree is dropped by that stage).
 struct IndexedFile {
     path: PathBuf,
     source: String,
     symbols: Vec<IndexedSymbol>,
+    package: String,
+    imports: Vec<Import>,
+    types: Vec<TypeFacts>,
+    tree: Option<tree_sitter::Tree>,
 }
 
 /// One symbol row the structure stage wrote, with what later stages key on.
@@ -454,8 +493,16 @@ async fn index_structure(
         }
         stats.files += 1;
 
-        let mut symbols = Vec::with_capacity(parsed.symbols.len());
-        for symbol in parsed.symbols {
+        let ParsedFile {
+            symbols: parsed_symbols,
+            package,
+            imports,
+            types,
+            tree,
+            ..
+        } = parsed;
+        let mut symbols = Vec::with_capacity(parsed_symbols.len());
+        for symbol in parsed_symbols {
             let content_hash = content_hash(&symbol, &source)
                 .with_context(|| format!("hashing symbol {}", symbol.fqn))?;
             let Some(id) =
@@ -474,9 +521,90 @@ async fn index_structure(
             path: relative.clone(),
             source,
             symbols,
+            package,
+            imports,
+            types,
+            tree,
         });
     }
     Ok(indexed)
+}
+
+/// Unresolved type names logged at `-v`, most frequent first.
+const TOP_UNRESOLVED: usize = 20;
+
+/// Edges stage: resolve the type usages between the symbols the structure
+/// stage wrote and write them to `edges`, one row per distinct (source,
+/// target, kind, line). Only symbols of this run are targets, so a `--path`
+/// run keeps the edges inside its prefix. Fills the `edges_*` and
+/// `unresolved_*` counters and `edges_time`, logs the most frequent
+/// unresolved names at info level and drops the trees.
+async fn index_edges(
+    transaction: &Transaction,
+    indexed: &mut [IndexedFile],
+    stats: &mut IndexStats,
+) -> Result<()> {
+    let start = Instant::now();
+    let files: Vec<SourceFile<'_>> = indexed
+        .iter()
+        .filter_map(|file| {
+            Some(SourceFile {
+                source: &file.source,
+                tree: file.tree.as_ref()?,
+                package: &file.package,
+                imports: &file.imports,
+                types: &file.types,
+                symbols: file
+                    .symbols
+                    .iter()
+                    .map(|row| (&row.symbol, row.id))
+                    .collect(),
+            })
+        })
+        .collect();
+    let found = usages::resolve(&files);
+    for edge in &found.edges {
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, line) VALUES (?1, ?2, ?3, ?4)",
+                params![edge.src, edge.dst, edge.kind.as_str(), edge.line as i64],
+            )
+            .await
+            .context("writing an edge")?;
+        if inserted == 0 {
+            continue;
+        }
+        match edge.kind {
+            EdgeKind::Extends => stats.edges_extends += 1,
+            EdgeKind::Implements => stats.edges_implements += 1,
+            EdgeKind::Instantiate => stats.edges_instantiate += 1,
+            EdgeKind::Reference => stats.edges_reference += 1,
+        }
+    }
+    stats.unresolved_types = found.unresolved.values().sum();
+    stats.unresolved_type_names = found.unresolved.len();
+    let mut names: Vec<(&String, &usize)> = found.unresolved.iter().collect();
+    names.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    if !names.is_empty() {
+        tracing::info!(
+            names = names
+                .iter()
+                .take(TOP_UNRESOLVED)
+                .map(|(name, count)| format!("{name} {count}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            "most frequent unresolved type names"
+        );
+    }
+    drop(files);
+    for file in indexed.iter_mut() {
+        file.tree = None;
+        file.package = String::new();
+        file.imports = Vec::new();
+        file.types = Vec::new();
+    }
+    stats.edges_time = start.elapsed();
+    Ok(())
 }
 
 /// History stage: attach commits and ticket keys to every symbol the
@@ -2221,13 +2349,129 @@ public class UserService {
         assert_eq!(count(conn).await, 1);
     }
 
+    /// Every `edges` row as `src fqn -kind-> dst fqn :line`, sorted.
+    async fn edge_rows(data: &Path) -> Vec<String> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query(
+                "SELECT src.fqn, edges.kind, dst.fqn, edges.line, edges.ambiguous FROM edges
+                 JOIN symbols src ON src.id = edges.src_id
+                 JOIN symbols dst ON dst.id = edges.dst_id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            assert_eq!(row.get::<i64>(4).unwrap(), 0, "no ambiguous type edge");
+            out.push(format!(
+                "{} -{}-> {} :{}",
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+                row.get::<i64>(3).unwrap()
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn type_usages_are_written_to_edges_once_per_line_and_counted() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Model.java",
+            "package com.acme;\npublic class Model {}\ninterface Api {}\nclass Base {}\n",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            "\
+package com.acme;
+import java.util.Map;
+class Service extends Base implements Api {
+    Map<Model, Model> cache;
+    Model load(String key) { return new Model(); }
+}
+",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        let stats = build(repo.path(), data.path()).await.unwrap();
+        assert_eq!(
+            edge_rows(data.path()).await,
+            [
+                "com.acme.Service -extends-> com.acme.Base :3",
+                "com.acme.Service -implements-> com.acme.Api :3",
+                "com.acme.Service -reference-> com.acme.Model :4",
+                "com.acme.Service#load(String) -instantiate-> com.acme.Model :5",
+                "com.acme.Service#load(String) -reference-> com.acme.Model :5",
+            ]
+        );
+        assert_eq!(
+            (
+                stats.edges_extends,
+                stats.edges_implements,
+                stats.edges_instantiate,
+                stats.edges_reference,
+                stats.edges()
+            ),
+            (1, 1, 1, 2, 5),
+            "the two mentions of Model on line 4 are one row"
+        );
+        assert_eq!(
+            (stats.unresolved_types, stats.unresolved_type_names),
+            (2, 2),
+            "Map and String"
+        );
+    }
+
+    #[tokio::test]
+    async fn edges_point_at_the_first_definition_of_a_duplicate_fqn() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/A.java",
+            "package com.acme;\nclass Dup { Target first; }\nclass Target {}\n",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/B.java",
+            "package com.acme;\nclass Dup { Target second() { return null; } }\n",
+        );
+        write(
+            repo.path(),
+            "src/main/java/com/acme/User.java",
+            "package com.acme;\nclass User { Dup dup; }\n",
+        );
+        let data = tempfile::tempdir().unwrap();
+
+        build(repo.path(), data.path()).await.unwrap();
+        assert_eq!(
+            edge_rows(data.path()).await,
+            [
+                "com.acme.Dup -reference-> com.acme.Target :2",
+                "com.acme.User -reference-> com.acme.Dup :2",
+            ],
+            "the dropped copy in B.java is neither a source nor a target"
+        );
+    }
+
     #[tokio::test]
     async fn empty_repo_yields_zero_symbols_without_error() {
         let repo = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
 
         let stats = build(repo.path(), data.path()).await.unwrap();
-        assert_eq!(stats, IndexStats::default());
+        assert_eq!(
+            IndexStats {
+                edges_time: Duration::ZERO,
+                ..stats
+            },
+            IndexStats::default()
+        );
 
         let reader = IndexReader::open(data.path()).await.unwrap();
         let conn = reader.connection();
@@ -3023,7 +3267,7 @@ public class UserService {
         write(
             repo.path(),
             "src/main/java/com/acme/a/A.java",
-            "package com.acme.a;\nclass A {}\n",
+            "package com.acme.a;\nclass A { com.acme.b.B b; Peer peer; }\nclass Peer {}\n",
         );
         write(
             repo.path(),
@@ -3045,7 +3289,14 @@ public class UserService {
         .unwrap();
         assert_eq!(
             fqns(data.path()).await,
-            vec!["com.acme.a.A", "com.acme.b.B"]
+            vec!["com.acme.a.A", "com.acme.a.Peer", "com.acme.b.B"]
+        );
+        assert_eq!(
+            edge_rows(data.path()).await,
+            [
+                "com.acme.a.A -reference-> com.acme.a.Peer :2",
+                "com.acme.a.A -reference-> com.acme.b.B :2",
+            ]
         );
 
         let stats = build_index(
@@ -3058,12 +3309,18 @@ public class UserService {
         )
         .await
         .unwrap();
-        assert_eq!(stats.symbols, 1);
+        assert_eq!(stats.symbols, 2);
         assert_eq!(
             fqns(data.path()).await,
-            vec!["com.acme.a.A"],
+            vec!["com.acme.a.A", "com.acme.a.Peer"],
             "--path narrows the whole index by design (open #19)"
         );
+        assert_eq!(
+            edge_rows(data.path()).await,
+            ["com.acme.a.A -reference-> com.acme.a.Peer :2"],
+            "only edges between symbols under the prefix"
+        );
+        assert_eq!(stats.unresolved_types, 1, "B is outside the prefix");
     }
 
     async fn index_with(

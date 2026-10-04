@@ -81,6 +81,22 @@ pub const INDEX_TABLES: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )",
+    // 6.2 `edges`: one row per usage site, `src_id` uses `dst_id` on `line`
+    // of `src_id`'s file (see [`crate::usages`]). `kind` is `extends`,
+    // `implements`, `instantiate` or `reference` (6.3 adds `call`, 6.4
+    // `overrides`); `ambiguous = 1` marks one of several overload
+    // candidates (6.3).
+    "CREATE TABLE edges (
+        id INTEGER PRIMARY KEY,
+        src_id INTEGER NOT NULL REFERENCES symbols(id),
+        dst_id INTEGER NOT NULL REFERENCES symbols(id),
+        kind TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        ambiguous INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(src_id, dst_id, kind, line)
+    )",
+    "CREATE INDEX edges_dst_id ON edges(dst_id)",
+    "CREATE INDEX edges_src_id ON edges(src_id)",
 ];
 
 /// `index_meta` key: the embedding model that produced `symbol_vectors`.

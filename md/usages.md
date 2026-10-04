@@ -1,6 +1,6 @@
 # Annatar — Usages
 
-Design of Phase 6: which symbol uses which, `used by` / `uses` in `annatar show` and `annatar trace`. The steps and their *done when* are in [`plan.md`](./plan.md) (Phase 6, authoritative for scope); progress, decisions D-cu–D-cx and open questions #45–#47 are in [`usages_state.md`](./usages_state.md); open #42, the reason for the phase, is in [`state.md`](./state.md). `project.md` describes the target (`edges`, `show`, `trace`).
+Design of Phase 6: which symbol uses which, `used by` / `uses` in `annatar show` and `annatar trace`. The steps and their *done when* are in [`plan.md`](./plan.md) (Phase 6, authoritative for scope); progress, decisions (D-cu onward) and open questions (#45 onward) are in [`usages_state.md`](./usages_state.md); open #42, the reason for the phase, is in [`state.md`](./state.md). `project.md` describes the target (`edges`, `show`, `trace`).
 
 ## Why
 
@@ -38,6 +38,8 @@ Symbol **S uses T** when S's source names T or one of T's members, and the name 
 | `call` | `x.m(..)`, `m(..)`, `T.m(..)`, `super.m(..)`, `super(..)`, `this(..)`, `x::m`, `this::m`, static imports of methods | → method or constructor |
 | `reference` | every other mention of a type: field, parameter, return, local or `var` with a known initializer, cast, `instanceof`, `catch`, `throws`, generic argument (`List<T>`), `T.class`, annotation `@T` and its arguments, a constant `T.X` or a static import of one, a field of T read or written, a Lombok accessor | → type |
 
+The type a member is reached through is a `reference` as well: `T.m()`, `T::m` and `T.X` name `T` (6.2), and 6.3 adds the `call` to `T#m`, so the type side holds even where the member does not resolve. An anonymous class `new T() { .. }` is an `instantiate` of `T`; `new T[n]` creates no `T` and is a `reference`; the header of a local or anonymous class is a `reference` from the member around it (`extends` and `implements` are type → type) (D-dc).
+
 **Where an edge starts.** The innermost method or constructor around the reference. Code in a lambda, an anonymous class or a local class belongs to that member (those classes are not symbols, 1.3). Field declarations and their initializers, static and instance initializer blocks, enum-constant bodies, the class header (`extends`, `implements`) and class annotations belong to the type.
 
 **Not a usage:**
@@ -66,13 +68,13 @@ Tree-sitter gives syntax, not meaning: it says "a call `consume(..)` on the resu
 
 A simple type name in a file resolves in this order — the order `javac` uses:
 
-1. a type nested in the current type or in a type around it (also inherited nested types from an indexed superclass);
+1. a type nested in the super type of an anonymous or local class around the name, then in the current type or in a type around it (also inherited nested types from an indexed superclass); a type's header (`extends`, `implements`, type bounds) and its annotations are outside it, so its own nested types are not in scope there;
 2. a single-type import (`import a.b.Foo;`);
 3. a type in the same package;
 4. a wildcard import (`import a.b.*;`);
 5. otherwise unresolved: `java.lang`, a library type, or a name the run does not know — no edge.
 
-A qualified name (`Outer.Inner`, `com.acme.Foo`) resolves its first part this way and walks down from there.
+A qualified name (`Outer.Inner`, `com.acme.Foo`) resolves its first part this way and walks down from there; the edge goes to the type it ends on (`Inner`), not to `Outer` as well — `show Outer` reaches it through the roll-up of nested types. In `outer.new Inner()` the name is a member of `outer`'s type: no type edge in 6.2 (counted unresolved), 6.3 knows the receiver.
 
 **The same simple name in different packages** is the normal case this order settles. `argus` has four `MessageBearer` classes (`cronus.role`, `cronus.person`, `cronus.user`, `pactum`) and three `MessageConsumer` interfaces. `RoleRelationMessageDispatcher` imports `com.haufe.greenland.argus.messaging.consume.cronus.role.message.MessageBearer`, so every `MessageBearer` in that file is that one, never the `person` or `user` one. Java itself refuses to compile a file in which a used simple name could mean two types, so for compiling code the order gives exactly one answer. The edge cases:
 
@@ -164,7 +166,7 @@ CREATE INDEX edges_src_id ON edges(src_id);
 
 One row per call site, so `show` can print every line. Roll-ups (a type's `used by`) and transitive callers are queries: plain joins and a recursive CTE, as `project.md` plans.
 
-**Pipeline.** A structure-side stage after the symbols are written. Files are parsed again (162 files on `argus`; parsing is cheap next to `git log -L`, the run's bottleneck). `IndexStats` and the `index` summary add edges per kind and unresolved type names and call sites (the most frequent unresolved names at `-v`); the benchmark reports the stage's time.
+**Pipeline.** A structure-side stage after the symbols are written (`index_edges`, module `src/usages.rs`). It walks the syntax trees the structure stage parsed, kept in memory until then and dropped after it (D-db); 7 ms on `argus`'s 162 files. `IndexStats` and the `index` summary add edges per kind and unresolved type names and call sites (the most frequent unresolved names at `-v`); the benchmark reports the stage's time.
 
 **`--path`.** The index holds only the prefix, so only edges between symbols under it are kept; the existing `--path` warning adds that usages from outside the prefix are missing.
 

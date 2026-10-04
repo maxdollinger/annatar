@@ -11,6 +11,9 @@
 //! 3. **changed** — about a tenth of the files rewritten in one new commit, so
 //!    only those files' symbols miss.
 //!
+//! Each class holds a field of the next one, so the edges stage (6.2) has
+//! one type usage per class to resolve; its time is printed per run.
+//!
 //! No network and no `--release`: the timings are from a debug build and
 //! overstate release run time. They are printed, never asserted; only the
 //! exact hit/miss counts are. Run it with:
@@ -49,7 +52,9 @@ fn date(minute: usize) -> String {
 }
 
 fn class_source(class: usize, version: usize) -> String {
-    let mut out = format!("package com.bench;\n\npublic class C{class} {{\n");
+    let next = (class + 1) % FILES;
+    let mut out =
+        format!("package com.bench;\n\npublic class C{class} {{\n    private C{next} next;\n");
     for method in 0..METHODS {
         out.push_str(&format!(
             "    /** method {method} */\n    public int m{method}() {{\n        return {};\n    }}\n",
@@ -157,11 +162,22 @@ async fn synthetic_index_benchmark() {
             stats.history_hits,
             stats.history_misses
         );
-        println!("{name} wall time: {time:?}");
+        println!(
+            "{name} wall time: {time:?}; edges stage {:?} ({} edges)",
+            stats.edges_time,
+            stats.edges()
+        );
     }
 
     let symbols = FILES * (METHODS + 1);
     assert_eq!(cold.symbols, symbols, "every generated symbol is indexed");
+    for stats in [cold, warm, changed] {
+        assert_eq!(
+            (stats.edges_reference, stats.edges()),
+            (FILES, FILES),
+            "one field reference per class"
+        );
+    }
     for stats in [cold, warm, changed] {
         assert_eq!(stats.history_skipped, 0, "every file is committed");
     }
