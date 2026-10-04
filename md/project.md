@@ -66,16 +66,16 @@ Embeddings are made from the what/why text, not from code, so similarity search 
 
 ## Interfaces
 
-The MCP server is the primary interface. Every result carries a file:line, so an agent jumps straight to the code with its normal read tools: Annatar answers *where* and *why*, the agent reads the code itself.
+The `annatar` CLI is the primary interface, for people and coding agents alike: agents are good at driving CLIs through their normal shell tool, so there is no separate MCP server. Every result carries a file:line, so an agent jumps straight to the code with its normal read tools: Annatar answers *where* and *why*, the agent reads the code itself.
 
-| MCP tool | Returns |
+| Command | Returns |
 | --- | --- |
-| `search_intent(query, kind?, role?, path?)` | Ranked symbols with name, kind, file:line, what and why; no code |
-| `get_symbol(fqn)` | Full what/why, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
-| `get_module(path)` | Module summary and its main symbols; the entry point for an unfamiliar area |
-| `trace_usage(fqn, depth)` | Transitive callers, so an agent or engineer sees what a change can break |
+| `annatar search "<query>" [--kind] [--role] [--path]` | Ranked symbols with name, kind, file:line, what and why; no code |
+| `annatar show <fqn>` | Full what/why, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
+| `annatar module <path>` | Module summary and its main symbols; the entry point for an unfamiliar area |
+| `annatar trace <fqn> --depth <n>` | Transitive callers, so an agent or engineer sees what a change can break |
 
-For people, a thin search page over the same index covers non-technical roles who don't use an agent. It shows the same records as the MCP tools, in plain language and without code.
+For people, a thin search page over the same index covers non-technical roles who don't use an agent. It shows the same records as the CLI, in plain language and without code.
 
 ## Architecture and deployment
 
@@ -102,7 +102,7 @@ Vector search finds candidate symbols; plain joins and recursive CTEs over `edge
 - Everyone queries the same what/why, so answers are consistent.
 - Output: `index-<commit>.db` published as an artifact.
 
-**Local serve** (the MCP server next to the agent):
+**Local use** (the CLI next to the agent):
 
 - Downloads the index for the nearest main commit.
 - Re-extracts changed files on the current branch with tree-sitter, so structure and edges always match the working copy.
@@ -112,7 +112,7 @@ A separate hosted service only becomes worthwhile when several teams or many rep
 
 ## Scope and non-goals
 
-**In scope:** structure, high-level purpose, the ticket-level "why" and usages for classes, methods, functions and types, served over MCP.
+**In scope:** structure, high-level purpose, the ticket-level "why" and usages for classes, methods, functions and types, served through the `annatar` CLI.
 
 **Non-goals:**
 
@@ -124,7 +124,7 @@ A separate hosted service only becomes worthwhile when several teams or many rep
 
 - Hotspots: centrality (in-degree, PageRank) combined with recent churn and bug tickets per symbol.
 - Temporal coupling: symbols that change together without an edge between them, pointing to hidden dependencies.
-- Risk hints in `get_symbol`, so an agent knows when it is about to edit a high-risk symbol.
+- Risk hints in `annatar show`, so an agent knows when it is about to edit a high-risk symbol.
 
 Analysis starts from bugs and churn and then investigates the code structure there, rather than classifying design patterns up front.
 
@@ -139,16 +139,16 @@ Analysis starts from bugs and churn and then investigates the code structure the
 
 ## Roadmap and success measures
 
-The intent index and MCP server come first; analysis follows on the data already collected.
+The intent index and its CLI come first; analysis follows on the data already collected.
 
-1. **MVP on one real repo:** symbols and edges, per-symbol history and tickets, ticket summaries, what/why, embeddings, the four MCP tools.
-2. **Central build and local serve:** CI job that publishes the index per commit, local overlay for branches.
+1. **MVP on one real repo:** symbols and edges, per-symbol history and tickets, ticket summaries, what/why, embeddings, the four CLI commands.
+2. **Central build and local use:** CI job that publishes the index per commit, local overlay for branches.
 3. **Human access:** a search page for non-technical roles.
-4. **Analysis:** hotspots, temporal coupling, risk hints in `get_symbol`.
+4. **Analysis:** hotspots, temporal coupling, risk hints in `annatar show`.
 
 **How to tell it works:**
 
-- **Agent efficiency:** on tasks where the relevant code is known in advance, compare tokens and tool calls with and without Annatar. A good sign is an agent going from `search_intent` straight to the right file without grepping around.
+- **Agent efficiency:** on tasks where the relevant code is known in advance, compare tokens and tool calls with and without Annatar. A good sign is an agent going from `annatar search` straight to the right file without grepping around.
 - **Agent quality:** fewer changes that break callers or contradict the original requirement.
 - **Summary accuracy:** hand-check a sample of what/why records against the code and tickets before relying on them.
 - **Onboarding:** new engineers find the right area and its reasoning without asking a colleague first.

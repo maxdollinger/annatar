@@ -1,8 +1,8 @@
 # Annatar — Agent Instructions
 
 Annatar is a Rust POC that builds an intent index of a Java/Spring repo (Jira
-tickets + Ollama + libSQL) and serves it over MCP. The work is driven by the
-plan, not by ad-hoc requests.
+tickets + Ollama + libSQL) and serves it through its CLI (`search`, `show`).
+The work is driven by the plan, not by ad-hoc requests.
 
 ## Start here
 
@@ -57,7 +57,7 @@ Before starting the next step, explicitly check:
   file + atomic rename); `cache.db` persists only expensive, content-keyed
   results. If a cache table's schema changes, drop the table.
 - **Symbols are identified by fqn** everywhere outside a single run (caches,
-  golden set, MCP tools). Row IDs change every rebuild.
+  golden set, CLI). Row IDs change every rebuild.
 - **Secrets only from the environment** (`ANNATAR_*`); never in
   `annatar.toml` and never committed.
 - **`--path <prefix>`** limits a run to part of the repo for fast prompt
