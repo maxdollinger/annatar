@@ -76,7 +76,16 @@ annatar show com.acme.token.TokenCleanup        # one symbol: description, ticke
 
 `search` returns files, best first: the class with its description, then its methods with line numbers; matching lines end with `*score`. `--symbols` lists single symbols instead.
 
-For a coding agent, tell it in the repository's `CLAUDE.md` / `AGENTS.md` to use `annatar search "<question>"` to find files and `annatar show <fqn>` to explain a symbol, and that the code stays the source of truth.
+For a coding agent, add this to the repository's `AGENTS.md` / `CLAUDE.md`:
+
+```markdown
+## Annatar
+
+`annatar` is an index of this repository: what each class and method does and why (from Jira tickets and commits).
+- `annatar search "<question>"` finds the relevant files. Use it before grepping.
+- `annatar show '<fqn>'` explains one symbol with its tickets and commits.
+Descriptions can be wrong; the code is the source of truth.
+```
 
 Useful flags: `index --offline` (no Jira requests), `index --no-llm` (cache only), `-v` (logs on stderr). Everything else (output formats, filters, `eval`, how each stage works) is in [`md/reference.md`](./md/reference.md).
 
