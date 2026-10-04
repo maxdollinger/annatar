@@ -4,9 +4,9 @@
 //! [`ticket_prompt`] builds the prompt for one ticket (key, type, title and a
 //! capped description, fenced as data); the model answers with a
 //! [`TicketSummary`], which [`validate_summary`] checks (blank summary,
-//! overlong fields, control characters, a summary about the ticket itself, a
-//! purpose about its sources or missing information or one that restates the
-//! summary). The purpose is empty when the ticket gives no reason, so later
+//! overlong fields, control characters, a ticket key, a summary about the
+//! ticket itself, a purpose about its sources or missing information or one
+//! that restates the summary). The purpose is empty when the ticket gives no reason, so later
 //! stages know there is no "why". The summaries stage in [`crate::indexer`]
 //! runs it for every available ticket and stores the result in the index
 //! `tickets` table. Later
@@ -17,6 +17,7 @@
 //! client is cache-only and never calls the model.
 
 use anyhow::Result;
+use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -189,16 +190,19 @@ const NO_REASON_REPLIES: &[&str] = &[
 ];
 
 /// Reject a blank summary, an overlong field, control characters other than
-/// whitespace, a summary that opens with the ticket itself, a purpose that
-/// talks about its sources or missing information, and a purpose that only
+/// whitespace, a field naming a ticket key (`ticket_regex`, its own key
+/// too), a summary that opens with the ticket itself, a purpose that talks
+/// about its sources or missing information, and a purpose that only
 /// restates the summary. An empty purpose is valid (no reason given). The
 /// message goes back to the model.
-pub fn validate_summary(summary: &TicketSummary) -> Result<(), String> {
+pub fn validate_summary(summary: &TicketSummary, ticket_regex: &Regex) -> Result<(), String> {
     if summary.summary.trim().is_empty() {
         return Err("`summary` is blank".to_string());
     }
     check_field("summary", &summary.summary, MAX_SUMMARY_CHARS)?;
     check_field("purpose", &summary.purpose, MAX_PURPOSE_CHARS)?;
+    check_no_ticket_key("summary", &summary.summary, ticket_regex)?;
+    check_no_ticket_key("purpose", &summary.purpose, ticket_regex)?;
     let meta = opener(&summary.summary, SUMMARY_OPENERS)
         .map(|phrase| ("summary", phrase))
         .or_else(|| reason_meta_phrase(&summary.purpose).map(|phrase| ("purpose", phrase)));
@@ -229,6 +233,26 @@ pub(crate) fn check_field(name: &str, value: &str, max: usize) -> Result<(), Str
         return Err(format!("`{name}` contains control characters"));
     }
     Ok(())
+}
+
+/// Reject a field that names a ticket key (a non-empty `ticket_regex`
+/// match): the text is about the code or the change, and a key means nothing
+/// to a reader searching the code.
+pub(crate) fn check_no_ticket_key(
+    name: &str,
+    value: &str,
+    ticket_regex: &Regex,
+) -> Result<(), String> {
+    match ticket_regex
+        .find_iter(value)
+        .find(|key| !key.as_str().is_empty())
+    {
+        Some(key) => Err(format!(
+            "`{name}` names the ticket {}; write about the code or the change itself and never name tickets",
+            key.as_str()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The one of `openers` that `text` starts with, ignoring case and leading
@@ -449,21 +473,54 @@ TICKET>>>
         assert!(!ticket_prompt(&exact).contains("truncated"));
     }
 
+    fn validate(summary: &TicketSummary) -> Result<(), String> {
+        validate_summary(
+            summary,
+            &Regex::new(crate::config::DEFAULT_TICKET_REGEX).unwrap(),
+        )
+    }
+
+    #[test]
+    fn validation_rejects_ticket_keys() {
+        let err = validate(&summary("Adds X for GRLD-12.", "Users need X."))
+            .expect_err("key in the summary");
+        assert!(err.contains("`summary` names the ticket GRLD-12"), "{err}");
+        let err = validate(&summary("Adds X.", "Part of the GRLD-24681 improvement."))
+            .expect_err("key in the purpose");
+        assert!(
+            err.contains("`purpose` names the ticket GRLD-24681"),
+            "{err}"
+        );
+        assert_eq!(
+            validate(&summary(
+                "Adds UTF-8 and SHA-256 support.",
+                "XGRLD-1 needs it."
+            )),
+            Ok(()),
+            "only the configured pattern counts"
+        );
+        assert_eq!(
+            validate_summary(
+                &summary("Adds X.", "Users need X."),
+                &Regex::new("").unwrap()
+            ),
+            Ok(()),
+            "an empty pattern matches no key"
+        );
+    }
+
     #[test]
     fn validation_rejects_blank_and_overlong_fields() {
+        assert_eq!(validate(&summary("Adds X.", "Users need X.")), Ok(()));
         assert_eq!(
-            validate_summary(&summary("Adds X.", "Users need X.")),
-            Ok(())
-        );
-        assert_eq!(
-            validate_summary(&summary(" ", "Users need X.")),
+            validate(&summary(" ", "Users need X.")),
             Err("`summary` is blank".to_string())
         );
-        let err = validate_summary(&summary(&"x".repeat(MAX_SUMMARY_CHARS + 1), "Why."))
+        let err = validate(&summary(&"x".repeat(MAX_SUMMARY_CHARS + 1), "Why."))
             .expect_err("overlong summary");
         assert!(err.contains("`summary` has 401 characters"), "{err}");
-        assert!(validate_summary(&summary(&"x".repeat(MAX_SUMMARY_CHARS), "Why.")).is_ok());
-        let err = validate_summary(&summary("Adds X.", &"y".repeat(MAX_PURPOSE_CHARS + 1)))
+        assert!(validate(&summary(&"x".repeat(MAX_SUMMARY_CHARS), "Why.")).is_ok());
+        let err = validate(&summary("Adds X.", &"y".repeat(MAX_PURPOSE_CHARS + 1)))
             .expect_err("overlong purpose");
         assert!(err.contains("`purpose`"), "{err}");
     }
@@ -472,7 +529,7 @@ TICKET>>>
     fn empty_purpose_is_valid_and_stored_as_none() {
         for purpose in ["", "  ", "\n"] {
             let reply = summary("Adds X.", purpose);
-            assert_eq!(validate_summary(&reply), Ok(()));
+            assert_eq!(validate(&reply), Ok(()));
             assert_eq!(reply.purpose_text(), None);
         }
         assert_eq!(
@@ -484,14 +541,13 @@ TICKET>>>
     #[test]
     fn whitespace_is_collapsed_and_control_characters_rejected() {
         let reply = summary("Adds\n X\tand  Y.\r\n", "Users\nneed it.");
-        assert_eq!(validate_summary(&reply), Ok(()));
+        assert_eq!(validate(&reply), Ok(()));
         assert_eq!(reply.summary_text(), "Adds X and Y.");
         assert_eq!(reply.purpose_text(), Some("Users need it.".to_string()));
 
-        let err = validate_summary(&summary("Adds\u{0}X.", "Why.")).expect_err("NUL");
+        let err = validate(&summary("Adds\u{0}X.", "Why.")).expect_err("NUL");
         assert_eq!(err, "`summary` contains control characters");
-        let err =
-            validate_summary(&summary("Adds X.", "Users \u{1b}[1mneed it.")).expect_err("ESC");
+        let err = validate(&summary("Adds X.", "Users \u{1b}[1mneed it.")).expect_err("ESC");
         assert_eq!(err, "`purpose` contains control characters");
     }
 
@@ -508,8 +564,7 @@ TICKET>>>
             ("Adds X.", "According to the ticket, users need it."),
             ("Adds X.", "Unknown"),
         ] {
-            let err = validate_summary(&summary(summary_text, purpose))
-                .expect_err("meta-text is invalid");
+            let err = validate(&summary(summary_text, purpose)).expect_err("meta-text is invalid");
             assert!(err.contains("not about the ticket"), "{err}");
         }
     }
@@ -531,7 +586,7 @@ TICKET>>>
             ),
         ] {
             assert_eq!(
-                validate_summary(&summary(summary_text, purpose)),
+                validate(&summary(summary_text, purpose)),
                 Ok(()),
                 "{summary_text} / {purpose}"
             );
@@ -540,21 +595,21 @@ TICKET>>>
 
     #[test]
     fn purpose_restating_the_summary_is_invalid() {
-        let err = validate_summary(&summary(
+        let err = validate(&summary(
             "Enables SMS sending for the Dev and Color environments.",
             "To enable SMS sending in Dev and Color environments.",
         ))
         .expect_err("restated");
         assert!(err.contains("restates"), "{err}");
         assert_eq!(
-            validate_summary(&summary(
+            validate(&summary(
                 "Fixes an OutOfMemory error when deleting expired user tokens.",
                 "Prevents crashes caused by excessive memory use during the cleanup.",
             )),
             Ok(())
         );
         assert_eq!(
-            validate_summary(&summary("Adds caching.", "Caching.")),
+            validate(&summary("Adds caching.", "Caching.")),
             Ok(()),
             "a one-word purpose is too short to judge"
         );

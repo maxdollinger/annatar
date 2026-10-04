@@ -275,7 +275,7 @@ pub async fn build_index(
         .await?;
         index_tickets(&transaction, store.cache(), jira, &mut stats).await?;
         let before = llm_stats();
-        invalid_summaries = index_summaries(&transaction, llm, &mut stats).await?;
+        invalid_summaries = index_summaries(&transaction, llm, ticket_regex, &mut stats).await?;
         stats.summary_llm = llm_stats().since(&before);
     }
     let before = llm_stats();
@@ -283,27 +283,15 @@ pub async fn build_index(
         JiraMode::Disabled => UnknownTickets::Unavailable,
         JiraMode::Fetch(_) | JiraMode::Offline => UnknownTickets::Pending,
     };
-    let whats = index_descriptions(
-        &transaction,
-        &indexed,
-        llm,
-        &invalid_summaries,
+    let inputs = DescribeInputs {
+        ticket_regex,
+        invalid_summaries: &invalid_summaries,
         unknown_tickets,
-        &mut stats,
-    )
-    .await?;
+    };
+    let whats = index_descriptions(&transaction, &indexed, llm, &inputs, &mut stats).await?;
     stats.describe_llm = llm_stats().since(&before);
     let before = llm_stats();
-    index_type_descriptions(
-        &transaction,
-        &indexed,
-        llm,
-        &invalid_summaries,
-        unknown_tickets,
-        whats,
-        &mut stats,
-    )
-    .await?;
+    index_type_descriptions(&transaction, &indexed, llm, &inputs, whats, &mut stats).await?;
     stats.type_llm = llm_stats().since(&before);
     stats.llm = llm_stats().since(&run_before);
 
@@ -767,6 +755,7 @@ async fn fetch_tickets(
 async fn index_summaries(
     transaction: &Transaction,
     llm: Option<&Summarizer>,
+    ticket_regex: &Regex,
     stats: &mut IndexStats,
 ) -> Result<HashSet<String>> {
     let tickets = available_tickets(transaction).await?;
@@ -782,7 +771,9 @@ async fn index_summaries(
         let prompt = ticket_prompt(ticket);
         let summary = match llm
             .client
-            .complete_with::<TicketSummary, _>(&prompt, validate_summary)
+            .complete_with::<TicketSummary, _>(&prompt, |summary| {
+                validate_summary(summary, ticket_regex)
+            })
             .await
         {
             Ok(summary) => summary,
@@ -870,6 +861,16 @@ enum UnknownTickets {
     Unavailable,
 }
 
+/// What the describe and type stages take from the earlier stages and the
+/// configuration.
+struct DescribeInputs<'a> {
+    /// Rejects replies that name a ticket key.
+    ticket_regex: &'a Regex,
+    /// Tickets whose summary was invalid this run: their Jira title stands in.
+    invalid_summaries: &'a HashSet<String>,
+    unknown_tickets: UnknownTickets,
+}
+
 /// The available tickets in the index `tickets` table, by key.
 async fn available_tickets(conn: &Connection) -> Result<Vec<Ticket>> {
     let mut rows = conn
@@ -926,8 +927,7 @@ async fn index_descriptions(
     transaction: &Transaction,
     files: &[IndexedFile],
     llm: Option<&Summarizer>,
-    invalid_summaries: &HashSet<String>,
-    unknown_tickets: UnknownTickets,
+    inputs: &DescribeInputs<'_>,
     stats: &mut IndexStats,
 ) -> Result<HashMap<i64, ChildWhat>> {
     let mut whats = HashMap::new();
@@ -947,7 +947,12 @@ async fn index_descriptions(
         .filter(|indexed| indexed.symbol.kind.is_type())
         .map(|indexed| (indexed.symbol.fqn.as_str(), &indexed.symbol))
         .collect();
-    let mut tickets = member_tickets(transaction, invalid_summaries, unknown_tickets).await?;
+    let mut tickets = member_tickets(
+        transaction,
+        inputs.invalid_summaries,
+        inputs.unknown_tickets,
+    )
+    .await?;
     let mut commits = member_commits(transaction).await?;
     let config = &llm.describe;
     let mut blocking = HashSet::new();
@@ -991,7 +996,9 @@ async fn index_descriptions(
         let hits = llm.client.stats().chat_hits;
         let description = match llm
             .client
-            .complete_with::<Description, _>(&prompt, validate_description)
+            .complete_with::<Description, _>(&prompt, |description| {
+                validate_description(description, inputs.ticket_regex)
+            })
             .await
         {
             Ok(description) => description,
@@ -1079,8 +1086,7 @@ async fn index_type_descriptions(
     transaction: &Transaction,
     files: &[IndexedFile],
     llm: Option<&Summarizer>,
-    invalid_summaries: &HashSet<String>,
-    unknown_tickets: UnknownTickets,
+    inputs: &DescribeInputs<'_>,
     mut whats: HashMap<i64, ChildWhat>,
     stats: &mut IndexStats,
 ) -> Result<()> {
@@ -1119,7 +1125,12 @@ async fn index_type_descriptions(
             children.entry(parent).or_default().push(indexed);
         }
     }
-    let mut tickets = member_tickets(transaction, invalid_summaries, unknown_tickets).await?;
+    let mut tickets = member_tickets(
+        transaction,
+        inputs.invalid_summaries,
+        inputs.unknown_tickets,
+    )
+    .await?;
     let mut commits = member_commits(transaction).await?;
     let config = &llm.describe;
     let history_config = DescribeConfig {
@@ -1152,11 +1163,14 @@ async fn index_type_descriptions(
         let in_interface = matches!(symbol.kind, SymbolKind::Interface | SymbolKind::Annotation);
         let listed: Vec<TypeChild> = own
             .iter()
-            .map(|child| TypeChild {
-                kind: child.symbol.kind.as_str().to_string(),
-                name: child_name(symbol, &child.symbol),
-                public: is_public(&child.symbol.signature, in_interface),
-                what: whats.get(&child.id).cloned().unwrap_or(ChildWhat::Missing),
+            .map(|child| {
+                let (kind, name) = child_name(symbol, &child.symbol);
+                TypeChild {
+                    kind,
+                    name,
+                    public: is_public(&child.symbol.signature, in_interface),
+                    what: whats.get(&child.id).cloned().unwrap_or(ChildWhat::Missing),
+                }
             })
             .collect();
         let listed = match select_children(&listed, config.type_members) {
@@ -1168,9 +1182,9 @@ async fn index_type_descriptions(
                 continue;
             }
         };
-        let cuts: Vec<std::ops::Range<usize>> = own
+        let spans: Vec<std::ops::Range<usize>> = own
             .iter()
-            .map(|child| declaration_start(&file.source, &child.symbol)..child.symbol.end_byte)
+            .map(|child| child.symbol.start_byte..child.symbol.end_byte)
             .collect();
         let context = TypeContext {
             kind: symbol.kind.as_str().to_string(),
@@ -1178,7 +1192,12 @@ async fn index_type_descriptions(
             role: symbol.role.map(|role| role.as_str().to_string()),
             signature: symbol.signature.clone(),
             javadoc: symbol.javadoc.clone(),
-            outline: outline(&file.source, symbol.start_byte..symbol.end_byte, &cuts),
+            outline: outline(
+                &file.source,
+                symbol.start_byte..symbol.end_byte,
+                &spans,
+                &symbol.blocks,
+            ),
             enclosing: symbol
                 .parent
                 .as_deref()
@@ -1193,7 +1212,9 @@ async fn index_type_descriptions(
         let hits = llm.client.stats().chat_hits;
         let description = match llm
             .client
-            .complete_with::<TypeDescription, _>(&prompt, validate_type_description)
+            .complete_with::<TypeDescription, _>(&prompt, |description| {
+                validate_type_description(description, inputs.ticket_regex)
+            })
             .await
         {
             Ok(description) => Description::from(description),
@@ -1259,38 +1280,23 @@ async fn index_type_descriptions(
     Ok(())
 }
 
-/// How a type's prompt names its `child`: `find(Long)` for a method,
-/// `UserService(Repo)` for a constructor of `UserService`, the simple name
-/// for a nested type.
-fn child_name(parent: &Symbol, child: &Symbol) -> String {
+/// How a type's prompt lists its `child`, as kind and name: `method`
+/// `find(Long)`, `constructor` `UserService(Repo)` (a record's compact
+/// constructor, which has no parameter list, as `compact constructor`
+/// `Point`), a nested type by its kind and simple name.
+fn child_name(parent: &Symbol, child: &Symbol) -> (String, String) {
+    let kind = child.kind.as_str().to_string();
     let member = child.fqn.rsplit_once('#').map(|(_, member)| member);
     match (child.kind, member) {
-        (SymbolKind::Constructor, Some(member)) => {
-            format!("{}{}", parent.name, member.trim_start_matches("<init>"))
+        (SymbolKind::Constructor, Some(_)) if !child.signature.contains('(') => {
+            ("compact constructor".to_string(), parent.name.clone())
         }
-        (_, Some(member)) => member.to_string(),
-        (_, None) => child.name.clone(),
-    }
-}
-
-/// Where `symbol`'s declaration starts for cutting it out of its type's
-/// outline: the start of its Javadoc's first line, unless code precedes it
-/// on that line (then the declaration itself).
-fn declaration_start(source: &str, symbol: &Symbol) -> usize {
-    let line_start = source
-        .match_indices('\n')
-        .nth(symbol.history_start_line.saturating_sub(2))
-        .map(|(index, _)| index + 1)
-        .filter(|_| symbol.history_start_line > 1)
-        .unwrap_or(0);
-    let prefix = source
-        .get(line_start..symbol.start_byte)
-        .unwrap_or_default()
-        .trim_start();
-    if line_start <= symbol.start_byte && (prefix.is_empty() || prefix.starts_with("/**")) {
-        line_start
-    } else {
-        symbol.start_byte
+        (SymbolKind::Constructor, Some(member)) => (
+            kind,
+            format!("{}{}", parent.name, member.trim_start_matches("<init>")),
+        ),
+        (_, Some(member)) => (kind, member.to_string()),
+        (_, None) => (kind, child.name.clone()),
     }
 }
 
@@ -1817,6 +1823,7 @@ public class UserService {
             javadoc: None,
             annotations: Vec::new(),
             role: None,
+            blocks: Vec::new(),
         }
     }
 
@@ -4345,7 +4352,7 @@ Declaration (members and nested types are cut out and listed below):
 public static class Line {
     private int amount;
 }
-Members and nested types (what each does):
+Methods, constructors and nested types (what each does):
 - method amount(): Returns the value.
 - enum Kind: Lists the kinds.
 "
@@ -4365,7 +4372,7 @@ Declaration (members and nested types are cut out and listed below):
 public class Orders extends Base {
     private final Repo repo;
 }
-Members and nested types (what each does):
+Methods, constructors and nested types (what each does):
 - constructor Orders(Repo): Returns the value.
 - method helper(): Returns the value.
 - class Line: Holds one order line.
@@ -4463,7 +4470,7 @@ com.acme.Orders [class] role=service
         assert!(
             prompts[2].contains(
                 "\
-Members and nested types (what each does):
+Methods, constructors and nested types (what each does):
 - constructor Orders(Repo): Returns the value.
 - (2 more not listed)
 Change history: (none)
@@ -4539,28 +4546,292 @@ Change history: (none)
         );
     }
 
+    /// `future`'s output and the warnings it logged, as plain text.
+    async fn with_warnings<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let output = future.with_subscriber(subscriber).await;
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        (output, logs)
+    }
+
+    /// The logged line containing `message`.
+    fn log_line<'a>(logs: &'a str, message: &str) -> &'a str {
+        logs.lines()
+            .find(|line| line.contains(message))
+            .unwrap_or_else(|| panic!("no {message:?} in {logs}"))
+    }
+
     #[tokio::test]
-    async fn type_with_an_unfetched_chosen_ticket_waits() {
-        let repo = repo_with_commits(&["GRLD-1 add"]);
+    async fn only_the_types_own_chosen_ticket_holds_it_back() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let service = |limit: i64| {
+            format!(
+                "package com.acme;\nclass Service {{\n    int limit = {limit};\n\n    int value() {{ return 1; }}\n}}\n"
+            )
+        };
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &service(1),
+        );
+        commit(repo.path(), "GRLD-1 add", "2024-01-01T00:00:00+00:00");
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &service(2),
+        );
+        commit(repo.path(), "GRLD-2 limit", "2024-01-02T00:00:00+00:00");
+        let data = tempfile::tempdir().unwrap();
+        let source = FakeSource::new();
+        source.script("GRLD-1", &[Answer::Ok(fake::ticket("GRLD-1"))]);
+        source.script("GRLD-2", &[Answer::Status(503)]);
+        let jira = fake::instant(source, 4);
+        let backend = FakeBackend::new();
+        backend.always("TicketSummary", BRIEF);
+        backend.always("Description", DESCRIBED);
+        backend.always("TypeDescription", TYPE_DESCRIBED);
+
+        let (stats, logs) = with_warnings(run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &jira_mode(Some(&jira)),
+            &backend,
+            false,
+            DescribeConfig::default(),
+        ))
+        .await;
+
+        assert_eq!(stats.tickets_failed, 1, "GRLD-2 stays unknown");
+        assert_eq!(stats.described, 1, "value() only has GRLD-1");
+        assert_eq!(stats.describe_incomplete, 0);
+        assert_eq!(stats.types_incomplete, 1, "Service chose GRLD-2");
+        assert_eq!(stats.type_llm.chat_calls, 0);
+        let warning = log_line(&logs, "some types got no what/why");
+        assert!(
+            warning.contains("incomplete=1")
+                && warning.contains("waiting_for_members=0")
+                && warning.contains("blocking_tickets=\"GRLD-2\""),
+            "{warning}"
+        );
+        assert!(!logs.contains("some methods got no what/why"), "{logs}");
+
+        let fetched = jira_with(&[fake::ticket("GRLD-1"), fake::ticket("GRLD-2")]);
+        let stats = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &jira_mode(Some(&fetched)),
+            &backend,
+            false,
+            DescribeConfig::default(),
+        )
+        .await;
+        assert_eq!(stats.types_described, 1, "described once GRLD-2 is in");
+        assert!(
+            type_prompts(&backend)[0].contains("- Changed for GRLD-2 (Story): Adds the service.\n"),
+            "{}",
+            type_prompts(&backend)[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn interface_members_are_public_and_compact_constructors_are_named() {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Repo.java",
+            "\
+package com.acme;
+
+public interface Repo {
+    int MAX = 3;
+
+    private void helper() {}
+
+    User find(Long id);
+
+    default int size() { return 0; }
+
+    record Point(int x, int y) {
+        public Point {
+            if (x < 0) throw new IllegalArgumentException();
+        }
+
+        Point(int x) { this(x, 0); }
+    }
+}
+",
+        );
         let data = tempfile::tempdir().unwrap();
         let backend = FakeBackend::new();
         backend.always("Description", DESCRIBED);
         backend.always("TypeDescription", TYPE_DESCRIBED);
+        let config = DescribeConfig {
+            type_members: 3,
+            ..DescribeConfig::default()
+        };
 
         let stats = run_llm_stages(
             repo.path(),
             data.path(),
             None,
-            &JiraMode::Offline,
+            &JiraMode::Disabled,
+            &backend,
+            false,
+            config,
+        )
+        .await;
+
+        assert_eq!(stats.types_described, 2);
+        let prompts = type_prompts(&backend);
+        assert!(
+            prompts[0].contains(
+                "\
+Declaration (members and nested types are cut out and listed below):
+record Point(int x, int y) {
+}
+Methods, constructors and nested types (what each does):
+- compact constructor Point: Returns the value.
+- constructor Point(int): Returns the value.
+"
+            ),
+            "{}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains(
+                "\
+public interface Repo {
+    int MAX = 3;
+}
+Methods, constructors and nested types (what each does):
+- method find(Long): Returns the value.
+- method size(): Returns the value.
+- record Point: Serves the values.
+- (1 more not listed)
+"
+            ),
+            "the private helper() is the one left out: {}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_nested_type_is_listed_bare_in_its_outer_type() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Orders.java", ORDERS);
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.always("Description", DESCRIBED);
+        let blank = r#"{"what": " ", "why": ""}"#;
+        let kinds = type_reply("Lists the kinds.");
+        let book = type_reply("Keeps the order book.");
+        backend.reply(&[&kinds, blank, blank, &book]);
+
+        let stats = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
             &backend,
             false,
             DescribeConfig::default(),
         )
         .await;
 
-        assert_eq!(stats.describe_incomplete, 1);
-        assert_eq!(stats.types_incomplete, 1);
-        assert_eq!(stats.type_llm.chat_calls, 0);
+        assert_eq!(stats.types_described, 2);
+        assert_eq!(stats.types_invalid, 1, "Line");
+        assert_eq!(stats.type_llm.chat_retries, 1);
+        let prompts = type_prompts(&backend);
+        assert!(
+            prompts[3].contains("- class Line: (not described)\n"),
+            "{}",
+            prompts[3]
+        );
+        assert_eq!(
+            what_why(data.path(), "com.acme.Orders").await.0,
+            Some("Keeps the order book.".to_string())
+        );
+        assert_eq!(
+            what_why(data.path(), "com.acme.Orders.Line").await,
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_type_call_trips_the_breaker_and_holds_the_outer_types_back() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "src/main/java/com/acme/Orders.java", ORDERS);
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Other.java",
+            "package com.acme;\nclass Other {}\n",
+        );
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.always("Description", DESCRIBED);
+
+        let (stats, logs) = with_warnings(run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
+            &backend,
+            false,
+            DescribeConfig::default(),
+        ))
+        .await;
+
+        assert_eq!(stats.described, 3, "members are cached before the trip");
+        assert_eq!(stats.types_failed, 1, "Kind: no scripted reply");
+        assert_eq!(
+            stats.types_incomplete, 2,
+            "Line waits for Kind, Orders for Line"
+        );
+        assert_eq!(stats.types_skipped, 1, "Other after the trip");
+        assert_eq!(stats.type_llm.chat_calls, 1);
+        let warning = log_line(&logs, "some types got no what/why");
+        assert!(
+            warning.contains("failed=1")
+                && warning.contains("waiting_for_members=2")
+                && warning.contains("skipped=1"),
+            "{warning}"
+        );
+
+        backend.always("TypeDescription", TYPE_DESCRIBED);
+        let stats = run_llm_stages(
+            repo.path(),
+            data.path(),
+            None,
+            &JiraMode::Disabled,
+            &backend,
+            false,
+            DescribeConfig::default(),
+        )
+        .await;
+        assert_eq!(stats.types_described, 4, "the next run catches up");
+        assert_eq!(stats.described_cached, 3);
     }
 
     #[tokio::test]

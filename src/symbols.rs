@@ -117,6 +117,10 @@ pub struct Symbol {
     pub annotations: Vec<String>,
     /// The Spring role, for types only.
     pub role: Option<Role>,
+    /// For a type, the byte spans of the code blocks directly in its body
+    /// that are not members: enum constant bodies and static or instance
+    /// initializers, in source order. Empty for members.
+    pub blocks: Vec<std::ops::Range<usize>>,
 }
 
 /// A reusable tree-sitter Java parser.
@@ -206,7 +210,7 @@ fn collect_symbols(
                 Some(parent) => format!("{parent}.{name}"),
                 None => qualify(package, &name),
             };
-            out.push(build_symbol(
+            let mut symbol = build_symbol(
                 package,
                 name,
                 fqn.clone(),
@@ -214,14 +218,46 @@ fn collect_symbols(
                 enclosing.map(str::to_string),
                 child,
                 source,
-            ));
-            if let Some(body) = type_body(child) {
+            );
+            let body = type_body(child);
+            if let Some(body) = body {
+                collect_blocks(body, &mut symbol.blocks);
+            }
+            out.push(symbol);
+            if let Some(body) = body {
                 collect_symbols(body, source, package, Some(&fqn), out);
             }
         } else if let Some(symbol) = member_symbol(child, source, package, enclosing) {
             out.push(symbol);
         } else if is_type_container(child.kind()) {
             collect_symbols(child, source, package, enclosing, out);
+        }
+    }
+}
+
+/// The spans of the enum constant bodies and static or instance initializer
+/// blocks directly in the type body `container` (and an enum's declarations
+/// section).
+fn collect_blocks(container: Node<'_>, out: &mut Vec<std::ops::Range<usize>>) {
+    let mut cursor = container.walk();
+    for child in container.children(&mut cursor) {
+        let block = match child.kind() {
+            "enum_constant" => child.child_by_field_name("body"),
+            "static_initializer" => {
+                let mut inner = child.walk();
+                child
+                    .children(&mut inner)
+                    .find(|node| node.kind() == "block")
+            }
+            "block" => Some(child),
+            "enum_body_declarations" => {
+                collect_blocks(child, out);
+                None
+            }
+            _ => None,
+        };
+        if let Some(block) = block {
+            out.push(block.start_byte()..block.end_byte());
         }
     }
 }
@@ -320,6 +356,7 @@ fn build_symbol(
         javadoc: javadoc.map(|comment| clean_javadoc(&text(comment, source))),
         annotations,
         role,
+        blocks: Vec::new(),
     }
 }
 
@@ -753,6 +790,38 @@ record Point(int x, int y) {}
                 .all(|symbol| symbol.package == "com.acme.kinds")
         );
         assert!(symbols.iter().all(|symbol| symbol.parent.is_none()));
+    }
+
+    #[test]
+    fn types_record_their_constant_bodies_and_initializer_blocks() {
+        let source = "\
+enum Op {
+    PLUS { int apply() { return 1; } },
+    MINUS;
+    static { init(); }
+    { count++; }
+    int apply() { return 0; }
+    class Inner { static { load(); } }
+}
+";
+        let symbols = parse(source);
+        let blocks = |name: &str| -> Vec<&str> {
+            by_name(&symbols, name)
+                .blocks
+                .iter()
+                .map(|block| &source[block.clone()])
+                .collect()
+        };
+        assert_eq!(
+            blocks("Op"),
+            [
+                "{ int apply() { return 1; } }",
+                "{ init(); }",
+                "{ count++; }"
+            ]
+        );
+        assert_eq!(blocks("Inner"), ["{ load(); }"]);
+        assert!(blocks("apply").is_empty());
     }
 
     #[test]
