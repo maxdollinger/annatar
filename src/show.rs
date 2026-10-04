@@ -5,8 +5,9 @@
 //! sorted by source line, each with the model's `description` when it has
 //! one; a nested type or member also names its enclosing type. The shown
 //! symbol also lists its entry-point annotations and its direct usages
-//! (`used by`, `uses`, see [`usage_query`]), grouped by file and capped.
-//! This is the read side of the index behind `annatar show`. Ticket types,
+//! (`used by`, `uses`, see [`usage_query`]), grouped by file and capped;
+//! commits and tickets only when asked for. This is the read side of the
+//! index behind `annatar show`. Ticket types,
 //! titles and the model's summary and purpose come from the index `tickets`
 //! table, never from `cache.db`.
 
@@ -84,19 +85,32 @@ impl StoredSymbol {
 }
 
 /// Render the symbol named `fqn` and all its children as indented text,
-/// with at most [`DEFAULT_LIMIT`] entries in each of its usage lists.
+/// with their commits and tickets and at most [`DEFAULT_LIMIT`] entries in
+/// each of its usage lists.
 ///
 /// A missing `fqn` is an error that names the symbol.
 pub async fn render(conn: &Connection, fqn: &str) -> Result<String> {
-    render_limited(conn, fqn, DEFAULT_LIMIT).await
+    render_with(conn, fqn, DEFAULT_LIMIT, true).await
 }
 
-/// [`render`] with at most `limit` entries in each usage list.
-pub async fn render_limited(conn: &Connection, fqn: &str, limit: usize) -> Result<String> {
+/// [`render`] with at most `limit` entries in each usage list; commits and
+/// tickets only when `history` is set.
+pub async fn render_with(
+    conn: &Connection,
+    fqn: &str,
+    limit: usize,
+    history: bool,
+) -> Result<String> {
     let symbols = load_all(conn).await?;
-    let commits = load_commits(conn).await?;
-    let tickets = load_tickets(conn).await?;
-    let info = load_ticket_info(conn).await?;
+    let (commits, tickets, info) = if history {
+        (
+            load_commits(conn).await?,
+            load_tickets(conn).await?,
+            load_ticket_info(conn).await?,
+        )
+    } else {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    };
     let root = symbols
         .iter()
         .find(|symbol| symbol.fqn == fqn)
@@ -618,6 +632,31 @@ com.acme.show.Widget.Part#run() [method]
             ),
             "ticket line: {output}"
         );
+
+        let without = render_with(
+            reader.connection(),
+            "com.acme.show.Widget",
+            DEFAULT_LIMIT,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!without.contains("- commits:"), "{without}");
+        assert!(!without.contains("- tickets:"), "{without}");
+        assert!(!without.contains("GRLD-42"), "{without}");
+        assert_eq!(
+            without,
+            output
+                .lines()
+                .filter(|line| {
+                    let line = line.trim_start();
+                    !line.starts_with("- commits:")
+                        && !line.starts_with("- tickets:")
+                        && !line.contains("GRLD-42")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        );
     }
 
     const FLOW: [(&str, &str); 5] = [
@@ -814,7 +853,7 @@ com.acme.flow.AddConsumer#consume(Message) [method]
         let (_repo, data) = flow().await;
         let reader = IndexReader::open(data.path()).await.unwrap();
 
-        let output = render_limited(reader.connection(), "com.acme.flow.Message", 2)
+        let output = render_with(reader.connection(), "com.acme.flow.Message", 2, true)
             .await
             .unwrap();
 

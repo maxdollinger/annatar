@@ -71,7 +71,7 @@ The `annatar` CLI is the primary interface, for people and coding agents alike: 
 | Command | Returns |
 | --- | --- |
 | `annatar search "<query>" [--kind] [--role] [--path]` | Ranked symbols with name, kind, file:line and description; no code |
-| `annatar show <fqn>` | Full description, linked tickets, parent (method → class → module), direct `used_by` and `uses` |
+| `annatar show <fqn>` | Full description, parent (method → class → module), direct `used_by` and `uses`; linked tickets and commits on request (`--history`), since the description already condenses them |
 | `annatar module <path>` | Module summary and its main symbols; the entry point for an unfamiliar area |
 | `annatar trace <fqn> --depth <n>` | Transitive callers, so an agent or engineer sees what a change can break |
 

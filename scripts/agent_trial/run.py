@@ -3,7 +3,7 @@
 
 Usage:
   run.py run --tasks tasks.toml --out DIR [--reps 2] [--only T1,T2] [--arms with,without]
-             [--with-prompt files|symbols|usages]
+             [--with-prompt files|symbols|usages|brief]
   run.py summary --out DIR          # per-run CSV + per task/arm means; warns about incomplete runs
   run.py blind --out DIR            # shuffled final answers for grading, annatar mentions redacted
 
@@ -11,7 +11,8 @@ Usage:
 wall time, the with-arm prompt); a run without a result event is repeated by the next `run`.
 `--with-prompt` picks the appended system prompt of the "with" arm: `files` describes the file-level
 `annatar search` output (5.5, the default), `symbols` the symbol list the 5.4 trial ran with, `usages`
-the `files` prompt plus a bullet on `show`'s `used by` / `uses` and `annatar trace` (6.7).
+the `files` prompt plus a bullet on `show`'s `used by` / `uses` and `annatar trace` (6.7), `brief`
+the `usages` prompt for `show` without history by default (`--history` adds commits and tickets).
 Tests (stdlib, no network): python3 -m unittest discover -s scripts/agent_trial
 
 The task file (private) holds `preamble` and `[[task]]` tables with `id`, `label`, `prompt`.
@@ -49,6 +50,10 @@ Results are ranked by similarity of meaning; the best match is not always first,
 - `annatar show` also lists `used by` (the methods and types that call, instantiate or reference the symbol, grouped by file with lines; callers through an interface marked `via` its method) and `uses` (what the symbol calls or references). `annatar trace '<fqn>'` prints the callers transitively as a tree, up to the entry points such as `[entry: @Scheduled]` (`--depth N`, default 6). Usages come from the source code: calls through reflection, events, message queues or configuration, and test code, are not included.
 Results are ranked by similarity of meaning; the best match is not always first, and descriptions can be incomplete or wrong, so check the code.""",
 }
+WITH_PROMPTS["brief"] = WITH_PROMPTS["usages"].replace(
+    "- `annatar show '<fqn>'` prints one symbol (a member's fqn is the class fqn + `#name(params)`): description, parent, children, file and lines, recent commits and Jira tickets with an English summary and purpose.",
+    "- `annatar show '<fqn>'` prints one symbol (a member's fqn is the class fqn + `#name(params)`): description, parent, children, file and lines; `--history` adds its recent commits and Jira tickets with an English summary and purpose.",
+)
 
 TOOLS = "Bash,Read,Grep,Glob"
 ARMS = ("with", "without")

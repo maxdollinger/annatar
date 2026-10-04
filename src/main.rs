@@ -61,6 +61,7 @@ enum Command {
     /// and its direct usages: `used by` (for a type also its members' and
     /// nested types' users, for a method also the callers of the methods it
     /// overrides, `via`) and `uses`, grouped by file as `fqn [kind] :lines`.
+    /// The ticket and commit history only with `--history`.
     Show {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
         fqn: String,
@@ -68,6 +69,10 @@ enum Command {
         /// rest are counted as `… N more`.
         #[arg(short = 'k', long, value_name = "N", default_value_t = show::DEFAULT_LIMIT, value_parser = parse_show_limit)]
         limit: usize,
+        /// Also list each symbol's commits and tickets (with the model's
+        /// summary and purpose); without it the description stands for them.
+        #[arg(long)]
+        history: bool,
     },
     /// Print the transitive callers of a symbol as an indented tree: per
     /// line a caller as `fqn [kind] [via I#m] file:lines` (the file left out
@@ -336,11 +341,15 @@ async fn run(cli: &Cli) -> Result<()> {
                 stats.embedding_dim
             );
         }
-        Command::Show { fqn, limit } => {
+        Command::Show {
+            fqn,
+            limit,
+            history,
+        } => {
             let reader = IndexReader::open(&config.data_dir).await?;
             print!(
                 "{}",
-                show::render_limited(reader.connection(), fqn, *limit).await?
+                show::render_with(reader.connection(), fqn, *limit, *history).await?
             );
         }
         Command::Trace { fqn, depth, limit } => {
