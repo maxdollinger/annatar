@@ -74,7 +74,30 @@ pub const INDEX_TABLES: &[&str] = &[
     // 5.1 `symbol_vectors` is not here: its `F32_BLOB(<dim>)` column needs
     // the embedding dimension, known only from the first embedding response,
     // so the embeddings stage creates it with [`vector_tables`].
+    // 5.1 review `index_meta`: settings the index was built with, one row per
+    // key (see [`META_EMBEDDING_MODEL`] and its siblings), so a reader can
+    // tell whether its query vectors match the stored ones.
+    "CREATE TABLE index_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )",
 ];
+
+/// `index_meta` key: the embedding model that produced `symbol_vectors`.
+/// Written by the embeddings stage with the other `META_EMBEDDING_*` keys
+/// only when the index has vectors.
+pub const META_EMBEDDING_MODEL: &str = "embedding_model";
+/// `index_meta` key: the length of every vector in `symbol_vectors`.
+pub const META_EMBEDDING_DIM: &str = "embedding_dim";
+/// `index_meta` key: `true` or `false`, the `[embedding] parent_description`
+/// setting the embedded texts were built with.
+pub const META_EMBEDDING_PARENT_DESCRIPTION: &str = "embedding_parent_description";
+
+/// `max_neighbors` of the vector index. libSQL's default for 1024
+/// dimensions is 96, about 105 KB of graph per symbol with float8
+/// neighbours; 32 keeps recall@10 at 1.0 on `argus` and on a 6× larger
+/// synthetic set (16 drops to 0.998 there) at about 42 KB per symbol.
+pub const VECTOR_MAX_NEIGHBORS: usize = 32;
 
 /// Name of the vector index over `symbol_vectors.embedding`, the first
 /// argument of `vector_top_k`.
@@ -82,9 +105,12 @@ pub const VECTOR_INDEX: &str = "symbol_vectors_embedding";
 
 /// 5.1 `symbol_vectors`: one embedding of `dim` 32-bit floats per symbol
 /// that has a description (its `symbol_id` is the rowid `vector_top_k`
-/// returns), with a cosine `libsql_vector_idx` index. Part of `index.db`, but
-/// created by the embeddings stage once the dimension is known; an index
-/// without any vector has no such table.
+/// returns), with a cosine `libsql_vector_idx` index (float8 neighbours,
+/// [`VECTOR_MAX_NEIGHBORS`]). Part of `index.db`, but created by the
+/// embeddings stage once the dimension is known; an index without any vector
+/// has no such table. `vector_top_k` returns at most about 200 rows
+/// whatever its `k` (libSQL's default search list), so a filtered query
+/// cannot over-fetch the whole table through it.
 pub fn vector_tables(dim: usize) -> [String; 2] {
     [
         format!(
@@ -94,7 +120,7 @@ pub fn vector_tables(dim: usize) -> [String; 2] {
     )"
         ),
         format!(
-            "CREATE INDEX {VECTOR_INDEX} ON symbol_vectors(libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8'))"
+            "CREATE INDEX {VECTOR_INDEX} ON symbol_vectors(libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors={VECTOR_MAX_NEIGHBORS}'))"
         ),
     ]
 }
@@ -163,7 +189,9 @@ pub async fn create_index(conn: &Connection) -> Result<()> {
 /// an allocation). The vector index rewrites graph nodes of several KiB on
 /// every insert; with SQLite's 2 MB default the open transaction spills
 /// pages to the temporary file on each one, which made 654 inserts of 1024
-/// dimensions take 13 s on a slow (container-mounted) disk instead of 1.4 s.
+/// dimensions take 13 s on a slow (container-mounted) disk instead of 1.4 s
+/// (default neighbours), and still 1.6 s instead of 0.6 s with
+/// [`VECTOR_MAX_NEIGHBORS`].
 pub const VECTOR_CACHE_KIB: i64 = 256 * 1024;
 
 /// Create `symbol_vectors` and its vector index for `dim`-dimensional
@@ -253,5 +281,24 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("dimension"), "{err}");
         assert!(create_vectors(conn, 0).await.is_err());
+
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                params![VECTOR_INDEX],
+            )
+            .await
+            .unwrap();
+        let sql = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert!(
+            sql.contains(&format!("'max_neighbors={VECTOR_MAX_NEIGHBORS}'")),
+            "{sql}"
+        );
     }
 }

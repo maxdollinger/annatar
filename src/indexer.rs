@@ -1444,11 +1444,14 @@ async fn member_commits(conn: &Connection) -> Result<HashMap<i64, Vec<MemberComm
 /// batches. The first vector's length is the dimension of the
 /// `F32_BLOB(<dim>)` column: the stage creates `symbol_vectors` and its
 /// vector index ([`schema::create_vectors`]) only when at least one symbol
-/// has a vector, so an index without vectors has no such table. A cache-only
-/// client (`--no-llm`, or the breaker tripped in an earlier stage) uses
-/// cached embeddings only; the rest are `embed_skipped`. A failed embedding
-/// request warns once and falls back to the cache, the rest are
-/// `embed_failed`. Without a summarizer no symbol has a description. Only an
+/// has a vector, so an index without vectors has no such table, and then
+/// records the model, dimension and text settings in `index_meta`
+/// ([`write_embedding_meta`]). A cache-only client (`--no-llm`, or the
+/// breaker tripped in an earlier stage) uses cached embeddings only; the
+/// rest are `embed_skipped` (one warning). A failed embedding request warns
+/// once and falls back to the cache, the rest are `embed_failed`. Cached
+/// vectors of another length than the model now returns are re-embedded by
+/// [`crate::llm::LlmClient::embed`]. Without a summarizer no symbol has a description. Only an
 /// index write error fails the stage.
 async fn index_embeddings(
     transaction: &Transaction,
@@ -1499,7 +1502,7 @@ async fn index_embeddings(
     }
     for (symbol, vector) in symbols.iter().zip(vectors) {
         match vector {
-            Some(vector) if dim > 0 => {
+            Some(vector) => {
                 transaction
                     .execute(
                         "INSERT INTO symbol_vectors (symbol_id, embedding) VALUES (?1, vector32(?2))",
@@ -1509,10 +1512,12 @@ async fn index_embeddings(
                     .with_context(|| format!("writing the vector of {}", symbol.fqn))?;
                 stats.embedded += 1;
             }
-            Some(_) => stats.embed_failed += 1,
             None if failed => stats.embed_failed += 1,
             None => stats.embed_skipped += 1,
         }
+    }
+    if dim > 0 {
+        write_embedding_meta(transaction, llm, dim).await?;
     }
     stats.embedded_cached = (llm.client.stats().embed_hits - hits).min(stats.embedded);
     stats.embedding_dim = if stats.embedded > 0 { dim } else { 0 };
@@ -1531,6 +1536,44 @@ async fn index_embeddings(
             failed = stats.embed_failed,
             "some symbols got no vector this run; they are embedded next run"
         );
+    }
+    if stats.embed_skipped > 0 {
+        tracing::warn!(
+            symbols = symbols.len(),
+            embedded = stats.embedded,
+            skipped = stats.embed_skipped,
+            "some symbols got no vector: their embeddings are not cached and this run makes no embedding calls (--no-llm or the circuit breaker)"
+        );
+    }
+    Ok(())
+}
+
+/// Record in `index_meta` what produced `symbol_vectors`: the embedding
+/// model, the dimension and the `[embedding] parent_description` setting,
+/// so a reader can refuse query vectors from another model.
+async fn write_embedding_meta(
+    transaction: &Transaction,
+    llm: &Summarizer,
+    dim: usize,
+) -> Result<()> {
+    for (key, value) in [
+        (
+            schema::META_EMBEDDING_MODEL,
+            llm.client.embedding_model().to_string(),
+        ),
+        (schema::META_EMBEDDING_DIM, dim.to_string()),
+        (
+            schema::META_EMBEDDING_PARENT_DESCRIPTION,
+            llm.embedding.parent_description.to_string(),
+        ),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO index_meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .await
+            .with_context(|| format!("writing index_meta {key}"))?;
     }
     Ok(())
 }
@@ -1913,8 +1956,8 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_TICKET_REGEX, EmbeddingConfig, OllamaConfig};
     use crate::llm::LlmClient;
-    use crate::llm::MAX_CONSECUTIVE_INVALID;
-    use crate::llm::fake::{FakeBackend, ModelCheck, vector_for};
+    use crate::llm::fake::{FakeBackend, ModelCheck, vector_for, with_warnings};
+    use crate::llm::{EMBED_BATCH, MAX_CONSECUTIVE_INVALID};
     use crate::store::IndexReader;
     use crate::test_support::{commit, init_repo};
     use crate::tickets::fake::{self, Answer, FakeSource};
@@ -4103,6 +4146,17 @@ public class UserService {
     /// index has no `symbol_vectors` table.
     async fn vector_fqns(data: &Path) -> Option<Vec<String>> {
         let reader = IndexReader::open(data).await.unwrap();
+        let mut tables = reader
+            .connection()
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'symbol_vectors'",
+                (),
+            )
+            .await
+            .unwrap();
+        if tables.next().await.unwrap().unwrap().get::<i64>(0).unwrap() == 0 {
+            return None;
+        }
         let mut rows = reader
             .connection()
             .query(
@@ -4110,7 +4164,7 @@ public class UserService {
                 (),
             )
             .await
-            .ok()?;
+            .unwrap();
         let mut fqns = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             fqns.push(row.get::<String>(0).unwrap());
@@ -4155,6 +4209,7 @@ public class UserService {
                 "com.acme.Service#value()".to_string()
             ])
         );
+        assert_eq!(index_meta(data.path()).await, embedding_meta("3", "false"));
 
         let reader = IndexReader::open(data.path()).await.unwrap();
         let query = encode_vector(&vector_for(VALUE_TEXT));
@@ -4211,9 +4266,20 @@ public class UserService {
         };
 
         let quiet = FakeBackend::new();
-        let cached = embed_with(repo.path(), data.path(), &quiet, true, with_parent)
-            .await
-            .unwrap();
+        let (cached, logs) = with_warnings(embed_with(
+            repo.path(),
+            data.path(),
+            &quiet,
+            true,
+            with_parent,
+        ))
+        .await;
+        let cached = cached.unwrap();
+        let warning = log_line(
+            &logs,
+            "some symbols got no vector: their embeddings are not cached",
+        );
+        assert!(warning.contains("skipped=1"), "{warning}");
         assert_eq!(cached.embed_symbols, 2);
         assert_eq!(cached.embedded, 1, "the type's text has no parent part");
         assert_eq!(cached.embedded_cached, 1);
@@ -4227,6 +4293,7 @@ public class UserService {
             vector_fqns(data.path()).await,
             Some(vec!["com.acme.Service".to_string()])
         );
+        assert_eq!(index_meta(data.path()).await, embedding_meta("3", "true"));
 
         let stats = embed_with(repo.path(), data.path(), &backend, false, with_parent)
             .await
@@ -4265,6 +4332,7 @@ public class UserService {
             Some("Returns the value.".to_string())
         );
         assert_eq!(vector_fqns(data.path()).await, None, "no vector, no table");
+        assert!(index_meta(data.path()).await.is_empty());
 
         let working = FakeBackend::new();
         let stats = embed_with(
@@ -4278,6 +4346,155 @@ public class UserService {
         .unwrap();
         assert_eq!(stats.embedded, 2);
         assert_eq!(stats.embedded_cached, 0);
+    }
+
+    /// `(key, value)` of every `index_meta` row in the committed index, by
+    /// key.
+    async fn index_meta(data: &Path) -> Vec<(String, String)> {
+        let reader = IndexReader::open(data).await.unwrap();
+        let mut rows = reader
+            .connection()
+            .query("SELECT key, value FROM index_meta ORDER BY key", ())
+            .await
+            .unwrap();
+        let mut meta = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            meta.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
+        meta
+    }
+
+    /// The `index_meta` rows of an index embedded by the fake `embed` model.
+    fn embedding_meta(dim: &str, parent_description: &str) -> Vec<(String, String)> {
+        vec![
+            (schema::META_EMBEDDING_DIM.to_string(), dim.to_string()),
+            (
+                schema::META_EMBEDDING_MODEL.to_string(),
+                "embed".to_string(),
+            ),
+            (
+                schema::META_EMBEDDING_PARENT_DESCRIPTION.to_string(),
+                parent_description.to_string(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_request_failing_midway_keeps_the_batches_embedded_before_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let methods: String = (0..EMBED_BATCH + 6)
+            .map(|i| format!("    int m{i}() {{ return {i}; }}\n"))
+            .collect();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            &format!("package com.acme;\nclass Service {{\n{methods}}}\n"),
+        );
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        backend.fail_embeddings_from(2);
+
+        let (stats, logs) = with_warnings(embed_with(
+            repo.path(),
+            data.path(),
+            &backend,
+            false,
+            EmbeddingConfig::default(),
+        ))
+        .await;
+        let stats = stats.unwrap();
+
+        assert_eq!(stats.embed_symbols, EMBED_BATCH + 7);
+        assert_eq!(stats.embedded, EMBED_BATCH, "the first batch was cached");
+        assert_eq!(stats.embedded_cached, EMBED_BATCH);
+        assert_eq!(stats.embed_failed, 7);
+        assert_eq!(stats.embed_llm.embed_calls, 2);
+        assert!(logs.contains("the embedding model failed"), "{logs}");
+        assert_eq!(vector_fqns(data.path()).await.unwrap().len(), EMBED_BATCH);
+        assert_eq!(index_meta(data.path()).await, embedding_meta("3", "false"));
+
+        let working = FakeBackend::new();
+        let stats = embed_with(
+            repo.path(),
+            data.path(),
+            &working,
+            false,
+            EmbeddingConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.embedded, EMBED_BATCH + 7);
+        assert_eq!(stats.embedded_cached, EMBED_BATCH);
+        assert_eq!(working.batches().len(), 1);
+        assert_eq!(working.batches()[0].len(), 7);
+    }
+
+    #[tokio::test]
+    async fn after_an_earlier_trip_only_cached_embeddings_are_used_and_undescribed_members_get_none()
+     {
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            "src/main/java/com/acme/Service.java",
+            "package com.acme;\nclass Service {\n    int a() { return 1; }\n    int b() { return 2; }\n    int c() { return 3; }\n}\n",
+        );
+        let data = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new();
+        let store = Store::open(data.path()).await.unwrap();
+        let llm = summarizer(&store, &backend, false);
+        llm.client
+            .embed(&["com.acme.Service#a()\nReturns the value."])
+            .await
+            .unwrap();
+        drop(llm);
+        drop(store);
+        let backend = FakeBackend::new();
+        backend.reply(&[DESCRIBED, DESCRIBED]);
+        let store = Store::open(data.path()).await.unwrap();
+        let config = OllamaConfig {
+            url: "http://localhost:11434".to_string(),
+            chat_model: "chat".to_string(),
+            embedding_model: "embed".to_string(),
+            reasoning_effort: "none".to_string(),
+            temperature: 0.0,
+            max_tokens: crate::config::DEFAULT_MAX_TOKENS,
+        };
+        let client = LlmClient::new(backend.clone(), store.connect_cache().unwrap(), &config);
+        let llm = Summarizer::new(client, false);
+
+        let (stats, logs) = with_warnings(build_index(
+            &store,
+            repo.path(),
+            None,
+            &ticket_regex(),
+            &JiraMode::Disabled,
+            Some(&llm),
+        ))
+        .await;
+        let stats = stats.unwrap();
+
+        assert_eq!(stats.described, 2);
+        assert_eq!(stats.describe_failed, 1, "c(): no scripted reply trips");
+        assert_eq!(description_of(data.path(), "com.acme.Service").await, None);
+        assert!(llm.client.is_cache_only());
+        assert_eq!(stats.embed_symbols, 2, "c() and the type have none");
+        assert_eq!(stats.embedded, 1);
+        assert_eq!(stats.embedded_cached, 1);
+        assert_eq!(stats.embed_skipped, 1, "b() is not cached");
+        assert_eq!(stats.embed_failed, 0);
+        assert!(backend.batches().is_empty(), "a tripped run sends nothing");
+        assert!(
+            logs.contains("some symbols got no vector: their embeddings are not cached"),
+            "{logs}"
+        );
+        assert_eq!(
+            description_of(data.path(), "com.acme.Service#c()").await,
+            None
+        );
+        assert_eq!(
+            vector_fqns(data.path()).await,
+            Some(vec!["com.acme.Service#a()".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -5004,33 +5221,6 @@ Commits: (none)
             description_of(data.path(), "com.acme.Orders.Line.Kind").await,
             Some("Serves the values.".to_string())
         );
-    }
-
-    /// `future`'s output and the warnings it logged, as plain text.
-    async fn with_warnings<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
-        use tracing::instrument::WithSubscriber;
-
-        #[derive(Clone, Default)]
-        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buffer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buffer = Buffer::default();
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let output = future.with_subscriber(subscriber).await;
-        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
-        (output, logs)
     }
 
     /// The logged line containing `message`.
