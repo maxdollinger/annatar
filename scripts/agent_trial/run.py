@@ -3,8 +3,12 @@
 
 Usage:
   run.py run --tasks tasks.toml --out DIR [--reps 2] [--only T1,T2] [--arms with,without]
-  run.py summary --out DIR          # per-run CSV + per task/arm means
+  run.py summary --out DIR          # per-run CSV + per task/arm means; warns about incomplete runs
   run.py blind --out DIR            # shuffled final answers for grading, annatar mentions redacted
+
+`run` writes DIR/raw/<task>-<arm>-<rep>.jsonl (the stream) and .meta.json (exit code, timeout,
+wall time); a run without a result event is repeated by the next `run`.
+Tests (stdlib, no network): python3 -m unittest discover -s scripts/agent_trial
 
 The task file (private) holds `preamble` and `[[task]]` tables with `id`, `label`, `prompt`.
 Environment: ANNATAR_TRIAL_REPO (cwd of the agent), ANNATAR_TRIAL_BIN (directory with an
@@ -17,6 +21,8 @@ import json
 import os
 import random
 import re
+import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -31,6 +37,9 @@ Results are ranked by similarity of meaning; the best match is not always first,
 
 TOOLS = "Bash,Read,Grep,Glob"
 ARMS = ("with", "without")
+VALUE_OPTIONS = {"--path", "--config", "-k", "--limit", "--kind", "--role"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)|`([^`]*)`")
 
 
 def claude_cmd(model, arm, prompt, max_turns, budget):
@@ -70,14 +79,50 @@ def repo_state(repo):
                           text=True, check=True).stdout
 
 
+def substitutions(command):
+    inner = []
+    while True:
+        match = SUBSTITUTION.search(command)
+        if not match:
+            return command, inner
+        inner.append(match.group(1) or match.group(2))
+        command = command[:match.start()] + "_" + command[match.end():]
+
+
+def shell_words(command):
+    command = command.replace("\\\n", " ").replace("\n", " ; ")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return re.sub(r"([;|&()$])", r" \1 ", command).split()
+
+
 def annatar_calls(command):
-    calls = []
-    for part in re.split(r"\|\||&&|[;|\n]", command):
-        words = part.strip().split()
-        if words and os.path.basename(words[0]) == "annatar":
-            sub = next((w for w in words[1:] if not w.startswith("-")), "?")
-            calls.append(sub)
+    outer, inner = substitutions(command)
+    return [call for part in [outer] + inner for call in simple_calls(part)]
+
+
+def simple_calls(command):
+    calls, segment = [], []
+    for word in shell_words(command) + [";"]:
+        if word.strip("();<>|&$"):
+            segment.append(word)
+            continue
+        while segment and ASSIGNMENT.match(segment[0]):
+            segment.pop(0)
+        if segment and os.path.basename(segment[0]) == "annatar":
+            calls.append(subcommand(segment[1:]))
+        segment = []
     return calls
+
+
+def subcommand(args):
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in VALUE_OPTIONS else 1
+    return args[i] if i < len(args) else "?"
 
 
 def parse_stream(path):
@@ -120,38 +165,66 @@ def run(args):
                 raw = out / "raw" / f"{name}.jsonl"
                 if raw.exists() and '"type":"result"' in raw.read_text():
                     continue
+                env = arm_env(arm)
+                check_path(arm, env)
                 prompt = spec["preamble"] + task["prompt"]
                 start = time.time()
                 with open(raw, "w") as f:
-                    proc = subprocess.run(claude_cmd(model, arm, prompt, args.max_turns, args.budget),
-                                          cwd=repo, env=arm_env(arm), stdout=f,
-                                          stderr=subprocess.STDOUT, timeout=args.timeout)
+                    try:
+                        returncode = subprocess.run(claude_cmd(model, arm, prompt, args.max_turns, args.budget),
+                                                    cwd=repo, env=env, stdout=f, stderr=subprocess.STDOUT,
+                                                    timeout=args.timeout).returncode
+                    except subprocess.TimeoutExpired:
+                        returncode = None
                 wall = time.time() - start
+                meta = {"returncode": returncode, "timeout": returncode is None, "wall_s": round(wall, 1)}
+                (out / "raw" / f"{name}.meta.json").write_text(json.dumps(meta) + "\n")
                 if repo_state(repo) != baseline:
                     sys.exit(f"{name}: repository changed")
                 if memory.exists() and any(memory.iterdir()):
                     sys.exit(f"{name}: agent wrote memory under {memory}")
                 tools, annatar, result, _ = parse_stream(raw)
-                used = sorted((result or {}).get("modelUsage", {}))
+                if result is None:
+                    print(f"{name}: no result (exit {returncode}, timeout {meta['timeout']}) wall {wall:.0f}s",
+                          flush=True)
+                    continue
+                used = sorted(result.get("modelUsage", {}))
                 if used != [model]:
                     sys.exit(f"{name}: ran on {used}, not {model}")
-                cost = result.get("total_cost_usd") if result else None
-                print(f"{name}: exit {proc.returncode} wall {wall:.0f}s cost {cost} tools {tools} annatar {annatar}",
-                      flush=True)
+                print(f"{name}: exit {returncode} wall {wall:.0f}s cost {result.get('total_cost_usd')} "
+                      f"tools {tools} annatar {annatar}", flush=True)
+
+
+def check_path(arm, env):
+    found = shutil.which("annatar", path=env["PATH"])
+    if arm == "without" and found:
+        sys.exit(f"annatar is on PATH for the without arm: {found}")
+    if arm == "with" and found != str(Path(env["ANNATAR_TRIAL_BIN"]) / "annatar"):
+        sys.exit(f"annatar on PATH for the with arm is {found}, not the one in ANNATAR_TRIAL_BIN")
 
 
 def rows(out):
-    spec_rows = []
+    spec_rows, problems = [], []
     for raw in sorted((Path(out) / "raw").glob("*.jsonl")):
         task, arm, rep = raw.stem.split("-")
         tools, annatar, result, final = parse_stream(raw)
+        meta_path = raw.with_name(f"{raw.stem}.meta.json")
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        if meta.get("timeout"):
+            problems.append(f"{raw.stem}: timed out")
+        elif meta.get("returncode") not in (None, 0):
+            problems.append(f"{raw.stem}: exit {meta['returncode']}")
         if not result:
+            problems.append(f"{raw.stem}: no result event, left out")
             continue
+        if result.get("subtype") != "success":
+            problems.append(f"{raw.stem}: subtype {result.get('subtype')}")
         u = result["usage"]
         total = u["input_tokens"] + u["cache_read_input_tokens"] + u["cache_creation_input_tokens"] + u["output_tokens"]
         spec_rows.append({
             "run": raw.stem, "task": task, "arm": arm, "rep": int(rep),
-            "subtype": result.get("subtype"), "turns": result.get("num_turns"),
+            "subtype": result.get("subtype"), "returncode": meta.get("returncode"),
+            "turns": result.get("num_turns"),
             "duration_s": round(result.get("duration_ms", 0) / 1000, 1),
             "cost_usd": round(result.get("total_cost_usd", 0), 4),
             "tokens_total": total, "input": u["input_tokens"], "cache_read": u["cache_read_input_tokens"],
@@ -162,11 +235,13 @@ def rows(out):
             "annatar_search": annatar["search"], "annatar_show": annatar["show"], "annatar_other": annatar["other"],
             "final_chars": len(final),
         })
-    return spec_rows
+    return spec_rows, problems
 
 
 def summary(args):
-    data = rows(args.out)
+    data, problems = rows(args.out)
+    for problem in problems:
+        print(f"warning: {problem}", file=sys.stderr)
     if not data:
         sys.exit("no finished runs")
     with open(Path(args.out) / "runs.csv", "w", newline="") as f:
