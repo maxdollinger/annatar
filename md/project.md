@@ -90,7 +90,7 @@ Tables in `index.db`:
 
 - `symbols`: name, kind, file, line, description, content hash
 - `edges`: src, dst, kind (call, import, implements)
-- `symbol_vec`: embeddings of the description text, not of the code
+- `symbol_vectors`: embeddings of the fqn and description text, not of the code
 - `tickets`: one cached summary per ticket ID
 
 Vector search finds candidate symbols; plain joins and recursive CTEs over `edges` answer usage and blast-radius questions. No separate graph database is needed.

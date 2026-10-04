@@ -33,8 +33,9 @@
 //!
 //! The client is also the run's circuit breaker for the chat model (see
 //! [`LlmClient`]): once tripped, or with `--no-llm`, every stage gets cached
-//! completions only. [`LlmClient::check_chat_model`] fails a run whose chat
-//! model does not exist.
+//! completions only (and the embeddings stage cached embeddings only).
+//! [`LlmClient::check_models`] fails a run whose chat or embedding model does
+//! not exist.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -641,26 +642,28 @@ impl LlmClient {
     }
 
     /// Check once, before the first LLM stage, that the server has the chat
-    /// model. A missing model is an error (a misconfigured run would
-    /// otherwise finish with no summaries at all); an unreachable server or
-    /// another failure trips the breaker and the run goes on cache-only. A
-    /// cache-only client makes no request.
-    pub async fn check_chat_model(&self) -> Result<()> {
-        if self.is_cache_only() {
-            return Ok(());
-        }
-        match self.backend.has_model(&self.chat_model).await {
-            Ok(true) => Ok(()),
-            Ok(false) => bail!(
-                "the chat model {:?} does not exist on the Ollama server; pull it (`ollama pull {}`) or fix ollama.chat_model",
-                self.chat_model,
-                self.chat_model
-            ),
-            Err(err) => {
-                self.trip(&format!("checking the chat model failed: {err:#}"));
-                Ok(())
+    /// model and then the embedding model. A missing model is an error (a
+    /// misconfigured run would otherwise finish with no summaries or no
+    /// vectors at all); an unreachable server or another failure trips the
+    /// breaker and the run goes on cache-only. A cache-only client makes no
+    /// request.
+    pub async fn check_models(&self) -> Result<()> {
+        for (model, kind, key) in [
+            (&self.chat_model, "chat", "chat_model"),
+            (&self.embedding_model, "embedding", "embedding_model"),
+        ] {
+            if self.is_cache_only() {
+                return Ok(());
+            }
+            match self.backend.has_model(model).await {
+                Ok(true) => {}
+                Ok(false) => bail!(
+                    "the {kind} model {model:?} does not exist on the Ollama server; pull it (`ollama pull {model}`) or fix ollama.{key}"
+                ),
+                Err(err) => self.trip(&format!("checking the {kind} model failed: {err:#}")),
             }
         }
+        Ok(())
     }
 
     /// Answer `prompt` with a `T`, from the cache or the chat model. See the
@@ -841,6 +844,30 @@ impl LlmClient {
     /// the same name, a bad cache row) are an error, and such a batch is not
     /// cached.
     pub async fn embed<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
+        self.embed_with(texts, true)
+            .await?
+            .into_iter()
+            .map(|vector| vector.ok_or_else(|| anyhow!("a text has no embedding")))
+            .collect()
+    }
+
+    /// The cached vector of each text, in input order, `None` for a miss,
+    /// without ever calling the backend: the cache-only half of
+    /// [`LlmClient::embed`]. Hits count in `embed_hits`; cached vectors of
+    /// different lengths are an error.
+    pub async fn cached_embeddings<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.embed_with(texts, false).await
+    }
+
+    /// [`LlmClient::embed`], sending the misses only when `send` is set.
+    async fn embed_with<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        send: bool,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut dim: Option<usize> = None;
         let mut missing: Vec<(&str, String)> = Vec::new();
@@ -866,6 +893,9 @@ impl LlmClient {
             }
         }
 
+        if !send {
+            missing.clear();
+        }
         for batch in missing.chunks(EMBED_BATCH) {
             let inputs: Vec<String> = batch.iter().map(|(text, _)| text.to_string()).collect();
             self.counters.embed_calls.fetch_add(1, Ordering::Relaxed);
@@ -903,7 +933,7 @@ impl LlmClient {
         let missed: HashSet<&str> = missing.iter().map(|(text, _)| *text).collect();
         let mut hits = 0;
         for (text, seen) in &positions {
-            if !missed.contains(text) {
+            if !missed.contains(text) && vectors[seen[0]].is_some() {
                 hits += seen.len();
             }
             for &position in &seen[1..] {
@@ -911,10 +941,7 @@ impl LlmClient {
             }
         }
         self.counters.embed_hits.fetch_add(hits, Ordering::Relaxed);
-        vectors
-            .into_iter()
-            .map(|vector| vector.ok_or_else(|| anyhow!("a text has no embedding")))
-            .collect()
+        Ok(vectors)
     }
 
     async fn cached_completion(&self, key: &str) -> Result<Option<String>> {
@@ -1109,7 +1136,7 @@ fn embedding_key(model: &str, text: &str) -> String {
 }
 
 /// Little-endian `f32`s, the layout of libSQL's `F32_BLOB`.
-fn encode_vector(vector: &[f32]) -> Vec<u8> {
+pub(crate) fn encode_vector(vector: &[f32]) -> Vec<u8> {
     vector
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -1149,6 +1176,8 @@ pub(crate) mod fake {
         chats: Mutex<Vec<ChatRequest>>,
         batches: Mutex<Vec<Vec<String>>>,
         short: Mutex<Vec<String>>,
+        lacks: Mutex<Vec<String>>,
+        embed_fails: AtomicBool,
     }
 
     /// How [`FakeBackend::has_model`] answers.
@@ -1167,6 +1196,17 @@ pub(crate) mod fake {
 
         pub fn model(&self, check: ModelCheck) {
             *self.model.lock().unwrap() = check;
+        }
+
+        /// Answer the check of `model` with "missing", whatever
+        /// [`FakeBackend::model`] says.
+        pub fn lacks(&self, model: &str) {
+            self.lacks.lock().unwrap().push(model.to_string());
+        }
+
+        /// Fail every embedding request from now on (recorded first).
+        pub fn fail_embeddings(&self) {
+            self.embed_fails.store(true, Ordering::Relaxed);
         }
 
         /// The model names checked so far.
@@ -1239,6 +1279,9 @@ pub(crate) mod fake {
             Box::pin(async move {
                 assert!(!texts.is_empty(), "the client never sends an empty batch");
                 self.batches.lock().unwrap().push(texts.to_vec());
+                if self.embed_fails.load(Ordering::Relaxed) {
+                    return Err(anyhow!("embedding server down"));
+                }
                 let short = self.short.lock().unwrap();
                 Ok(texts
                     .iter()
@@ -1256,6 +1299,15 @@ pub(crate) mod fake {
         fn has_model<'a>(&'a self, model: &'a str) -> BackendFuture<'a, bool> {
             Box::pin(async move {
                 self.model_checks.lock().unwrap().push(model.to_string());
+                if self
+                    .lacks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|lacks| lacks == model)
+                {
+                    return Ok(false);
+                }
                 match *self.model.lock().unwrap() {
                     ModelCheck::Found => Ok(true),
                     ModelCheck::Missing => Ok(false),
@@ -1708,32 +1760,49 @@ mod tests {
         assert_eq!(llm.complete::<Summary>("cached").await.unwrap(), summary());
         let err = llm.complete::<Summary>("missing").await.unwrap_err();
         assert!(is_unavailable(&err), "{err:#}");
-        llm.check_chat_model().await.unwrap();
+        llm.check_models().await.unwrap();
         assert!(backend.model_checks().is_empty());
         assert_eq!(backend.chats().len(), 1);
     }
 
     #[tokio::test]
-    async fn chat_model_check_fails_on_a_missing_model_and_trips_on_errors() {
+    async fn model_check_fails_on_a_missing_model_and_trips_on_errors() {
         let (_dir, store) = store().await;
         let backend = FakeBackend::new();
         let llm = client(&backend, &store, &ollama("chat"));
-        llm.check_chat_model().await.unwrap();
+        llm.check_models().await.unwrap();
         assert!(!llm.is_cache_only());
-        assert_eq!(backend.model_checks(), vec!["chat".to_string()]);
+        assert_eq!(
+            backend.model_checks(),
+            vec!["chat".to_string(), "embed".to_string()]
+        );
+
+        backend.lacks("embed");
+        let err = llm.check_models().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the embedding model \"embed\" does not exist")
+                && format!("{err:#}").contains("ollama.embedding_model"),
+            "{err:#}"
+        );
 
         backend.model(ModelCheck::Missing);
-        let err = llm.check_chat_model().await.unwrap_err();
+        let err = llm.check_models().await.unwrap_err();
         assert!(
             format!("{err:#}").contains("the chat model \"chat\" does not exist"),
             "{err:#}"
         );
 
         backend.model(ModelCheck::Fails);
-        llm.check_chat_model().await.unwrap();
+        let checks = backend.model_checks().len();
+        llm.check_models().await.unwrap();
         assert!(
             llm.is_cache_only(),
             "an unreachable server trips the breaker"
+        );
+        assert_eq!(
+            backend.model_checks().len(),
+            checks + 1,
+            "a tripped breaker skips the embedding model check"
         );
     }
 
@@ -2015,6 +2084,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(backend.batches().len(), 3, "another model misses");
+    }
+
+    #[tokio::test]
+    async fn cached_embeddings_never_call_the_backend() {
+        let (_dir, store) = store().await;
+        let backend = FakeBackend::new();
+        let llm = client(&backend, &store, &ollama("chat"));
+        llm.embed(&["alpha"]).await.unwrap();
+        let llm = client(&backend, &store, &ollama("chat"));
+
+        let vectors = llm
+            .cached_embeddings(&["beta", "alpha", "beta", "alpha"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vectors,
+            vec![
+                None,
+                Some(vector_for("alpha")),
+                None,
+                Some(vector_for("alpha"))
+            ]
+        );
+        assert_eq!(backend.batches().len(), 1);
+        assert_eq!(
+            llm.stats(),
+            LlmStats {
+                embed_hits: 2,
+                ..LlmStats::default()
+            }
+        );
     }
 
     #[tokio::test]

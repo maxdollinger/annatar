@@ -142,6 +142,7 @@ Product owner: "Move from the pure what / why to a simple general symbol descrip
 *Goal:* every symbol with a description has a vector in a searchable index.
 Embed `fqn + description` through the embedding cache (was `fqn + what + why` before 4.6). Take the dimension from the first embedding response, not from config. Store it in an `F32_BLOB(<dim>)` column with a `libsql_vector_idx` index.
 *Done when:* every symbol with a description has a vector.
+*Built (5.1, `state.md` D-br–D-bv):* table `symbol_vectors (symbol_id, embedding F32_BLOB(<dim>))` with a cosine `libsql_vector_idx` (`compress_neighbors=float8`), created by the embeddings stage once the dimension is known, so an index without vectors has no such table (5.2 must say so); text `fqn\ndescription`, `[embedding] parent_description` (default off) appends a member's type description for 5.3 to compare; the run checks the embedding model like the chat model; `--no-llm` uses cached embeddings only.
 
 **5.2 `annatar search "<query>"`**
 *Goal:* a plain-language question returns the top-k symbols with fqn, description and file:line.

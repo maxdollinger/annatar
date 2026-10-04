@@ -43,8 +43,8 @@ enum Command {
         /// already in cache.db are still used.
         #[arg(long)]
         offline: bool,
-        /// Make no chat-model calls; summaries and descriptions already in
-        /// cache.db are still used, the rest get none.
+        /// Make no chat or embedding calls; summaries, descriptions and
+        /// embeddings already in cache.db are still used, the rest get none.
         #[arg(long)]
         no_llm: bool,
     },
@@ -78,7 +78,8 @@ async fn main() -> Result<()> {
             let jira = TicketFetch::from_config(config.jira.as_ref(), *offline)?;
             let store = Store::open(&config.data_dir).await?;
             let llm =
-                Summarizer::from_config(config.ollama.as_ref(), config.describe, *no_llm, &store)?;
+                Summarizer::from_config(config.ollama.as_ref(), config.describe, *no_llm, &store)?
+                    .map(|llm| llm.with_embedding(config.embedding));
             let stats = indexer::build_index(
                 &store,
                 &config.repo,
@@ -153,6 +154,17 @@ async fn main() -> Result<()> {
                 stats.type_llm.chat_retries,
                 stats.type_llm.peak_prompt_tokens,
                 stats.type_llm.peak_completion_tokens
+            );
+            println!(
+                "embeddings: {} symbols, {} embedded ({} from cache), {} failed, {} skipped; {} embedding calls, {} texts sent, dim {}",
+                stats.embed_symbols,
+                stats.embedded,
+                stats.embedded_cached,
+                stats.embed_failed,
+                stats.embed_skipped,
+                stats.embed_llm.embed_calls,
+                stats.embed_llm.embed_texts,
+                stats.embedding_dim
             );
         }
         Command::Show { fqn } => {

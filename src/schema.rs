@@ -71,9 +71,33 @@ pub const INDEX_TABLES: &[&str] = &[
         llm_summary TEXT,
         llm_purpose TEXT
     )",
-    // 5.1 adds `symbol_vec`
-    // (`F32_BLOB` + `libsql_vector_idx`).
+    // 5.1 `symbol_vectors` is not here: its `F32_BLOB(<dim>)` column needs
+    // the embedding dimension, known only from the first embedding response,
+    // so the embeddings stage creates it with [`vector_tables`].
 ];
+
+/// Name of the vector index over `symbol_vectors.embedding`, the first
+/// argument of `vector_top_k`.
+pub const VECTOR_INDEX: &str = "symbol_vectors_embedding";
+
+/// 5.1 `symbol_vectors`: one embedding of `dim` 32-bit floats per symbol
+/// that has a description (its `symbol_id` is the rowid `vector_top_k`
+/// returns), with a cosine `libsql_vector_idx` index. Part of `index.db`, but
+/// created by the embeddings stage once the dimension is known; an index
+/// without any vector has no such table.
+pub fn vector_tables(dim: usize) -> [String; 2] {
+    [
+        format!(
+            "CREATE TABLE symbol_vectors (
+        symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id),
+        embedding F32_BLOB({dim}) NOT NULL
+    )"
+        ),
+        format!(
+            "CREATE INDEX {VECTOR_INDEX} ON symbol_vectors(libsql_vector_idx(embedding, 'metric=cosine', 'compress_neighbors=float8'))"
+        ),
+    ]
+}
 
 /// `CREATE TABLE IF NOT EXISTS` statements for the persistent `cache.db`.
 pub const CACHE_TABLES: &[&str] = &[
@@ -135,6 +159,29 @@ pub async fn create_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Page cache of a build connection that writes vectors, in KiB (a cap, not
+/// an allocation). The vector index rewrites graph nodes of several KiB on
+/// every insert; with SQLite's 2 MB default the open transaction spills
+/// pages to the temporary file on each one, which made 654 inserts of 1024
+/// dimensions take 13 s on a slow (container-mounted) disk instead of 1.4 s.
+pub const VECTOR_CACHE_KIB: i64 = 256 * 1024;
+
+/// Create `symbol_vectors` and its vector index for `dim`-dimensional
+/// embeddings on a build connection, and raise its page cache to
+/// [`VECTOR_CACHE_KIB`]; see [`vector_tables`].
+pub async fn create_vectors(conn: &Connection, dim: usize) -> Result<()> {
+    anyhow::ensure!(dim > 0, "an embedding needs at least one dimension");
+    conn.execute(&format!("PRAGMA cache_size = -{VECTOR_CACHE_KIB}"), ())
+        .await
+        .context("raising the page cache for the vector index")?;
+    for statement in vector_tables(dim) {
+        conn.execute(&statement, ())
+            .await
+            .with_context(|| format!("creating vector table: {statement}"))?;
+    }
+    Ok(())
+}
+
 /// Create any missing cache tables. Called by
 /// [`crate::store::Store::open`].
 pub async fn create_cache(conn: &Connection) -> Result<()> {
@@ -144,4 +191,67 @@ pub async fn create_cache(conn: &Connection) -> Result<()> {
             .with_context(|| format!("creating cache table: {statement}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use libsql::params;
+
+    use super::*;
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn vector_table_takes_f32_blobs_and_answers_top_k_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let build = store.begin_index().await.unwrap();
+        let conn = build.connection();
+        create_vectors(conn, 3).await.unwrap();
+        for (id, fqn, vector) in [
+            (1, "com.acme.A", [1.0f32, 0.0, 0.0]),
+            (2, "com.acme.B", [0.0, 1.0, 0.0]),
+            (3, "com.acme.C", [0.9, 0.1, 0.0]),
+        ] {
+            conn.execute(
+                "INSERT INTO symbols (id, kind, fqn, file, start_line, end_line, signature, content_hash)
+                 VALUES (?1, 'class', ?2, 'A.java', 1, 1, '', '')",
+                params![id, fqn],
+            )
+            .await
+            .unwrap();
+            let blob: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+            conn.execute(
+                "INSERT INTO symbol_vectors (symbol_id, embedding) VALUES (?1, vector32(?2))",
+                params![id, blob],
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT s.fqn FROM vector_top_k('{VECTOR_INDEX}', vector32('[1, 0, 0]'), 2) AS v
+                     JOIN symbols s ON s.id = v.id"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        let mut fqns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            fqns.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(fqns, vec!["com.acme.A", "com.acme.C"]);
+
+        let err = conn
+            .execute(
+                "UPDATE symbol_vectors SET embedding = vector32('[1, 0]') WHERE symbol_id = 1",
+                (),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dimension"), "{err}");
+        assert!(create_vectors(conn, 0).await.is_err());
+    }
 }
