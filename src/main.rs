@@ -58,8 +58,6 @@ enum Command {
         /// Plain-language query.
         query: String,
     },
-    /// Run the MCP server over stdio.
-    Serve,
 }
 
 #[tokio::main]
@@ -143,7 +141,6 @@ async fn main() -> Result<()> {
             print!("{}", show::render(reader.connection(), fqn).await?);
         }
         Command::Search { query } => not_implemented(&format!("search {query}")),
-        Command::Serve => not_implemented("serve"),
     }
     Ok(())
 }

@@ -10,7 +10,7 @@ Scope: **Java / Spring** only, **Jira** only (keys like `GRLD-123`), **Ollama** 
 
 1. **Quality:** what/why records generated from signature, Javadoc and ticket summaries are correct and useful.
 2. **Retrieval:** searching what/why by meaning finds the right class or method for a plain-language question.
-3. **Agent value:** a coding agent using the MCP server finds relevant code faster and with fewer tokens.
+3. **Agent value:** a coding agent using the `annatar` CLI finds relevant code faster and with fewer tokens.
 
 Everything that doesn't help answer these three questions is in **Later**, at the end.
 
@@ -19,9 +19,9 @@ Everything that doesn't help answer these three questions is in **Later**, at th
 - One step = one small PR. Don't start the next step in the same change.
 - Every step ships with tests. Unit tests use fixtures and never need network, Jira or Ollama. Tests that do are marked `#[ignore]` and run manually.
 - **Two database files.**
-  - `index.db` is rebuilt from scratch on every run. It's written to a temporary file and atomically renamed into place, so a running MCP server never sees a half-built index.
+  - `index.db` is rebuilt from scratch on every run. It's written to a temporary file and atomically renamed into place, so a concurrent `search` or `show` never sees a half-built index.
   - `cache.db` persists and holds only expensive results, keyed by content: tickets by ticket key (fetched once, never refreshed, since done tickets don't change), LLM outputs by a hash of model + prompt text + input (plus the response schema, reasoning effort and temperature, so a changed struct or setting misses), and embeddings by a hash of model + text. A changed prompt, model or input simply misses the cache, so no versioning or invalidation logic is needed. If a cache table's schema changes, drop that table.
-- **Symbols are identified by fully qualified name (fqn)** everywhere outside a single run: in caches, the golden set and the MCP tools. Row IDs change on every rebuild.
+- **Symbols are identified by fully qualified name (fqn)** everywhere outside a single run: in caches, the golden set and the CLI (`show`, `search`). Row IDs change on every rebuild.
 - `--path <prefix>` limits a run to part of the repo, for fast iteration on prompts. The run still replaces the whole `index.db`, which then holds only that prefix (one warning says so; `state.md` D-ab).
 
 ---
@@ -30,7 +30,7 @@ Everything that doesn't help answer these three questions is in **Later**, at th
 
 **0.1 CLI, config, logging**
 *Goal:* a binary that loads a validated configuration and exposes the subcommands later steps fill in.
-Binary `annatar` with `clap` subcommands `index`, `show`, `search`, `serve` (stubs), `--path` and `-v`. Load `annatar.toml`: repo path, data directory, ticket key regex (default `\bGRLD-\d+\b`), Jira base URL and auth, Ollama URL, chat model, embedding model. Secrets from environment variables. Logging with `tracing`.
+Binary `annatar` with `clap` subcommands `index`, `show`, `search` (stubs; a `serve` stub was dropped when MCP left the POC, `state.md` D-ax), `--path` and `-v`. Load `annatar.toml`: repo path, data directory, ticket key regex (default `\bGRLD-\d+\b`), Jira base URL and auth, Ollama URL, chat model, embedding model. Secrets from environment variables. Logging with `tracing`.
 *Done when:* `--help` works; config tests cover defaults and a missing required value.
 
 **0.2 Database files**
@@ -128,7 +128,7 @@ Process the deepest nested types first, so an outer class can include its nested
 Review 20–30 symbols you know well against the code and tickets; adjust prompts. Write 15–20 plain-language questions, each with the fqn it should find, as a test fixture.
 *Done when:* you'd trust the records you reviewed; the golden set exists. **This answers question 1.**
 
-## Phase 5 — Search
+## Phase 5 — Search and agent trial
 
 **5.1 Embeddings**
 *Goal:* every symbol with what/why has a vector in a searchable index.
@@ -137,7 +137,7 @@ Embed `fqn + what + why` through the embedding cache. Take the dimension from th
 
 **5.2 `annatar search "<query>"`**
 *Goal:* a plain-language question returns the top-k symbols with fqn, what, why and file:line.
-Use `vector_top_k`, with optional kind and role filters.
+Use `vector_top_k`, with optional kind and role filters. The CLI is the agents' interface too (D-ax): results and errors on stdout/stderr are stable, compact lines an agent can read without a parser, logs go to stderr only (`state.md` open #29), and `show` gives the detail view (what, why, tickets, parent, children, file:line).
 *Done when:* a query for a known responsibility lists the right class.
 
 **5.3 Evaluate**
@@ -145,30 +145,24 @@ Use `vector_top_k`, with optional kind and role filters.
 Run the golden set; report how often the expected fqn is in the top 1 and top 5.
 *Done when:* numbers are in the PR. **This answers question 2.**
 
-## Phase 6 — MCP
-
-**6.1 Server**
-*Goal:* an agent can search and inspect the index over MCP.
-`annatar serve` with `rmcp` over stdio: `search_intent(query, kind?, role?)` and `get_symbol(fqn)` (what, why, tickets, parent, children, file:line). It reopens `index.db` when the file is replaced.
-*Done when:* the server works from a coding agent's MCP config.
-
-**6.2 Agent trial**
+**5.4 Agent trial**
 *Goal:* a measured with/without comparison of agent efficiency and correctness.
-Pick 3–5 real tasks where you know the relevant code. Decide up front how to measure tokens and tool calls (e.g. the agent's session cost or usage report). Run each task with and without Annatar.
+The agent uses Annatar through the CLI (`annatar search`, `annatar show`) with its normal shell tool; there is no MCP server (`state.md` D-ax). Pick 3–5 real tasks where you know the relevant code. Decide up front how to measure tokens and tool calls (e.g. the agent's session cost or usage report). Run each task with and without Annatar.
 *Done when:* results are written down. **This answers question 3.**
 
 ---
 
 ## Later (after the POC proves itself)
 
-- **Usages from SCIP:** scip-java setup, definition mapping, reference edges, interface and override edges (needed for Spring injection), Lombok-generated members, callers in prompts, `trace_usage`.
-- **Spring entry points:** HTTP handlers with full paths, listeners, `@Scheduled`; `find_entry_point`.
+- **Usages from SCIP:** scip-java setup, definition mapping, reference edges, interface and override edges (needed for Spring injection), Lombok-generated members, callers in prompts, `annatar trace`.
+- **Spring entry points:** HTTP handlers with full paths, listeners, `@Scheduled`; an entry-point command.
 - **Incremental indexing:** stable IDs, upserts, incremental history.
-- **Package summaries** and `get_module`.
-- **Central build and local serve:** CI publishing the index per commit, local branch overlay.
+- **Package summaries** and `annatar module`.
+- **Central build and local use:** CI publishing the index per commit, local branch overlay.
 - **Multi-module handling** (Maven/Gradle module per file), test-code indexing.
 - **Analysis:** hotspots from churn and bug tickets, temporal coupling.
 - **Spring configuration:** `application.yml`, `@Value`, `@ConfigurationProperties`.
 - **Human search page** for non-technical roles.
+- **MCP server** (`serve`, `search_intent`/`get_symbol` over stdio): dropped from the POC by product-owner decision (D-ax); agents use the CLI. Revisit only if a CLI proves insufficient.
 - **Cache growth:** prune `history_cache_v2` rows (and later cache tables) for deleted or renamed symbols; today they stay forever.
 - **CI pipeline** with fmt, clippy and tests (add whenever it starts to hurt not having it).
