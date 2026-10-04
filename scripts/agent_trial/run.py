@@ -60,6 +60,10 @@ ARMS = ("with", "without")
 VALUE_OPTIONS = {"--path", "--config", "-k", "--limit", "--kind", "--role", "--depth"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)|`([^`]*)`")
+PREFIX_COMMANDS = {
+    "do": set(), "then": set(), "else": set(), "time": set(), "env": {"-u", "-C", "-S"},
+    "xargs": {"-I", "-n", "-P", "-L", "-d", "-s", "-a", "-E"},
+}
 
 
 def claude_cmd(model, arm, prompt, max_turns, budget, with_prompt="files"):
@@ -130,23 +134,40 @@ def simple_calls(command):
         if word.strip("();<>|&$"):
             segment.append(word)
             continue
-        while segment and ASSIGNMENT.match(segment[0]):
-            segment.pop(0)
+        segment = segment[command_start(segment):]
         if segment and os.path.basename(segment[0]) == "annatar":
             calls.append(subcommand(segment[1:]))
         segment = []
     return calls
 
 
+def command_start(segment):
+    i = 0
+    while i < len(segment):
+        if ASSIGNMENT.match(segment[i]):
+            i += 1
+        elif segment[i] in PREFIX_COMMANDS:
+            options = PREFIX_COMMANDS[segment[i]]
+            i += 1
+            while i < len(segment) and segment[i].startswith("-"):
+                i += 2 if segment[i] in options else 1
+        else:
+            break
+    return i
+
+
 def subcommand(args):
     i = 0
     while i < len(args) and args[i].startswith("-"):
         i += 2 if args[i] in VALUE_OPTIONS else 1
+    if i < len(args) and args[i] == "show" and "--history" in args[i + 1:]:
+        return "show --history"
     return args[i] if i < len(args) else "?"
 
 
 def parse_stream(path):
-    tools, annatar, result, final = {}, {"search": 0, "show": 0, "trace": 0, "other": 0}, None, ""
+    tools, result, final = {}, None, ""
+    annatar = {"search": 0, "show": 0, "show_history": 0, "trace": 0, "other": 0}
     for line in Path(path).read_text().splitlines():
         try:
             ev = json.loads(line)
@@ -160,6 +181,9 @@ def parse_stream(path):
                 tools[name] = tools.get(name, 0) + 1
                 if name == "Bash":
                     for sub in annatar_calls(block.get("input", {}).get("command", "")):
+                        if sub == "show --history":
+                            annatar["show_history"] += 1
+                            sub = "show"
                         annatar[sub if sub in ("search", "show", "trace") else "other"] += 1
         elif ev.get("type") == "result":
             result = ev
@@ -254,7 +278,8 @@ def rows(out):
             "tool_calls": sum(tools.values()),
             "bash": tools.get("Bash", 0), "read": tools.get("Read", 0), "grep": tools.get("Grep", 0),
             "glob": tools.get("Glob", 0), "other_tools": sum(v for k, v in tools.items() if k not in ("Bash", "Read", "Grep", "Glob")),
-            "annatar_search": annatar["search"], "annatar_show": annatar["show"], "annatar_trace": annatar["trace"],
+            "annatar_search": annatar["search"], "annatar_show": annatar["show"],
+            "annatar_show_history": annatar["show_history"], "annatar_trace": annatar["trace"],
             "annatar_other": annatar["other"],
             "final_chars": len(final),
         })
@@ -272,7 +297,7 @@ def summary(args):
         w.writeheader()
         w.writerows(data)
     keys = ["tokens_total", "cost_usd", "tool_calls", "turns", "duration_s", "annatar_search", "annatar_show",
-            "annatar_trace"]
+            "annatar_show_history", "annatar_trace"]
     groups = {}
     for r in data:
         groups.setdefault((r["task"], r["arm"]), []).append(r)

@@ -19,11 +19,145 @@ unique across both files.
 | | |
 | --- | --- |
 | Phase | 6 — Usages — **done** (2026-10-04; 6.1–6.7 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
-| Step | 6.7 agent trial (T4) on usages — **done** (graded blind; reviewed, findings fixed): dispatcher 5/5, full marks 5/5 (4/5 under a strict reading), no measurable cost increase vs 5.5 (mean +7 %, median −8 %, p = 1.0); #42 closed. Phase 6 complete; next: open items / `plan.md` Later with the product owner |
-| Last updated | 2026-10-04 (`show` without history, D-eh) |
+| Step | 6.7 agent trial (T4) on usages — **done** (graded blind; reviewed, findings fixed): dispatcher 5/5, full marks 5/5 (4/5 under a strict reading), no measurable cost increase vs 5.5 (mean +7 %, median −8 %, p = 1.0); #42 closed. Phase 6 complete. After it: `show` without history (D-eh), measured by a full 40-run re-run of the agent trial — kept (D-ei): with vs without −48 % tokens, −26 % cost, 39 vs 34 / 40 (strict 38), no correctness loss, `show` output −21 % on the calls made (replay); reviewed, findings fixed; next: open items / `plan.md` Later with the product owner |
+| Last updated | 2026-10-04 (D-eh agent trial: full re-run, both arms, D-ei) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
+
+- **Agent trial on `show` without history (D-eh), full re-run** (product
+  owner: "repeat the benchmark in full"). *Protocol:* a D-eh amendment
+  appended to the private `protocol.md` before any run (fixed 21:24:40,
+  first run ≈ 21:25): the full 5.4 design, T1–T4 × 5 reps × both arms =
+  40 runs (`main-eh/`), rep-major, arm order alternating as 5.4; *with* =
+  `run.py --with-prompt brief` (the 6.7 `usages` prompt whose `show` bullet
+  says `--history` adds commits and tickets) and the wrapper on `PATH`,
+  *without* unchanged; Claude Code 2.1.289, `claude-sonnet-5` in every
+  run's `modelUsage`, effort, tools, limits, task prompts, answer key,
+  rubric and 5.4-regrade strictness as before; `/Repos/argus` at 8f4664a,
+  `git status` unchanged after every run, auto-memory empty; index
+  `data-real` unchanged; wrapper = a fresh release build of HEAD 2e05233
+  (`cargo clean -p annatar` first), checked through it: `show` of the T4
+  consumer prints no commits / tickets (2.7 KB), `show --history` does
+  (7.9 KB), `trace` reaches `processMessages() [entry: @Scheduled]`.
+  *Harness:* `run.py`'s parser counts `annatar show --history` apart
+  (`show_history`, a subset of `show`; `annatar_show_history` column in
+  `runs.csv` and the summary), +2 Python tests (18; 19 after the
+  review). *Grading:* blind, by
+  a separate grader subagent: the 40 new answers among 20 old ones (per
+  task 2 5.4 *without*, 1 5.4 *symbols*, 2 5.5 *files*; on T4 one 5.5 and
+  one 6.7 instead of two 5.5 — seeded draw), new 4-digit codes, `annatar`
+  and `annatar show|trace|search …` → `[index]`, no arm labels (bundle,
+  mapping, grades in `.annatar-local/agent-trial/blind-eh*`). It gave all
+  20 old answers their published grades (20 / 20, flags included). Six
+  borderlines flagged, all kept; four were read before unblinding, two
+  (T3, both turned out *without*) were accepted on the grader's notes
+  and read only afterwards (acceptable as the key's inference); the
+  unblinding command also `grep`'d the mapping, output discarded: a
+  spurious "423-type" status beside the right 404 / 422 (T2, 2); four T3
+  reasons that are hedged inferences that admin tokens are not tracked in
+  the token store (the key counts that inference; all four turned out
+  to be *without* answers, two new, two 5.4); a T4 answer whose last step names the event
+  polling endpoint but not `getAuthData` / `AuthDataCacheRest` (fresh
+  read 0, score 1). *Strict reading:* "423-type" as a wrong main claim
+  gives T2-with-3 a 1, so *with* 38 / 40 (T2 reason still 5/5, no
+  Fisher test changes). The arm can be inferred from `[index]` in 4 of
+  5 T2 and 2 of 5 T3 *with* answers (known blinding limit). *Results* (mean of 5; tokens in thousands; exact
+  two-sided Mann-Whitney 5 vs 5 with mid-ranks, Fisher exact; the main
+  effect is new *with* vs new *without*, same time window):
+
+  | task | arm | tokens | cost $ | tool calls | Reads | search / show / `--history` | wall s | score |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | T1 | with | 64.5 | 0.057 | 4.4 | 1.8 | 2.0 / 0.8 / 0.2 | 13 | 10/10 |
+  | | without | 85.6 | 0.069 | 5.2 | 2.8 | – | 15 | 10/10 |
+  | T2 | with | 87.3 | 0.078 | 5.6 | 2.0 | 2.0 / 1.4 / 1.2 | 17 | 10/10 (reason 5/5) |
+  | | without | 151.8 | 0.100 | 10.0 | 2.4 | – | 26 | 5/10 (reason 0/5) |
+  | T3 | with | 72.4 | 0.053 | 4.4 | 1.8 | 1.6 / 1.0 / 1.0 | 15 | 10/10 (reason 5/5) |
+  | | without | 213.7 | 0.125 | 12.2 | 3.2 | – | 33 | 9/10 (reason 4/5) |
+  | T4 | with | 185.4 | 0.175 | 9.8 | 2.8 | 2.0 / 6.4 / 2.4 | 29 | 9/10 (dispatcher 5/5, fresh read 4/5) |
+  | | without | 339.9 | 0.200 | 20.2 | 12.0 | – | 46 | 10/10 (5/5, 5/5) |
+  | **all** | with | 102.4 | 0.091 | 6.05 | 2.1 | 1.9 / 2.4 / 1.2 | 18 | 39/40 |
+  | | without | 197.7 | 0.123 | 11.9 | 5.1 | – | 30 | 34/40 |
+
+  *Main effect* (with vs without, T1 / T2 / T3 / T4): tokens −25 / −42 /
+  −66 / −45 % (p = 0.22 / 0.008 / 0.008 / 0.008), cost −17 / −22 / −57 /
+  −12 % (p = 0.42 / 0.095 / 0.008 / 0.22), tool calls −15 / −44 / −64 /
+  −51 % (p = 0.24 / 0.016 / 0.008 / 0.008); overall −48 % tokens, −26 %
+  cost, −49 % tool calls, −39 % wall time. T2 ticket-only reason 5/5 vs
+  0/5 (Fisher p = 0.008); T4 dispatcher 5/5 vs 5/5, full marks 4/5 vs
+  5/5 (p = 1.0). *Did agents use `--history`?* Yes, when the question
+  asks why: in 14 of 20 *with* runs (T1 1/5, **T2 5/5, T3 5/5**, T4 3/5),
+  24 of the 48 `show` calls; on T2 and T3 the first `show` of the key
+  symbol already carried `--history`. *T2 / T3 reasons* (corrected in
+  the review): found 5/5 each, but `--history` was not needed for them:
+  in all 5 T2 runs the redirect-loop reason was already in the first
+  `search` output (`SubscriptionDataService`'s description, printed in
+  the file view), and on T3 the default `show` description of
+  `UserTokenService#isTokenValid` names admins "not registered in
+  Argus". `--history` added the ticket text. So the trial did **not**
+  test the D-eh risk (a reason only in tickets, dropped by the
+  description); it shows that with the current descriptions nothing was
+  lost (→ #56). *Output read:* `show` output per run T1 / T2 / T3 / T4
+  2.9 / 6.0 / 3.6 / 43.2 KB (5.5: 0 / 6.3 / 2.8 / 26.3; 6.7 T4: 46.7),
+  of it from `--history` calls 1.3 / 5.1 / 3.6 / 22.3 KB. *Replay*
+  (review; every *with* `show` command re-run offline through the
+  2e05233 binary, "as run" matches the recorded bytes): per run T1–T4
+  as run 2.9 / 6.0 / 3.6 / 43.2 KB, all with `--history` (the old
+  default) 3.3 / 6.4 / 3.6 / 56.9, none 2.6 / 3.3 / 1.5 / 33.2; total
+  55.7 vs 70.2 KB, so D-eh cut what agents read by **21 %** (T4
+  **24 %**; without any opt-in it would have been 42 % on T4): about
+  half of the possible saving, the opt-ins took the other half. The
+  raw 43.2 vs 46.7 KB vs 6.7 mixes in different call sets (D-eh agents
+  showed whole classes; no-history equivalent 33.2 vs 26.2 KB).
+  `trace` 0 calls in all 20 runs (#53 stands).
+  *Against older arms* (secondary, pre-registered; baselines ≈ 0.6–8.5 h
+  older): **T4 vs 6.7 usages** tokens −25 % (p = 0.22), cost −18 % (p =
+  0.42), tool calls −26 % (p = 0.29), cache creation 28.8 vs 35.1 k
+  (−18 %), dispatcher 5/5 vs 5/5, full marks 4/5 vs 5/5 (p = 1.0) — all
+  n.s.; part of it plausibly the smaller `show` (≈ 14 KB per run less
+  than the same calls with history, see the replay), part fewer tool
+  calls; **vs 5.5 files** (T1 / T2 / T3 / T4) tokens +25 / −20 / −3 /
+  −33 % (p = **0.016** / 0.15 / 0.84 / **0.008**), cost +16 / −9 / −10 /
+  −12 % (p = 0.15 / 0.42 / 0.14 / 0.15), tool calls +10 / −18 / −15 /
+  −34 % (p = 0.44 / 0.18 / 0.28 / **0.024**), T4 dispatcher 5/5 vs 3/5
+  (p = 0.44), full marks 4/5 vs 2/5 (p = 0.52), T2 reason 5/5 vs 5/5;
+  the T1 rise sits in the 3 runs that called `show` (an extra turn each:
+  74 / 72 / 70 k tokens vs 54 / 52 k for the 2 without; 5.5 50–54 k) —
+  the `brief` prompt seems to invite `show` on T1 (5.4 / 5.5: 0 calls);
+  its extra length (≈ 140 tokens per turn) is negligible; **vs 5.4
+  symbols** tokens +22 / −22 / −9 / −16 % (p = 0.095 / 0.095 / 0.22 /
+  0.22), cost +12 / −12 / −9 / +9 % (p = 0.22 / 0.15 / 0.095 / 0.69),
+  tool calls +10 / −7 / −12 / −42 % (p = 0.44 / 0.68 / 0.44 /
+  **0.016**), T4 dispatcher 5/5 vs 1/5 (p = 0.048), full marks 4/5 vs
+  0/5 (p = 0.048); **vs 5.4 without** tokens −54 / −60 / −67 / −40 %
+  (p = 0.008 / 0.016 / 0.008 / 0.016), cost −29 / −41 / −57 / −8 % (p =
+  0.24 / 0.016 / 0.008 / 0.31), tool calls −46 / −52 / −66 / −52 % (p =
+  0.048 / 0.008 / 0.008 / 0.008). This is the full pre-registered set
+  (the draft listed a selection).
+  *Drift* (new *without* vs 5.4 *without*, same code path): tokens −39 /
+  −30 / −1 / +10 % (p = 0.22 / 0.31 / 0.84 / 1.0), cost −14 / −24 / 0 /
+  +5 %, tool calls −37 / −14 / −5 / −2 %; none significant, but T1 and
+  T2 without used about a third fewer tokens (cost only −14 / −24 %); on
+  T1 two 5.4 outliers (221 k, 208 k) drive it, the medians fell 101 →
+  84 k (−17 %; T2 192 → 130 k). This shrinks the T1 main effect
+  (5.4: −62 %, p = 0.008; now −25 %, n.s.) — the T1 gap between the arms
+  is small this time, not an Annatar regression alone (T1 *with* also
+  rose +22 % vs 5.4 symbols). Correctness drift: T2 *without* reason 0/5
+  as in 5.4, T3 *without* 4/5 (5.4: 5/5). *Spend:* $4.29 for 40 runs
+  (estimate ≈ $4.5, abort $15; a watcher would have stopped at $12 of
+  finished runs), no pilot; grader ≈ 98 k subagent tokens. *Verdict:*
+  D-ei (keep D-eh); new open #55, #56. *Review:* 7 findings, all
+  addressed — the "reason only from `--history`" claim was false (F1:
+  the reason was in the default `search` / `show` descriptions; D-ei,
+  #55, README reworded, new #56); "−47 % barely reaches agents"
+  replaced by the replay (F2: −21 % overall, −24 % T4, about half the
+  potential); two borderlines accepted on grader notes disclosed, strict
+  reading 38 / 40 (F3); the full pre-registered secondary set reported
+  (F4); T1 rise, drift medians and token-vs-cost wording (F5); README
+  qualifiers (F6); `run.py` parser skips `do` / `then` / `else` /
+  `time` / `env` / `xargs` prefixes (+1 Python test, 19; recorded
+  `runs.csv` unchanged), `__pycache__/` ignored, unpinned wrapper binary
+  noted in the post-hoc protocol note (F7).
 
 - **`show` without history by default** (after Phase 6, product owner,
   2026-10-04). The product owner judged the description and `used by` /
@@ -814,9 +948,9 @@ unique across both files.
 
 ### Next
 
-- **Agent trial on `show` without history** (D-eh): T4 (and T1–T3, since
-  T2 hinges on a ticket-only reason) with `--with-prompt brief`, to check
-  that correctness holds and cost drops.
+- The D-eh trial is done (D-ei: keep `show` without history). Open
+  from it: #55 (agents opt into `--history` on half their `show` calls),
+  #56 (a task whose reason is only in tickets, to test D-eh's risk).
 - Phase 6 is complete (6.7 reviewed and committed); `plan.md` has no
   further step. The next work is chosen with the product owner from the
   open items and `plan.md` Later — e.g. a multi-hop agent task to measure
@@ -838,7 +972,8 @@ unique across both files.
 | 6.5 `show`: `used by` / `uses` | done | `src/usage_query.rs`: `used_by` / `uses` as SQL joins (`inside` CTE over `parent_id`, `overridden` CTE up `overrides`), `entry_point` (D-du); `show`: `- entry point:`, `- used by:` / `- uses:` grouped by file, `fqn [kind] [ambiguous] [via I#m] :lines [entry: …]`, `-k`/`--limit` (default 20, 1–100) with `… N more`, `none` when empty, shown symbol only (D-dt); `via` = callers of every method it overrides, transitively; incoming `overrides` listed (D-dr); a type's `uses` rolls up its members' (D-ds); #45 decided: deferred to Later (D-dv); new open #50, #51; tests: `via`, roll-up, cap, no users, entry points, exact format, CLI `-k`; `argus`: `SecurityDataAddEventConsumer` names `SecurityDataEventDispatcherConfig` (:24, :28, :45) and `SecurityDataEventDispatcher#dispatch` (`call` :76), `via` on `UserCreatedMessageConsumer#perform` → `UserMessageDispatcher#performMessage` :123; index not rebuilt, 0 LLM calls; review: 10 findings — fixed: `uses` lines vs the used symbol's path (F1, title `uses (lines in this symbol's file)`), members' `overrides` left out of a type's roll-up (F2, `AbstractCache` 36 → 18 entries, its callers within the cap), duplicate `instantiate` of type and constructor (F3), `@ExceptionHandler` / `@PreDestroy` (F5), `none in main sources` (F6), total `ORDER BY` (F7), tests for `ambiguous`, two overrides and a diamond (F8), wording (F10); recorded: full fqns' token cost → open #51 with `via` kept as an fqn (F4, D-dw), `trace` reuse (F9 → Next) |
 | 6.6 `annatar trace` | done | `src/trace.rs`: two-pass walk (BFS levels, DFS print, D-eb) over `usage_query::callers` (new: `used_by`'s query with a `call`/`instantiate`/`reference` filter, roll-up only at the root; `Usage::symbol_kind`), one query per printed symbol (D-dx); tree `fqn [kind] [ambiguous] [via I#m] file:lines; …`, file left out when unchanged (D-dz), `(see above)`, `[entry: @A]`, `[no callers in main sources]`, `[N callers beyond depth D]`, `(see below)`, each symbol expanded at its shallowest level (D-eb), types below the root `[type, not followed]` or `[initializer]` (followed through `usage_query::constructions`, D-dy), entry points labelled on every copy and followed when code calls them (D-ec); `--depth` 1–10 (default 6), `-k` per symbol 1–100 (default 10, D-ea), usage errors exit 2; tests: via, diamond, cycle, entry / no-caller leaves, depth, re-expansion, cap, type root, format, CLI ranges; `argus`: the T4 consumer → `dispatch` :76 → `receiveAndDispatchMessages` :67 → `processMessages` :59 `[entry: @Scheduled]`; sizes over 654 symbols (Measurements); index not rebuilt, 0 LLM calls; review: 6 findings, all fixed — `(see above)` into a depth-cut expansion hid callers (F1, 26 → 0 on `argus`; `UserOrganizationService` now reaches the role dispatcher's `@Scheduled`), default depth 6 and #52 closed (F2), initializer types followed (F3), entry label on repeats and entry points with code callers followed (F4), elision wording (F5), docs (F6) |
 | 6.7 Agent trial (T4) on usages | done | `run.py --with-prompt usages` (files + one bullet on `used by` / `uses` / `trace`, D-ed), `trace` counted apart, +2 Python tests; README agent snippet; 6.7 protocol amendment; T4 × 5 + T1–T3 × 1, *with* arm, `main-67/`; blind grading 30/30 old grades agree; T4 dispatcher 5/5 (5.5: 3/5), full marks 5/5 (2/5), cost +7 % / tokens −10 % (n.s.), `show` 6.4 vs 3.4, `trace` 0; T1–T3 all 2; $1.28; D-ed–D-eg, #42 closed, #46/#47/#49/#50/#51 decided, open #53; review: 11 findings, all addressed — mechanism 3/5 via the consumer's `used by` (one hit via a `LOG_PREFIX` reference, one via search), cost "no measurable increase" (mean +7 %, median −8 %, p = 1.0; cache creation +21 %), T4-with-5 strict 4/5, D-eg premise, prompt cues, deviations disclosed (post-hoc note in `protocol.md`), README scope, doc drift, test CLI order; new open #54 |
-| `show` without history | done | default `show` prints description, usages, parent, children; `--history` adds commits and tickets (D-eh); −47 % output on `argus`; `run.py --with-prompt brief`; agent trial pending |
+| `show` without history | done | default `show` prints description, usages, parent, children; `--history` adds commits and tickets (D-eh); −47 % output on `argus`; `run.py --with-prompt brief`; agent trial: next row |
+| D-eh agent trial (full re-run) | done | protocol amendment before any run; T1–T4 × 5 × both arms (40, `main-eh/`), `--with-prompt brief`, fresh build of 2e05233; `run.py` counts `show --history` apart (+2 Python tests); blind grading 20/20 old grades agree; with vs without −48 % tokens, −26 % cost (per task significant on T3 only), −49 % tool calls, 39 vs 34 / 40 (strict 38), T2 reason 5/5 vs 0/5 (p = 0.008), T4 dispatcher 5/5 both, full marks 4/5 vs 5/5; `--history` in 14/20 runs (T2, T3 every run), 24 of 48 `show` calls; replay: `show` output −21 % (T4 −24 %) vs the same calls with history; T4 vs 6.7 −25 % tokens / −18 % cost (n.s.); drift: new *without* T1/T2 a third fewer tokens than 5.4 (n.s.); $4.29; D-ei, open #55, #56; review: 7 findings, all addressed — T2/T3 reasons were in the default descriptions, so D-eh's risk was not tested (F1, #56); replay replaces "barely reaches" (F2); borderline disclosure, strict 38/40 (F3); full secondary set (F4); T1/drift wording (F5); README (F6); parser prefixes, `__pycache__/`, wrapper note (F7) |
 
 ## Measurements
 
@@ -854,6 +989,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | Edge stage time (benchmark, `argus`) | 6.2 / 6.3 / 6.4 | 6.4: `argus` 11 ms (release, overrides and substitution included); benchmark (release) ≈ 5 ms per run (no overrides in it). 6.3 after the review: `argus` 11 ms, benchmark ≈ 26–27 ms. 6.3: `argus` 10–11 ms (release); benchmark (200 files, 1000 edges, debug) ≈ 25 ms per run. 6.2: `argus` 7 ms (release, 162 files, `index --offline` 2.2 s wall in all); synthetic benchmark (200 files, debug) ≈ 12 ms per run |
 | `show` list sizes on `argus` (654 symbols, `-k 100`) | 6.5 | after the review (members' `overrides` out of type roll-ups, no type `instantiate` beside its constructor's): `used by`: empty 230, median 1 entry, > 20 entries 2 (max 29, `DynamoDBEvent`; `AbstractCache` 18); `uses`: empty 289, median 1, > 20 4 (max 27, `RoleRelationsUpdatedMessageConsumer`); ≈ 14 ms per `show` including process start, so the default cap 20 cuts 2 + 4 lists. Before the review: `used by` > 20 for 5 (max 36, `AbstractCache`, half of it its subclasses' `overrides`), `uses` > 20 for 5 (max 31) |
 | `trace` sizes on `argus` (654 symbols) | 6.6 | after the review (D-eb shallowest expansion), `-k 10`: **default `--depth 6`**: only the root line (no callers) 237, median 3 lines / 538 bytes, p90 37 lines / 8.4 KB, max 75 lines / 16.6 KB (`DynamoDBEvent`), > 20 lines 109, 1.46 MB in all; a `@Scheduled` reached in 238 traces, cut by the depth 36 (33 of them on a `…Dispatcher#` line); a `… N more` in 20; a `(see below)` in 44 (76 lines). By depth (`-k 10`; reaching `@Scheduled` / cut / cut on a dispatcher line / p90 / max / total): 4: 165 / 136 / 92 / 7.2 KB, 27 L / 13.6 KB, 56 L / 1.20 MB; 5: 206 / 76 / 60 / 8.1 KB, 33 L / 15.7 KB, 68 L / 1.37 MB; **6: 238 / 36 / 33 / 8.4 KB, 37 L / 16.6 KB, 75 L / 1.46 MB**; 8: 261 / 2 / 2 / 8.8 KB, 38 L / 19.9 KB, 82 L / 1.50 MB; `--depth 10 -k 100`: 262 / 0, max 103 lines / 23.6 KB (`DynamoDBEvent`), no trace reaches depth 10. ≈ 235 bytes per line, most of it the full path and fqn (#51). The T4 trace 830 bytes, 4 lines; the type `SecurityDataAddEventConsumer` 1947 bytes, 8 lines; `DynamoDBEventService#publishAsync(DynamoDBEvent)` 43 lines / 9.4 KB (all unchanged from depth 4). Before the review (depth 4, `cut` re-expansion only at the limit): reaching `@Scheduled` 162, cut 141, same p90 / max; `--depth 4 -k 20` max 84 lines / 20.6 KB. Before D-dy (type nodes followed, depth 4): max 75 lines / 17.6 KB (`AuthDataEvent`), > 20 lines 97. ≈ 8 ms per trace including process start |
+| `show` without history: agents (D-eh trial) | after 6 | 40 runs, with / without (mean per run): tokens 102 / 198 k, cost $0.091 / $0.123, tool calls 6.05 / 11.9, score 39 / 34 of 40; T2 reason 5/5 / 0/5; T4 dispatcher 5/5 / 5/5, full marks 4/5 / 5/5; `show --history` in 14 of 20 *with* runs (T1 1, T2 5, T3 5, T4 3), 24 of 48 `show` calls; `show` output read per run T1–T4 2.9 / 6.0 / 3.6 / 43.2 KB (from `--history` 1.3 / 5.1 / 3.6 / 22.3; 6.7 T4 46.7); replay of the same calls all with / none with `--history` 3.3 / 6.4 / 3.6 / 56.9 and 2.6 / 3.3 / 1.5 / 33.2 KB, total 55.7 vs 70.2 KB (−21 %, T4 −24 %); T4 vs 6.7: tokens 185 vs 247 k (p = 0.22), cost $0.175 vs 0.214 (p = 0.42); `trace` 0; spend $4.29 |
 | T4: dispatcher named / full marks / cost vs 5.5 | 6.7 | **dispatcher 5/5 (5.5: 3/5, Fisher p = 0.44; 5.4 symbols 1/5, p = 0.048), full marks 5/5 (2/5, p = 0.17; symbols 0/5, p = 0.008; 4/5 under a strict reading of T4-with-5, p = 0.52 / 0.048), fresh read 5/5 (3/5)**; per run tokens 266 / 174 / 402 / 204 / 191 k, mean 247 k (275 k, −10 %, MW p = 0.42), cost $0.214 (0.200): no measurable increase (mean +7 %, median −8 %, p = 1.0), tool calls 13.2 (14.8, p = 0.41); exploratory: Reads 3.6 (6.2), search 3.4 (3.6), `show` 6.4 (3.4, p = 0.12), `trace` 0, cache creation 35 k (29 k, +21 %, the larger `show` output), wall 33 s (37 s). Dispatcher first seen in the consumer's `used by` in 3 runs, in an incidental `reference` (`LOG_PREFIX`) in `AuthDataEventService`'s `used by` in 1, in a search result in 1. T1–T3 once each: score 2, 72.8 / 78.0 / 74.8 k tokens. `show` output read per T4 run 46.7 KB (26.3 KB), usage sections 14.9 KB, package prefixes in them 4.3 KB; no `trace` call, so no run hit the depth. Spend $1.28 |
 
 ## Decisions and tradeoffs
@@ -900,6 +1036,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-ef (6.7, #46) | **No usages in the `search` file view**; callers stay one `show` away | `used by N` per hit, or the callers' files under each hit | The agents called `show` on their own in every T4 run (6.4 per run) and read `used by` there; a count or callers on every search result would cost output on every query (T1–T3 never needed them) to save at most one call. `project.md` keeps search as the entry and `show` / `trace` as the drill-down |
 | D-eg (6.7, #51) | **Usage lists keep full fqns** (D-dw stands) | Members relative to the file's top-level type, as `search` prints them | The package prefixes in the usage sections the T4 agents read were 4.3 KB per run (≈ 1.1 k tokens, < 2 % of a run's tokens even when re-read on later turns). The fqns the agents passed to `show` were mostly copied from earlier output (about half from usage lines), which a relative name would break; 2 typed ones for an inherited member failed (→ #54, not a naming issue). The usage sections do cost: the T4 cost rose +7 % (n.s.) through cache creation from the larger `show` output (D-ee), but the prefixes are a small part of it |
 | D-eh (after 6, product owner) | **`show` prints no commits and tickets unless `--history` is given.** The description condenses them; `show` is about what a symbol does and where it is used | Keep them (the 5.4 finding: ticket-only reasons found 5/5 with Annatar vs 0/5 without); dedupe a member's history against its parent's; shorten dates and merge commits under their tickets | Product-owner call: description and usages carry the value; −47 % `show` output on `argus` (the 6.7 cost rise came from `show` output). The reasons stay reachable through the description (built from tickets and commits) and `--history`. Risk: an agent no longer sees a ticket-only reason the description dropped (T2) — measured by the next trial; `project.md`'s `show` row updated |
+| D-ei (D-eh trial) | **Keep D-eh (`show` without history by default).** In the full re-run no correctness was lost: the T2 reason 5/5 (vs 0/5 without, p = 0.008; 5/5 in 5.4 / 5.5), T3 5/5, the T4 dispatcher 5/5 (as 6.7); 39 / 40 vs 34 / 40 without (38 / 40 under a strict reading). Agents asked for `--history` on every T2 / T3 run | Revert to history by default (the 5.4 argument: a reason the description dropped stays visible); keep D-eh and drop `--history` from the agent prompt | Nothing measured favours a revert. But the trial did **not** test D-eh's risk: the T2 and T3 reasons were already in the default descriptions (`search`'s file view on T2, `show` on T3), so `--history` was asked for but never needed (→ #56). The cost case is partial: on the `show` calls agents made, D-eh cut the output by 21 % (T4 24 %, replay), about half of what it could, since agents put `--history` on half their `show` calls; T4's −25 % tokens / −18 % cost vs 6.7 is n.s. The case for keeping it is the product owner's (a `show` about what a symbol does and who uses it), with the trial showing no correctness loss. Caveats: one repository, 5 runs per cell, the same kind of LLM grades (20 / 20 old grades matched), the arm inferable from `[index]` in some answers, the *without* arm drifted (T1 / T2 a third fewer tokens than 5.4, n.s.) |
 
 ## Open questions
 
@@ -915,3 +1052,5 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | 52 | `trace`'s default depth 4 cuts 141 of 654 `argus` traces (`-k 100`; 85 at 5, 46 at 6, 2 at 8, none at 10), and of the 669 cut lines in them most fall on the message dispatchers (pactum, cronus, cives, janus: `performMessage` / `dispatch` / `receiveAndDispatchMessages`, one or two hops below their `@Scheduled` `processMessages`) — the T4 pattern, for a symbol a few calls below a consumer — then `AuthDataService#preWarm(UUID)` (35). Raise the default (6 cuts a third as many, at more output) or keep 4 and let agents pass `--depth`? | 6.6 | **closed (6.6 review, F2): default depth 6** (D-ea): after D-eb, 4 → 6 raises the traces reaching `@Scheduled` 165 → 238 and lowers the cut ones 136 → 36 (dispatcher lines 92 → 33) for p90 7.2 → 8.4 KB; 6.7 records whether any trial trace still ends at the depth |
 | 53 | No agent called `trace` in 6.7 (0 of 8 runs, though the prompt named it): on T4 one `used by` hop reaches the dispatcher's file and the rest is in that file. Does `trace` help agents where several hops are needed (a blast-radius task: "what breaks if this changes", `project.md`), or should `show`'s `used by` point to it? | 6.7 | open — Later: needs a multi-hop agent task; nothing built |
 | 54 | `show` of a member inherited from a supertype, named through the subtype (`show '…AuthDataEventService#publishAsync(AuthDataCacheUpdateEvent)'`, declared in `DynamoDBEventService`), is "not found in the index": 2 of 32 `show` calls in the 6.7 T4 runs, both typed by the agent. Resolve it to the declaring type's member, or suggest it in the error? Agent friction (`project.md` agent quality) | 6.7 review | open — Later; nothing built |
+| 55 | Agents add `--history` to half their `show` calls (24 of 48 in the D-eh trial, lumpy: 12 on T4, 7 of them in one run; T4 3 of 5 runs, where the flow needs no history), so D-eh realises about half of its possible `show` saving (replay: −21 % of the agents' `show` output, −42 % possible on T4). Is the prompt's "`--history` adds … purpose" clause the trigger (a why-question invites it)? Options: leave it, word the clause by use ("for why a symbol was built or changed"), or trim history itself (dedupe a member's history against its parent's, the D-eh alternative) | D-eh trial | open — nothing built; needs a prompt variant run (T2 + T4) to separate the wording from the task |
+| 56 | The D-eh trial did not test its own risk: the T2 / T3 reasons were in the default descriptions, so no agent needed `--history`. Does an agent still find a reason that is **only** in tickets (not in any description or search output) when `show` hides history by default? Needs a task built on such a reason (find one in `argus` by checking descriptions against tickets) | D-eh trial review (F1) | open — nothing built; needs a new task, run *with* × 5 (and *without* as control) |

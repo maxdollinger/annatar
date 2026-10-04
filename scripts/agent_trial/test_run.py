@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -39,6 +40,25 @@ class AnnatarCallsTest(unittest.TestCase):
         self.assertEqual(run.annatar_calls("annatar trace 'a.B#c()' --depth 8 | head"), ["trace"])
         self.assertEqual(run.annatar_calls("annatar --config x trace a.B --depth 8 && annatar show a.B"), ["trace", "show"])
 
+    def test_show_history(self):
+        self.assertEqual(run.annatar_calls("annatar show --history 'a.B#c()' | head"), ["show --history"])
+        self.assertEqual(run.annatar_calls("annatar -k 5 show a.B --history; annatar show a.B -k 5"),
+                         ["show --history", "show"])
+        self.assertEqual(run.annatar_calls('annatar search "show --history"'), ["search"])
+        self.assertEqual(run.annatar_calls("annatar show -k 5 --history a.B"), ["show --history"])
+        self.assertEqual(run.annatar_calls("x=$(annatar show --history a.B)"), ["show --history"])
+        self.assertEqual(run.annatar_calls("annatar show a.B | grep -- --history"), ["show"])
+
+    def test_loops_and_prefix_commands(self):
+        self.assertEqual(run.annatar_calls("for s in a.B a.C; do annatar show \"$s\"; done"), ["show"])
+        self.assertEqual(run.annatar_calls("if true; then annatar search q; else annatar show a.B; fi"),
+                         ["search", "show"])
+        self.assertEqual(run.annatar_calls("time annatar search q"), ["search"])
+        self.assertEqual(run.annatar_calls("env RUST_LOG=off annatar trace a.B"), ["trace"])
+        self.assertEqual(run.annatar_calls("echo a.B | xargs -I{} annatar show {} --history"), ["show --history"])
+        self.assertEqual(run.annatar_calls("echo a.B | xargs -n 1 annatar show"), ["show"])
+        self.assertEqual(run.annatar_calls("echo do annatar search q"), [])
+
     def test_query_with_separators_stays_one_call(self):
         self.assertEqual(run.annatar_calls('annatar search "a; annatar show b"'), ["search"])
 
@@ -50,9 +70,19 @@ class StreamTest(unittest.TestCase):
     def test_parse_stream(self):
         tools, annatar, result, final = run.parse_stream(FIXTURES / "raw" / "T1-with-1.jsonl")
         self.assertEqual(tools, {"Bash": 2, "Read": 1})
-        self.assertEqual(annatar, {"search": 2, "show": 1, "trace": 0, "other": 0})
+        self.assertEqual(annatar, {"search": 2, "show": 1, "show_history": 0, "trace": 0, "other": 0})
         self.assertEqual(result["subtype"], "success")
         self.assertEqual(final, "The cap is in TokenStore.")
+
+    def test_parse_stream_counts_show_history_among_shows(self):
+        command = "annatar show --history a.B && annatar show a.C && annatar trace a.B"
+        event = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": command}}]}}
+        with tempfile.TemporaryDirectory() as d:
+            stream = Path(d) / "T2-with-1.jsonl"
+            stream.write_text(json.dumps(event) + "\n")
+            _, annatar, _, _ = run.parse_stream(stream)
+        self.assertEqual(annatar, {"search": 0, "show": 2, "show_history": 1, "trace": 1, "other": 0})
 
     def test_parse_stream_without_result(self):
         tools, annatar, result, final = run.parse_stream(FIXTURES / "raw" / "T1-with-2.jsonl")
@@ -67,7 +97,8 @@ class StreamTest(unittest.TestCase):
         self.assertEqual((first["task"], first["arm"], first["rep"]), ("T1", "with", 1))
         self.assertEqual(first["tokens_total"], 6 + 1000 + 200 + 50)
         self.assertEqual(first["tool_calls"], 3)
-        self.assertEqual((first["annatar_search"], first["annatar_show"], first["annatar_trace"]), (2, 1, 0))
+        self.assertEqual((first["annatar_search"], first["annatar_show"], first["annatar_show_history"],
+                          first["annatar_trace"]), (2, 1, 0, 0))
         self.assertIsNone(first["returncode"])
         self.assertEqual(data[1]["returncode"], 1)
         self.assertEqual((data[1]["grep"], data[1]["glob"]), (1, 1))

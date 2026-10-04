@@ -1,3 +1,4 @@
 /target
 /.annatar
 /.annatar-local
+__pycache__/
