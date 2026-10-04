@@ -95,7 +95,24 @@ pub const CACHE_TABLES: &[&str] = &[
         parent_key TEXT,
         fetched_at TEXT NOT NULL
     )",
-    // 4.1 LLM cache and embedding cache.
+    // 4.1 `llm_cache`: one validated chat reply (`output`, JSON text) per key,
+    // a blake3 hash of chat model + reasoning effort + the response type's
+    // JSON schema + the full prompt. Failed completions are never stored.
+    "CREATE TABLE IF NOT EXISTS llm_cache (
+        key TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        output TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )",
+    // 4.1 `embedding_cache`: one vector per key, a blake3 hash of embedding
+    // model + text, stored as `dim` little-endian f32s (libSQL's `F32_BLOB`
+    // layout).
+    "CREATE TABLE IF NOT EXISTS embedding_cache (
+        key TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        vector BLOB NOT NULL
+    )",
 ];
 
 /// Create every index table on a fresh build connection. Called by
