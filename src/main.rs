@@ -7,12 +7,13 @@ use clap::builder::PossibleValuesParser;
 use clap::{ArgAction, Parser, Subcommand};
 
 use annatar::config::Config;
+use annatar::golden::GoldenSet;
 use annatar::search::{self, Filter, QueryEmbedder};
 use annatar::store::{IndexReader, Store};
 use annatar::summaries::Summarizer;
 use annatar::symbols::{Role, SymbolKind};
 use annatar::tickets::TicketFetch;
-use annatar::{indexer, show};
+use annatar::{eval, indexer, show};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
 #[derive(Debug, Parser)]
@@ -73,6 +74,17 @@ enum Command {
         #[arg(long, value_name = "ROLE", value_parser = PossibleValuesParser::new(Role::ALL.map(|role| role.as_str())))]
         role: Vec<String>,
         /// Number of results.
+        #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_limit)]
+        limit: usize,
+    },
+    /// Score retrieval against a golden set: every question runs through
+    /// `search`; prints per question the rank of its first expected fqn and
+    /// the best rank of any (`-` = not in the top N), then top-1, top-5 and
+    /// MRR for all questions, types and members.
+    Eval {
+        /// The golden set (TOML, see `golden`).
+        golden: PathBuf,
+        /// Hits searched per question.
         #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_limit)]
         limit: usize,
     },
@@ -234,6 +246,23 @@ async fn run(cli: &Cli) -> Result<()> {
                 eprintln!("no symbol matches the filter");
             }
             print!("{}", search::format_hits(&hits));
+        }
+        Command::Eval { golden, limit } => {
+            if cli.path.is_some() {
+                anyhow::bail!("eval scores the whole index and takes no --path");
+            }
+            let ollama = config.ollama.as_ref().context(
+                "eval needs an [ollama] section with the embedding_model the index was built with",
+            )?;
+            let set = GoldenSet::load(golden)?;
+            let reader = IndexReader::open(&config.data_dir).await?;
+            let embedder = QueryEmbedder::from_config(ollama).await?;
+            let outcomes = eval::evaluate(reader.connection(), &embedder, &set, *limit).await?;
+            print!(
+                "{}",
+                eval::settings_line(reader.connection(), *limit).await?
+            );
+            print!("{}", eval::format_report(&outcomes));
         }
     }
     Ok(())

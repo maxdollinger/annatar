@@ -232,3 +232,174 @@ fn search_path_outside_the_repo_is_one_error_line() {
         );
     }
 }
+
+/// An embedding server on localhost that answers every request with the
+/// vector `[1, 0, 0]` and counts the requests.
+fn embedding_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = served.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            let reply = r#"{"data": [{"embedding": [1, 0, 0], "index": 0}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+        }
+    });
+    (url, served)
+}
+
+#[tokio::test]
+async fn eval_scores_a_golden_set_through_search() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    let (url, served) = embedding_server();
+    std::fs::write(
+        dir.path().join("annatar.toml"),
+        format!(
+            "repo = \"repo\"\ndata_dir = \"data\"\n\n[ollama]\nurl = \"{url}\"\nchat_model = \"chat\"\nembedding_model = \"embed\"\n"
+        ),
+    )
+    .unwrap();
+    // Symbol n gets [1, n, 0]: against the query [1, 0, 0] the symbols rank
+    // in id order.
+    let order = {
+        let db = libsql::Builder::new_local(dir.path().join("data").join(annatar::store::INDEX_DB))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        annatar::schema::create_vectors(&conn, 3).await.unwrap();
+        conn.execute(
+            "INSERT INTO symbol_vectors (symbol_id, embedding) SELECT id, vector32('[1, ' || id || ', 0]') FROM symbols",
+            (),
+        )
+        .await
+        .unwrap();
+        for (key, value) in [
+            (annatar::schema::META_EMBEDDING_MODEL, "embed"),
+            (annatar::schema::META_EMBEDDING_DIM, "3"),
+            (annatar::schema::META_EMBEDDING_PARENT_DESCRIPTION, "false"),
+        ] {
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES (?1, ?2)",
+                libsql::params![key, value],
+            )
+            .await
+            .unwrap();
+        }
+        let mut rows = conn
+            .query("SELECT fqn FROM symbols ORDER BY id", ())
+            .await
+            .unwrap();
+        let mut order = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            order.push(row.get::<String>(0).unwrap());
+        }
+        order
+    };
+    let golden =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/sample.toml");
+    let set = annatar::golden::GoldenSet::load(&golden).unwrap();
+
+    let eval = annatar(dir.path(), &["eval", "-k", "20", golden.to_str().unwrap()]);
+
+    assert!(eval.status.success(), "{}", text(&eval.stderr));
+    let rank = |fqn: &str| order.iter().position(|other| other == fqn).unwrap() + 1;
+    let mut expected =
+        "eval: embedding_model=embed dim=3 parent_description=false k=20\n".to_string();
+    for (number, question) in set.questions().iter().enumerate() {
+        let primary = rank(question.primary());
+        let any = question.expect().iter().map(|fqn| rank(fqn)).min().unwrap();
+        let group = if question.primary().contains('#') {
+            "members"
+        } else {
+            "types"
+        };
+        expected.push_str(&format!(
+            "{}. {primary} {any} [{group}] {}",
+            number + 1,
+            question.primary()
+        ));
+        if primary != 1 {
+            expected.push_str(&format!(" top={}", order[0]));
+        }
+        expected.push('\n');
+    }
+    let stdout = text(&eval.stdout);
+    assert!(
+        stdout.starts_with(&expected),
+        "{stdout}\nexpected:\n{expected}"
+    );
+    let summaries: Vec<&str> = stdout.lines().skip(set.questions().len() + 1).collect();
+    assert_eq!(summaries.len(), 3, "{stdout}");
+    assert!(
+        summaries[0].starts_with("all 5: primary top-1 "),
+        "{stdout}"
+    );
+    assert!(summaries[1].starts_with("types 2: "), "{stdout}");
+    assert!(summaries[2].starts_with("members 3: "), "{stdout}");
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 5);
+}
+
+#[test]
+fn eval_fails_on_a_golden_symbol_missing_from_the_index() {
+    let dir = workspace();
+    let index = annatar(dir.path(), &["index", "--no-llm"]);
+    assert!(index.status.success(), "{}", text(&index.stderr));
+    std::fs::write(
+        dir.path().join("golden.toml"),
+        "[[question]]\ntext = \"Who lists users?\"\nexpect = [\"com.acme.sample.UserController#list()\", \"com.acme.sample.Gone\"]\n",
+    )
+    .unwrap();
+
+    let eval = annatar(dir.path(), &["eval", "golden.toml"]);
+
+    assert_eq!(eval.status.code(), Some(1));
+    assert_eq!(text(&eval.stdout), "");
+    assert_eq!(
+        text(&eval.stderr),
+        "error: the golden set does not match the index: com.acme.sample.Gone is not in the index (\"Who lists users?\")\n"
+    );
+}
+
+#[test]
+fn eval_takes_no_path() {
+    let dir = workspace();
+
+    let eval = annatar(dir.path(), &["--path", "src", "eval", "golden.toml"]);
+
+    assert_eq!(eval.status.code(), Some(1));
+    assert_eq!(
+        text(&eval.stderr),
+        "error: eval scores the whole index and takes no --path\n"
+    );
+}

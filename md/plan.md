@@ -155,6 +155,7 @@ Use `vector_top_k`, with optional kind and role filters. The CLI is the agents' 
 Run the golden set; report how often the expected fqn is in the top 1 and top 5.
 The set is `.annatar-local/golden-argus.toml` (outside git, D-bl), loaded with `golden::GoldenSet::load`; run `golden::check_index` first so a renamed symbol fails loudly instead of counting as a miss. Score the first `expect` entry and, separately, "any of `expect`" (the alternates); report types and methods apart (`kind`).
 *Done when:* numbers are in the PR. **This answers question 2.**
+*Built (5.3, `state.md` D-cf–D-ch):* `annatar eval [-k N] <golden.toml>` checks the set against the index, runs every question through the unfiltered `search` path and prints per question the rank of the first and of the best `expect` fqn, then top-1, top-5 and MRR for all questions, types and members (README). `argus` (24 questions): an acceptable symbol in the top 5 for 71 %, first for 42 %; the intended one first for 17 %. `[embedding] parent_description = true` helps members, hurts types, so the default stays off. Verdict: a good "where to look", not a one-shot answer; 5.4 tests whether that is enough for an agent.
 
 **5.4 Agent trial**
 *Goal:* a measured with/without comparison of agent efficiency and correctness.
