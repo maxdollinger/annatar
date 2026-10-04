@@ -26,9 +26,11 @@ ticket_regex = '\bGRLD-\d+\b'
 # Maximum Jira requests in flight while fetching tickets (default 4).
 # concurrency = 4
 
-# Ollama connection, used through its OpenAI-compatible /v1 API. Optional for
-# now; required once Phase 4 wires summaries and embeddings. LLM replies and
-# embeddings are cached in cache.db; changing a model simply misses the cache.
+# Ollama connection, used through its OpenAI-compatible /v1 API. Optional:
+# without it `annatar index` warns once and tickets get no summaries;
+# `annatar index --no-llm` makes no chat calls and uses only summaries already
+# cached. LLM replies and embeddings are cached in cache.db; changing a model,
+# reasoning_effort or temperature simply misses the cache.
 # [ollama]
 # Server root (a trailing /v1 is accepted).
 # url = "http://localhost:11434"
@@ -38,3 +40,6 @@ ticket_regex = '\bGRLD-\d+\b'
 # model's reasoning off, "low" / "medium" / "high" turn it on, "" leaves it to
 # the model. Part of the LLM cache key.
 # reasoning_effort = "none"
+# Sampling temperature sent with chat requests, 0.0 (default: greedy, so a
+# regenerated record matches the cached one) to 2.0. Part of the LLM cache key.
+# temperature = 0.0

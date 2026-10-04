@@ -17,6 +17,13 @@ pub const DEFAULT_REASONING_EFFORT: &str = "none";
 /// sent and the model decides.
 pub const REASONING_EFFORTS: &[&str] = &["", "none", "low", "medium", "high"];
 
+/// Default sampling temperature sent with chat requests: greedy, so a
+/// regenerated record matches the cached one.
+pub const DEFAULT_TEMPERATURE: f64 = 0.0;
+
+/// Highest accepted `ollama.temperature`.
+pub const MAX_TEMPERATURE: f64 = 2.0;
+
 /// Default number of Jira requests in flight during the ticket stage.
 pub const DEFAULT_JIRA_CONCURRENCY: usize = 4;
 
@@ -101,6 +108,13 @@ pub struct OllamaConfig {
         deserialize_with = "deserialize_reasoning_effort"
     )]
     pub reasoning_effort: String,
+    /// Sampling `temperature` sent with every chat request, `0.0` to
+    /// [`MAX_TEMPERATURE`]. Part of the LLM cache key.
+    #[serde(
+        default = "default_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
+    pub temperature: f64,
 }
 
 impl Config {
@@ -162,6 +176,21 @@ fn deserialize_reasoning_effort<'de, D: Deserializer<'de>>(
     } else {
         Err(serde::de::Error::custom(format!(
             "invalid ollama.reasoning_effort {effort:?}: expected one of {REASONING_EFFORTS:?}"
+        )))
+    }
+}
+
+fn default_temperature() -> f64 {
+    DEFAULT_TEMPERATURE
+}
+
+fn deserialize_temperature<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    let temperature = f64::deserialize(deserializer)?;
+    if (0.0..=MAX_TEMPERATURE).contains(&temperature) {
+        Ok(temperature)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "invalid ollama.temperature {temperature}: expected 0.0 to {MAX_TEMPERATURE}"
         )))
     }
 }
@@ -236,6 +265,7 @@ embedding_model = "nomic-embed-text"
         let ollama = config.ollama.expect("section present");
         assert_eq!(ollama.url, DEFAULT_OLLAMA_URL);
         assert_eq!(ollama.reasoning_effort, DEFAULT_REASONING_EFFORT);
+        assert_eq!(ollama.temperature, DEFAULT_TEMPERATURE);
     }
 
     #[test]
@@ -255,6 +285,27 @@ embedding_model = "nomic-embed-text"
             format!("{err:#}").contains("invalid ollama.reasoning_effort \"max\""),
             "error should name the bad value, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn temperature_is_validated() {
+        let with = |temperature: &str| {
+            MINIMAL.replace(
+                "embedding_model = \"nomic-embed-text\"",
+                &format!("embedding_model = \"nomic-embed-text\"\ntemperature = {temperature}"),
+            )
+        };
+        for (text, value) in [("0.0", 0.0), ("0.7", 0.7), ("2", 2.0)] {
+            let config = Config::parse(&with(text)).expect("valid temperature should parse");
+            assert_eq!(config.ollama.unwrap().temperature, value);
+        }
+        for bad in ["-0.1", "2.5"] {
+            let err = Config::parse(&with(bad)).expect_err("out-of-range temperature should fail");
+            assert!(
+                format!("{err:#}").contains("invalid ollama.temperature"),
+                "error should name the field, got: {err:#}"
+            );
+        }
     }
 
     #[test]

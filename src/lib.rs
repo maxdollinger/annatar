@@ -6,6 +6,7 @@ pub mod llm;
 pub mod schema;
 pub mod show;
 pub mod store;
+pub mod summaries;
 pub mod symbols;
 #[cfg(test)]
 mod test_support;

@@ -3,8 +3,9 @@
 //! [`render`] looks a symbol up by its fully qualified name and prints its
 //! stored fields, then every child — nested types and members, recursively —
 //! sorted by source line. This is the read side of the index: `annatar show`
-//! and later the MCP `get_symbol` tool both build on it. Ticket types and
-//! summaries come from the index `tickets` table, never from `cache.db`.
+//! and later the MCP `get_symbol` tool both build on it. Ticket types, titles
+//! and the model's summary and purpose come from the index `tickets` table,
+//! never from `cache.db`.
 
 use std::collections::HashMap;
 
@@ -29,7 +30,12 @@ struct StoredTicket {
 
 /// One row of the `tickets` table, as read back for display.
 enum TicketInfo {
-    Available { issue_type: String, summary: String },
+    Available {
+        issue_type: String,
+        summary: String,
+        /// The model's summary and purpose, when the ticket has them.
+        brief: Option<(String, String)>,
+    },
     Unavailable,
 }
 
@@ -162,7 +168,7 @@ async fn load_tickets(conn: &Connection) -> Result<HashMap<i64, Vec<StoredTicket
 async fn load_ticket_info(conn: &Connection) -> Result<HashMap<String, TicketInfo>> {
     let mut rows = conn
         .query(
-            "SELECT key, unavailable, issue_type, summary FROM tickets",
+            "SELECT key, unavailable, issue_type, summary, llm_summary, llm_purpose FROM tickets",
             (),
         )
         .await
@@ -173,10 +179,13 @@ async fn load_ticket_info(conn: &Connection) -> Result<HashMap<String, TicketInf
         let unavailable: i64 = row.get(1).context("reading tickets.unavailable")?;
         let issue_type: Option<String> = row.get(2).context("reading tickets.issue_type")?;
         let summary: Option<String> = row.get(3).context("reading tickets.summary")?;
+        let llm_summary: Option<String> = row.get(4).context("reading tickets.llm_summary")?;
+        let llm_purpose: Option<String> = row.get(5).context("reading tickets.llm_purpose")?;
         let ticket = match (unavailable, issue_type, summary) {
             (0, Some(issue_type), Some(summary)) => TicketInfo::Available {
                 issue_type,
                 summary,
+                brief: llm_summary.zip(llm_purpose),
             },
             (0, _, _) => anyhow::bail!("tickets row for {key} has content missing"),
             _ => TicketInfo::Unavailable,
@@ -239,18 +248,23 @@ fn write_symbol(symbol: &StoredSymbol, rows: &Rows, depth: usize, out: &mut Stri
     if let Some(list) = rows.tickets.get(&symbol.id) {
         out.push_str(&format!("{field}- tickets:\n"));
         for ticket in list {
-            let detail = match rows.info.get(&ticket.ticket_key) {
+            let (detail, brief) = match rows.info.get(&ticket.ticket_key) {
                 Some(TicketInfo::Available {
                     issue_type,
                     summary,
-                }) => format!(" [{issue_type}] {summary}"),
-                Some(TicketInfo::Unavailable) => " (unavailable)".to_string(),
-                None => String::new(),
+                    brief,
+                }) => (format!(" [{issue_type}] {summary}"), brief.as_ref()),
+                Some(TicketInfo::Unavailable) => (" (unavailable)".to_string(), None),
+                None => (String::new(), None),
             };
             out.push_str(&format!(
                 "{field}  {} (first: {}, last: {}){detail}\n",
                 ticket.ticket_key, ticket.first_date, ticket.last_date
             ));
+            if let Some((summary, purpose)) = brief {
+                out.push_str(&format!("{field}    summary: {summary}\n"));
+                out.push_str(&format!("{field}    purpose: {purpose}\n"));
+            }
         }
     }
 
@@ -302,7 +316,7 @@ public class Widget {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
-        build_index(&store, repo.path(), None, &regex, None)
+        build_index(&store, repo.path(), None, &regex, None, None)
             .await
             .unwrap();
         (repo, data)
@@ -395,7 +409,7 @@ com.acme.show.Widget [class]
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).await.unwrap();
         let regex = Regex::new(DEFAULT_TICKET_REGEX).unwrap();
-        build_index(&store, repo.path(), None, &regex, None)
+        build_index(&store, repo.path(), None, &regex, None, None)
             .await
             .unwrap();
         drop(store);
