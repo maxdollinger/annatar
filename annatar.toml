@@ -8,8 +8,10 @@ repo = "."
 # Directory holding the two libSQL files: index.db and cache.db.
 data_dir = ".annatar"
 
-# Regex used to find Jira ticket keys in commit messages and bodies.
-ticket_regex = '\bGRLD-\d+\b'
+# Regex used to find Jira ticket keys in commit messages and bodies. No
+# trailing `\b`: branch-style subjects like `GRLD-123_Fix_login` put a `_`
+# (a word character) right after the digits.
+ticket_regex = '\bGRLD-\d+'
 
 # Jira connection. Optional: without it (or without ANNATAR_JIRA_TOKEN)
 # `annatar index` warns once and uses only tickets already in cache.db;

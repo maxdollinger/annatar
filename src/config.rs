@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer};
 
 /// Default regex used to find Jira ticket keys in commit messages.
-pub const DEFAULT_TICKET_REGEX: &str = r"\bGRLD-\d+\b";
+pub const DEFAULT_TICKET_REGEX: &str = r"\bGRLD-\d+";
 
 /// Default URL of the local Ollama server.
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
@@ -376,6 +376,12 @@ data_dir = "data"
 
         assert!(config.jira.is_none(), "jira should default to None");
         assert!(config.ollama.is_none(), "ollama should default to None");
+        assert_eq!(config.ticket_regex.as_str(), DEFAULT_TICKET_REGEX);
+    }
+
+    #[test]
+    fn shipped_config_uses_the_default_ticket_regex() {
+        let config = Config::parse(include_str!("../annatar.toml")).expect("annatar.toml parses");
         assert_eq!(config.ticket_regex.as_str(), DEFAULT_TICKET_REGEX);
     }
 
