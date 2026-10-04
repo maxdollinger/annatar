@@ -71,7 +71,7 @@ Rerun `annatar index` whenever the code changes. It rebuilds the index from scra
 
 ```sh
 annatar search "who deletes expired tokens"     # the best matching files with their outline
-annatar show com.acme.token.TokenCleanup        # one symbol: description, tickets, commits, parent, children
+annatar show com.acme.token.TokenCleanup        # one symbol: description, tickets, commits, parent, children, used by / uses
 ```
 
 `search` returns files, best first: the class with its description, then its methods with line numbers; matching lines end with `*score`. `--symbols` lists single symbols instead.

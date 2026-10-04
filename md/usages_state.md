@@ -18,12 +18,204 @@ unique across both files.
 
 | | |
 | --- | --- |
-| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.4 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
-| Step | 6.4 Overrides and measured quality — **done** (reviewed, findings fixed); next: 6.5 `show`: `used by` and `uses` |
-| Last updated | 2026-10-04 (6.4) |
+| Phase | 6 — Usages — **in progress** (2026-10-04; 6.1–6.5 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
+| Step | 6.5 `show`: `used by` and `uses` — **done** (reviewed, findings fixed); next: 6.6 `annatar trace <fqn> [--depth N]` |
+| Last updated | 2026-10-04 (6.5) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
+
+- **6.5 `show`: `used by` and `uses`.** New read-side module
+  `src/usage_query.rs` (D-du): `used_by(conn, id)` and `uses(conn, id)`
+  return one `Usage` per edge (the other symbol's id, fqn, file, the edge
+  kind, line, `ambiguous`, `via`, entry point), each one SQL statement —
+  a recursive `inside` CTE over `parent_id` (the symbol and everything
+  nested in it), for `used_by` a recursive `overridden` CTE up the
+  `overrides` edges of everything inside and a `targets` union, then plain
+  joins, ordered fully (file, line, fqn, kind, `via`, `ambiguous`, the
+  other end's fqn); `entry_point(kind, fqn, signature, annotations)` names
+  `@Scheduled`, `@RequestMapping`, `@Get/Post/Put/Delete/PatchMapping`,
+  `@EventListener`, `@ExceptionHandler`, `@PostConstruct`, `@PreDestroy`,
+  `@Bean` (by simple name, qualified or with arguments) and `public static
+  void main(String[])` — all three for 6.6 `trace` to reuse. `show` (only
+  for the shown symbol, not its children, after its tickets and before
+  the children): `- entry point: @Scheduled` when it is one, then `- used
+  by:` and `- uses (lines in this symbol's file):` grouped by file (`used
+  by`: the user's file; `uses`: the used symbol's file, the lines being in
+  the shown symbol's file, which the title says), one line per symbol and
+  link `fqn [kind] [ambiguous] [via <fqn>] :line, line [entry: @A]` (kind
+  left out for `call`; same symbol + kind + ambiguous + via merged, lines
+  deduplicated), capped after `-k` entries (`--limit`, default
+  `show::DEFAULT_LIMIT` = 20, 1–100, like `search -k`) with `… N more`;
+  empty lists read `- used by: none in main sources` and `- uses: none`
+  (D-dt). `via` (D-dr): the callers of every method the symbol (or a
+  member of the type) overrides, transitively up the `overrides` chain,
+  outside the shown symbol, each caller once (also through a diamond);
+  a method's incoming `overrides` edges are listed as such (the
+  overriding methods), a type's roll-up leaves out the `overrides` edges
+  into its members. A type's `uses` rolls up its members' and nested
+  types' outgoing edges without the ones ending inside it and without its
+  members' `overrides` (D-ds); a `new T(..)` that reaches a declared
+  constructor shows only the constructor's `instantiate`, not the type's
+  too. `show::render(conn, fqn)` keeps its signature (default cap),
+  `render_limited(conn, fqn, limit)` is behind the CLI. No JSON or other
+  output mode exists for `show`, so none was added. `show` still reads only
+  `index.db` (no Ollama; ≈ 14 ms per call on `argus` including process
+  start). *Tests:* `usage_query` — a method's `via` up a two-level chain
+  and through a diamond (`C#m` overriding `B#m` and `J#m`, both overriding
+  `I#m`: the `I#m` caller once, a caller of each of `B#m`, `J#m`), an
+  `ambiguous` edge, an interface method listing both overriders, a
+  method's `uses` keeping its own `overrides` and only the constructor of a
+  `new`, a type roll-up without internal edges and without its members'
+  `overrides` for both lists (nested type included), a symbol without
+  users or uses, the entry-point rules (`@ExceptionHandler`, `@PreDestroy`,
+  `main` only when public static `String[]`, a type's `@RequestMapping` is
+  none, `@Scheduler` is none); `show` on a 5-file Java fixture through
+  `build_index` — the exact output of a method with a direct and a `via`
+  caller and its `uses` (`overrides`, internal call, `reference`), a type
+  roll-up (`instantiate`/`reference` of a field, a getter's return, `via`,
+  no member `overrides`), an entry point without users and the `[entry:
+  @Scheduled]` marker with merged lines `:14, 15`, the cap (`… 2 more`),
+  and one line format test (`ambiguous` apart from the plain edge on the
+  same line, `via`, entry, kind); the two existing exact `show` tests gain
+  the empty lists; `tests/cli.rs`: `show -k 1` caps, default lists all
+  with `[entry: @GetMapping]`, `-k 0` is a usage error (exit 2). 382 lib
+  tests (+9) and 13 CLI tests (+1) pass. *Docs:* `reference.md` (command
+  list, a `show` paragraph with examples that match the binary's output),
+  README `show` line, `usages.md` Output (the real `argus` output, `via`,
+  `uses`, entry points), `plan.md` 6.5 (`via <fqn of I#m>`) and Later
+  (test-code item names #45). **#45 decided** (D-dv): deferred to the Later
+  test-code indexing item, nothing built. **Review** (10 findings, all
+  handled): F1 `uses` paired the used symbol's path with lines of the
+  shown file → title `- uses (lines in this symbol's file):` (D-dt); F2 a
+  type's roll-up listed its subclasses' `overrides` into its members (18
+  of `AbstractCache`'s 36 entries, pushing all 8 consumers calling
+  `refresh` past the cap) → left out in both roll-ups, kept for a shown
+  method (D-dr, D-ds; `AbstractCache` 36 → 18 entries); F3 a `new T(..)`
+  listed both `T` and `T#<init>(..)` in `uses` → only the constructor; F4
+  package repeated in every fqn → kept (fqns are what agents copy), `via`
+  kept as a full fqn (D-dw), token cost → open #51 for 6.7; F5
+  `@ExceptionHandler` (2 on `argus`) and `@PreDestroy` added, D-du's
+  "`argus` uses only these" corrected; F6 `none in main sources`; F7
+  `ORDER BY` made total; F8 tests for `ambiguous`, two `overrides` edges
+  and a diamond; F9 reuse for `trace` (no roll-up, kind filter) noted in
+  Next; F10 the D-dv wording, `via` wording in `plan.md`, the timing (≈ 14
+  ms). *`argus`* (index current, not rebuilt; `cache.db` untouched; `show
+  --config real.toml`), after the review:
+  `show com.haufe.greenland.argus.messaging.consume.janus.securityMethods.messageConsumer.SecurityDataAddEventConsumer`:
+
+  ```text
+    - used by:
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/SecurityDataEventDispatcher.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) :76
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/SecurityDataEventDispatcherConfig.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcherConfig reference :24
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcherConfig#<init>(SecurityDataAddEventConsumer,SecurityDataRemoveEventConsumer) reference :28
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcherConfig#getSecurityDataAddEventConsumer() reference :45
+    - uses (lines in this symbol's file):
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/securitymethods/SecurityMethodsCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.securitymethods.SecurityMethodsCache reference :20
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/event/AuthDataCacheUpdateEvent.java
+        com.haufe.greenland.argus.auth.authorization.event.AuthDataCacheUpdateEvent#<init>(String) instantiate :27
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/event/AuthDataEventService.java
+        com.haufe.greenland.argus.auth.authorization.event.AuthDataEventService reference :19
+      backend/src/main/java/com/haufe/greenland/argus/auth/event/dynamoDB/DynamoDBEventService.java
+        com.haufe.greenland.argus.auth.event.dynamoDB.DynamoDBEventService#publishAsync(DynamoDBEvent) :27
+      backend/src/main/java/com/haufe/greenland/argus/common/cache/AbstractCache.java
+        com.haufe.greenland.argus.common.cache.AbstractCache#refresh(K) :26
+      backend/src/main/java/com/haufe/greenland/argus/integration/janus/SecurityData.java
+        com.haufe.greenland.argus.integration.janus.SecurityData reference :24, 25
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/SecurityDataMessageBearer.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataMessageBearer#getPayload() :24, 25
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/message/SecurityMethodAddMessage.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.message.SecurityMethodAddMessage reference :23
+  ```
+
+  `show 'com.haufe.greenland.argus.messaging.consume.janus.securityMethods.messageConsumer.SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage)'`:
+
+  ```text
+    - used by:
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/SecurityDataEventDispatcher.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcher#dispatch(SecurityDataMessageBearer<?>) :76
+    - uses (lines in this symbol's file):
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/event/AuthDataCacheUpdateEvent.java
+        com.haufe.greenland.argus.auth.authorization.event.AuthDataCacheUpdateEvent#<init>(String) instantiate :27
+      backend/src/main/java/com/haufe/greenland/argus/auth/event/dynamoDB/DynamoDBEventService.java
+        com.haufe.greenland.argus.auth.event.dynamoDB.DynamoDBEventService#publishAsync(DynamoDBEvent) :27
+      backend/src/main/java/com/haufe/greenland/argus/common/cache/AbstractCache.java
+        com.haufe.greenland.argus.common.cache.AbstractCache#refresh(K) :26
+      backend/src/main/java/com/haufe/greenland/argus/integration/janus/SecurityData.java
+        com.haufe.greenland.argus.integration.janus.SecurityData reference :24, 25
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/SecurityDataMessageBearer.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataMessageBearer#getPayload() :24, 25
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/message/SecurityMethodAddMessage.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.message.SecurityMethodAddMessage reference :23
+  ```
+
+  `show com.haufe.greenland.argus.common.cache.AbstractCache` (18 entries,
+  all within the default cap; before the review 36, the consumers below
+  hidden in `… 16 more`):
+
+  ```text
+    - used by:
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/AuthDataService.java
+        com.haufe.greenland.argus.auth.authorization.cache.AuthDataService#getAuthData(UUID) :56, 57, 58, 63
+        com.haufe.greenland.argus.auth.authorization.cache.AuthDataService#getPersonOrganizationRelations(UUID) :102
+        com.haufe.greenland.argus.auth.authorization.cache.AuthDataService#deleteUserCache(UUID) :118, 119, 120
+        com.haufe.greenland.argus.auth.authorization.cache.AuthDataService#deleteOrganizationCache(UUID) :125, 126
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/contract/ContractCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.contract.ContractCache extends :15
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/identificationmethods/IdentificationMethodsCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.identificationmethods.IdentificationMethodsCache extends :15
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/person/AccessPersonOrganizationRelationCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.person.AccessPersonOrganizationRelationCache extends :15
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/person/PersonOrganizationRelationCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.person.PersonOrganizationRelationCache extends :14
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/roles/UserRoleCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.roles.UserRoleCache extends :15
+      backend/src/main/java/com/haufe/greenland/argus/auth/authorization/cache/securitymethods/SecurityMethodsCache.java
+        com.haufe.greenland.argus.auth.authorization.cache.securitymethods.SecurityMethodsCache extends :15
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/cives/identification/messageConsumer/IdentificationDataAddEventConsumer.java
+        com.haufe.greenland.argus.messaging.consume.cives.identification.messageConsumer.IdentificationDataAddEventConsumer#consume(IdentificationDataAddMessage) :30
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/cives/identification/messageConsumer/IdentificationDataRemoveEventConsumer.java
+        com.haufe.greenland.argus.messaging.consume.cives.identification.messageConsumer.IdentificationDataRemoveEventConsumer#consume(IdentificationDataRemoveMessage) :31
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/cronus/person/message/consumer/PersonOrganizationRelationCreatedMessageConsumer.java
+        com.haufe.greenland.argus.messaging.consume.cronus.person.message.consumer.PersonOrganizationRelationCreatedMessageConsumer#perform(PersonOrganizationRelationMessagePayload) :35
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/cronus/role/message/consumer/RoleRelationsUpdatedMessageConsumer.java
+        com.haufe.greenland.argus.messaging.consume.cronus.role.message.consumer.RoleRelationsUpdatedMessageConsumer#perform(RoleRelationMessagePayload) :90
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/messageConsumer/SecurityDataAddEventConsumer.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.messageConsumer.SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage) :26
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/janus/securityMethods/messageConsumer/SecurityDataRemoveEventConsumer.java
+        com.haufe.greenland.argus.messaging.consume.janus.securityMethods.messageConsumer.SecurityDataRemoveEventConsumer#consume(SecurityMethodRemoveMessage) :25
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/pactum/message/messageConsumer/BusinessFeatureMessageConsumer.java
+        com.haufe.greenland.argus.messaging.consume.pactum.message.messageConsumer.BusinessFeatureMessageConsumer#perform(BusinessFeatureMessage.OrganizationBusinessFeatures) :50
+      backend/src/main/java/com/haufe/greenland/argus/messaging/consume/pactum/message/messageConsumer/ContractChangedMessageConsumer.java
+        com.haufe.greenland.argus.messaging.consume.pactum.message.messageConsumer.ContractChangedMessageConsumer#perform(ContractMessage.Contract) :42
+    - uses: none
+  ```
+
+  The type names the dispatcher config (field :24, constructor :28,
+  getter :45) and, through `call`, the dispatcher's `dispatch` :76; the
+  consumer implements no indexed interface, so no `via` here; its `uses`
+  is correct against the source (lines 20–27 of
+  `SecurityDataAddEventConsumer.java`). `via` on `argus`, a cronus user
+  consumer (`UserCreatedMessageConsumer#perform(UserMessagePayload)`
+  overrides `MessageConsumer#perform(T)`, called by the dispatcher only
+  through the interface):
+
+  ```text
+  - used by:
+    backend/src/main/java/com/haufe/greenland/argus/messaging/consume/cronus/user/UserMessageDispatcher.java
+      com.haufe.greenland.argus.messaging.consume.cronus.user.UserMessageDispatcher#performMessage(MessageBearer) via com.haufe.greenland.argus.messaging.consume.cronus.user.message.MessageConsumer#perform(T) :123
+  ```
+
+  `show com.haufe.greenland.argus.messaging.consume.janus.securityMethods.SecurityDataEventDispatcher#processMessages()` prints `- entry
+  point: @Scheduled` and `- used by: none in main sources`; both
+  `ArgusExceptionHandler` methods now print `- entry point:
+  @ExceptionHandler`. List sizes over all 654 symbols (`-k 100`): `used
+  by` empty for 230, median 1 entry, more than 20 for 2 (max 29,
+  `DynamoDBEvent`); `uses` empty for 289, median 1, more than 20 for 4
+  (max 27, `RoleRelationsUpdatedMessageConsumer`).
 
 - **6.4 Overrides and measured quality.** *`overrides` edges*
   (`EdgeKind::Overrides`, D-dn): after the walks, `Resolver::override_edges`
@@ -393,11 +585,23 @@ unique across both files.
 
 ### Next
 
-- **6.5 `show`: `used by` and `uses`** (`plan.md` Phase 6): the users
-  query of `usage_eval::users` (a type's roll-up over `parent_id` without
-  its internal sources) is the `used by` list; group by file with call-site
-  lines, label `overrides` callers `via I#m` (incoming `call` edges of the
-  methods a member's `overrides` edges point to), cap the lists.
+- **6.6 `annatar trace <fqn> [--depth N]`** (`plan.md` Phase 6): a
+  recursive CTE over incoming `call`, `instantiate` and `reference` edges
+  through `overrides` (`via`), built on `usage_query` (the `inside` CTE for
+  a type tracing its members, the `overridden` CTE for `via`,
+  `usage_query::entry_point` for the `[entry: @Scheduled]` leaves); the
+  `argus` check: tracing `SecurityDataAddEventConsumer#consume(..)` reaches
+  `SecurityDataEventDispatcher#processMessages()` (`@Scheduled`) through
+  `dispatch` :76 and `receiveAndDispatchMessages` :59 (the `uses` of
+  `processMessages` above already shows that hop). From the 6.5 review
+  (F9): `used_by(id)` always rolls a type up, so a trace through a type
+  node (`SecurityDataEventDispatcherConfig reference :24`) would fan out
+  to every user of every member — `trace` needs a variant without the
+  roll-up (a scope parameter or `pub(crate)` CTE fragments; `INSIDE` is
+  private today) and a kind filter (`call` / `instantiate` / `reference`,
+  no `extends` / `implements` / `overrides` hops); `entry_point` and
+  `Usage::entry` are ready. Make `trace`'s per-level cap `-k` too, so the
+  flag means "entries per list" in both usage commands.
 
 ## Step log
 
@@ -409,8 +613,8 @@ unique across both files.
 | 6.3 Member resolution | done | `call` edges and `instantiate` to constructors; typed expressions and block-scoped typed locals (D-dd replaced, D-dg); receivers, chains through declared return types, unqualified lookup inside-out then static imports, `super`/`this` calls, method references, implicit Lombok/record/enum/constructor members (D-dh), overloads with `ambiguous` (D-di), stops (D-dj); call-site counts and `-v` top unresolved calls; benchmark calls; `argus`: 392 `call` + 31 constructor `instantiate`, 586 / 0 / 800 call sites, T4 row :76 present, 0 chat calls; open #48; review: 14 findings — fixed: indexed argument vs final JDK parameter (H1), single candidate type-checked (H2), unqualified `Object`/`Enum` methods stop at the innermost class (H3), same-type overloads (M1), Java's arity phases and exact ranking only on known types (M2), one `lineage` walk superclass-first (M3), `implicit` call-site count (M4), pattern-variable and anonymous-field scoping (L1, L2), annotation elements (L4), builder edge cases (L5), `dims` helper; recorded: bounded type variables (L3 → #48), module split (L6 → Next); D-dk; `argus` after: 1142 edges (+4 annotation-element references), call sites 423 / 167 implicit / 0 / 796 |
 | 6.3a refactor(usages) split | done | review L6 of 6.3, no behaviour change: `src/usages.rs` (API, `resolve`, test helpers) + `src/usages/` `resolver.rs`, `members.rs`, `walk.rs`, `expr.rs` (D-dl); code moved verbatim, cross-file items `pub(super)`, tests moved with their code (39 tests, same names; 356 lib tests); `argus`: edges identical (1142, by fqn and by id), 0 chat calls; review: approved, 3 doc nits fixed |
 | 6.4 Overrides and measured quality | done | `overrides` edges, nearest per Java with type-argument substitution through generic super types, shared with the "overridden nearer" lookup (D-dn); #48 decided: super-type arguments substituted in inherited members, method-level bounded type variables typed by the bound (D-dp), receivers' own type arguments → open #49; `edges:` line + `edges_overrides`; `src/usage_eval.rs` + `annatar eval-usages` (D-do); hand-built 29-symbol `argus` usage set (D-dm); `argus`: 1200 edges (50 `overrides`), call sites 424 / 174 / 0 / 788, P 1.000 R 0.967 (88/91), overriders 10/10, misses 3 × lambda; review: 11 findings — fixed: a type variable of the nearer method or type matched any type (H1, wrong `overrides` and `call` edges) and a farther variable bound to a nearer variable (H2, the test expected a false override) via `Sig` / `Arg::Var`, varargs vs single parameter (M1), the random part of the set made reproducible and grown to 33 symbols with random-only scores (M2), bounds leaking between same-named variables (L1), package-private across packages (L2, `is_package_private`), header type arguments around the type (L3), eval wording and `symbol N` in index errors (L5); recorded: L4 recall gaps (`usages.md`), L5's optional checks (D-dq); 54-symbol set P 1.000 R 0.972 (104/107), random only 23/23, members 50/53; `argus` edges unchanged |
-| 6.5 `show`: `used by` / `uses` | next | |
-| 6.6 `annatar trace` | planned | |
+| 6.5 `show`: `used by` / `uses` | done | `src/usage_query.rs`: `used_by` / `uses` as SQL joins (`inside` CTE over `parent_id`, `overridden` CTE up `overrides`), `entry_point` (D-du); `show`: `- entry point:`, `- used by:` / `- uses:` grouped by file, `fqn [kind] [ambiguous] [via I#m] :lines [entry: …]`, `-k`/`--limit` (default 20, 1–100) with `… N more`, `none` when empty, shown symbol only (D-dt); `via` = callers of every method it overrides, transitively; incoming `overrides` listed (D-dr); a type's `uses` rolls up its members' (D-ds); #45 decided: deferred to Later (D-dv); new open #50, #51; tests: `via`, roll-up, cap, no users, entry points, exact format, CLI `-k`; `argus`: `SecurityDataAddEventConsumer` names `SecurityDataEventDispatcherConfig` (:24, :28, :45) and `SecurityDataEventDispatcher#dispatch` (`call` :76), `via` on `UserCreatedMessageConsumer#perform` → `UserMessageDispatcher#performMessage` :123; index not rebuilt, 0 LLM calls; review: 10 findings — fixed: `uses` lines vs the used symbol's path (F1, title `uses (lines in this symbol's file)`), members' `overrides` left out of a type's roll-up (F2, `AbstractCache` 36 → 18 entries, its callers within the cap), duplicate `instantiate` of type and constructor (F3), `@ExceptionHandler` / `@PreDestroy` (F5), `none in main sources` (F6), total `ORDER BY` (F7), tests for `ambiguous`, two overrides and a diamond (F8), wording (F10); recorded: full fqns' token cost → open #51 with `via` kept as an fqn (F4, D-dw), `trace` reuse (F9 → Next) |
+| 6.6 `annatar trace` | next | |
 | 6.7 Agent trial (T4) on usages | planned | |
 
 ## Measurements
@@ -425,6 +629,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | Usage golden set: precision / recall of direct users | 6.4 | `.annatar-local/usages-argus.toml` (D-dm), after the 6.4 review: 54 symbols (8 types, 46 members), 107 true direct users, 14 symbols with `overridden_by` (10 overriders). **Overall P 1.000 R 0.972 (104/107 users found, 0 extra)**; types P 1.000 R 1.000 (54/54, 8 symbols); **members P 1.000 R 0.943 (50/53, 46 symbols)**; **random only (symbols 20–27 and 30–54, 33 symbols) P 1.000 R 1.000 (23/23, 0 extra; 15 symbols without users, none given an extra)** — draw 1 (20–27, not reproducible) 7/7, draw 2 (30–54, `usages-argus-draw.py`) 16/16; chosen only (1–19) P 1.000 R 1.000 (80/80; members 29/29); lambda cases (28–29) R 0.250 (1/4); overriders P 1.000 R 1.000 (10/10). The review's own independent check (10 methods by `random.Random(2026).sample` over the method rows, users read off the edges and verified by grep/reading) found 7/7 users, 0 extra. The review fixes changed no `argus` edge (1200 rows identical by fqn, kind, line). Before the review (29 symbols): P 1.000 R 0.967 (88/91; types 54/54, members 34/37), overriders 10/10. Before the #48 change: P 1.000 R 0.934 (85/91; types 52/54, members 33/37). Per symbol (P / R, hits/expected; `argus` package prefix dropped): T4 `SecurityDataAddEventConsumer#consume(SecurityMethodAddMessage)` 1/1; `SecurityDataAddEventConsumer` 4/4; `SecurityDataEventDispatcherConfig#getSecurityDataAddEventConsumer()` 1/1; private `SecurityDataEventDispatcher#dispatch(..)` (via `this::dispatch`) 1/1; `SecurityMethodAddMessage` 3/3; Lombok `SecurityData` 7/7 (5/7 before #48); Lombok/builder `CachedSecurityMethods` 3/3; `cronus.user…MessageConsumer` 3/3; interface method `MessageConsumer#perform(T)` 1/1, overriders 3/3; private `UserMessageDispatcher#dispatch(MessageBearer)` (from a lambda) 1/1; `UserTokenService` 13/13; overload `UserTokenService#removeAllTokens(List<UUID>)` 1/1; interface method `TokenStoreStrategy#removeAllTokensForUserIdExceptOfGivenJwtIds(..)` 1/1, overriders 1/1; `AbstractCache` 18/18; inherited `AbstractCache#refresh(K)` 7/7; constructor `TechnicalException#<init>(Throwable)` 4/4; constructor `TokenInvalidationEvent#<init>(String)` 3/3; generic `UserDataMessagePublisher#sendAsync(T)` 7/7; `UserDataMessageBearer#getMessageType()` (bounded `T`) 1/1 (0/1 before #48); random: `SecurityDataEventDispatcherConfig#getQueueName()` 1/1, `AuthDataCachePreWarmThreadPool#authDataCachePreWarmThreadPool()` 0/0 (no users, none found), `IdentificationDataRemoveMessage` 3/3, `UserData#getFirstName()` 0/0, `UserToken#setType(TokenType)` 1/1, `DynamoDBEvent#getEventType()` 1/1 (overriders 0/0), `AbstractCache#getCachePrefix()` 1/1 (overriders 6/6), `DynamoDBEvent#getEventId()` 0/0 (overriders 0/0); lambda cases: `AuthDataEvent#toWebResponse()` 0/1, `UserToken#getId()` 1/3; draw 2: every symbol with users 1/1 or 2/2 (`UserTokenBearer#getValidTokens()`, `UserToken#getType()`, inherited protected `DynamoDBEventService#retrieveEventsSortedByCreatedDate(String)` 2/2, `authorization.event.AuthDataEventService#getEventsSince(String)` beside the interface of the same name, package-private `IdentificationDataEventDispatcherConfig#getQueueName()`, a static `from(..)`, the `UUID` overload `UserTokenService#removeAllTokens(UUID)` 2/2, the `String` constructor of `PersonOrganizationRelationCacheUpdateEvent`, `CivesConnector#createSystemJwt(..)`, protected static `createRoles(..)`, `new UserDataCreatedMessage(..)` 2/2, two private methods), the 12 without users 0 found. No false positive in any symbol |
 | Misses by cause (lambda, library chain, generics, other) | 6.4 | After #48: **3 misses, all lambda** — `AuthDataEvent#getWebListResponse(..)` → `toWebResponse()` (`events.forEach(event -> … event.toWebResponse())`), `UserTokenBearer#removeTokenById(String)` → `UserToken#getId()` (`validTokens.removeIf(token -> token.getId()…)`), `UserTokenService#isTokenValid(..)` → `UserToken#getId()` (`getValidTokens().stream().anyMatch(userToken -> …)`, a library chain as well); library chain alone 0, generics 0, other 0; **0 false positives**. Before #48: 6 misses — lambda 3 (the same), generics 3 (`getPayload()` returning `T` on `SecurityMethodAddMessage` / `SecurityMethodRemoveMessage extends SecurityDataMessageBearer<SecurityData>` → the two consumers' `SecurityData` references; `message.getMessageType()` on `<T extends UserDataMessageBearer>`). All three lambda misses need a receiver's own type argument (`List<UserToken>`, `List<AuthDataEvent>`) and the lambda parameter's type from a library functional interface (open #49) |
 | Edge stage time (benchmark, `argus`) | 6.2 / 6.3 / 6.4 | 6.4: `argus` 11 ms (release, overrides and substitution included); benchmark (release) ≈ 5 ms per run (no overrides in it). 6.3 after the review: `argus` 11 ms, benchmark ≈ 26–27 ms. 6.3: `argus` 10–11 ms (release); benchmark (200 files, 1000 edges, debug) ≈ 25 ms per run. 6.2: `argus` 7 ms (release, 162 files, `index --offline` 2.2 s wall in all); synthetic benchmark (200 files, debug) ≈ 12 ms per run |
+| `show` list sizes on `argus` (654 symbols, `-k 100`) | 6.5 | after the review (members' `overrides` out of type roll-ups, no type `instantiate` beside its constructor's): `used by`: empty 230, median 1 entry, > 20 entries 2 (max 29, `DynamoDBEvent`; `AbstractCache` 18); `uses`: empty 289, median 1, > 20 4 (max 27, `RoleRelationsUpdatedMessageConsumer`); ≈ 14 ms per `show` including process start, so the default cap 20 cuts 2 + 4 lists. Before the review: `used by` > 20 for 5 (max 36, `AbstractCache`, half of it its subclasses' `overrides`), `uses` > 20 for 5 (max 31) |
 | T4: dispatcher named / full marks / cost vs 5.5 | 6.7 | – |
 
 ## Decisions and tradeoffs
@@ -454,13 +659,21 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-do (6.4) | The evaluation is a command, **`annatar eval-usages <set.toml>`**, in a new module `src/usage_eval.rs` (set parsing and validation, the index check, scoring and report together), next to `eval` / `golden` and in their style: the check runs first and any missing or wrong-kind fqn is the error (reusing `golden::IndexProblem`), per-symbol lines then pooled summaries; it reads only `index.db` (no `[ollama]`), takes no `--path`. The users query (`usage_eval::users`: incoming non-`overrides` edges, a type rolled up over `parent_id` by a recursive CTE, sources inside it excluded) is the one 6.5's `used by` needs | An `#[ignore]` test reading env vars (as `real_golden_set_matches_the_real_index`); a flag on `eval`; extending `golden.rs` | `eval` needs Ollama and scores retrieval, a different set format; a command is how `project.md` measures quality (the golden-set loop) and runs in a second on a warm index, so every later resolver change (6.5+, SCIP) is re-measured the same way |
 | D-dp (6.4) | **Open #48 decided on the measured misses: implemented the part that is cheap and precise, recorded the rest.** Of the 6 golden-set misses before the change, 3 were generics: 2 a super type's type argument (`getPayload()` returning `T` on `SecurityMethodAddMessage extends SecurityDataMessageBearer<SecurityData>`), 1 a bounded method type variable (`<T extends UserDataMessageBearer> sendAsync(T message)`). Done: inherited members on a subtype take the type arguments of the super-type path (`Resolver::declared_via` / `declared_on` over `type_args`, the machinery `overrides` needs anyway) for return types, fields and Lombok/record accessors; a variable or parameter typed by a **method-level** (or other member-region) bounded type variable takes its first bound (`Region::bounds` from the tree's `type_bound`; the bound is the erasure, as precise as a declared type). `argus`: +8 edges, all correct, recall 0.934 → 0.967, precision unchanged. Not done: the type arguments of a receiver's own declared type (`Box<Item> box; box.get()`, `List<UserToken>`) — `Ty` carries no type arguments, and on `argus` they only matter together with lambda parameter inference (the 3 remaining misses); class-level bounds (`class Box<T extends Msg>`, not seen on `argus`) | Leave #48 to SCIP; a full generic `Ty` (type arguments on every expression type) now | The super-type part fixes every generics miss measured, at ≈ 60 lines and no facts change beyond `is_private`; a generic `Ty` plus lambda typing from library functional interfaces is a type checker's job (SCIP, Later) and buys 3 users of 91 on `argus` (open #49) |
 | D-dq (6.4 review) | The 6.4 review's findings, handled as follows. **H1/H2/M1/L2/L3** fixed in `Resolver::overrides` and `type_args` (D-dn as corrected), each with a fixture test (`<U> put(U)` and `Box<X>#put(X)` against `Base#put(String)` with the calls going to `Base#put`; `Flipped#put(Sms, P)` overriding and `put(Sms, Mail)` not; `log(String...)` vs `log(String)` / `all(String[])`; package-private `m()` across packages; a header argument naming the outer `Message` beside a nested one). **L1**: a type variable declared twice in one region (a method of an anonymous class) gets no bound — the simplest rule that never types a variable by another's bound; taking bounds per declaring member would also keep the inner one, not worth the scope tracking. **M2**: the set gained a reproducible draw and random-only scores (D-dm, Measurements); the old seed-64 draw is kept and labelled not reproducible. **L4** (recall: `super.get()` through a generic super type; an unrelated super type's method hiding an interface method on a multi-parent receiver) recorded in `usages.md` (where resolution stops), not fixed: both need the receiver threaded through `methods()` / `overrides`, and neither occurs on `argus`. **L5**: the summaries say "each symbol–user pair"; a missing fqn names its entry as `symbol N`; not done: rejecting a type's `users` entry that lies inside the type (a silent permanent miss — the hand-built set has none) and an override pair in the sample-project fixture (it has none; the unit test scores overriders on a synthetic index) | Fix L4 now; keep the unreproducible draw unlabelled; drop the seed-64 draw | L4 is recall-only and absent from `argus`; the old draw's symbols are still correct truth, only its selection cannot be repeated |
+| D-dr (6.5) | **`via`: a method is used by the callers of every method it overrides, transitively up the `overrides` chain** (`C#m → B#m → I#m`: callers of `B#m` and of `I#m`), each listed `via` the method they call; only non-`overrides` edges into those methods (siblings overriding the same method are not users); a type's roll-up includes its members' `via` callers; callers inside the shown symbol are left out like any other internal edge. A shown method's incoming `overrides` edges are listed in `used by` as `overrides` (the methods overriding it), its outgoing ones in `uses`; **amended in the review (F2):** a type's roll-up leaves out the `overrides` edges into its members (and, in `uses`, out of them) — the subtype's `extends` / `implements` line already says it, and on `argus` they were 18 of `AbstractCache`'s 36 entries, pushing all 8 consumers that call `refresh` past the cap | Only the nearest overridden method (one step, as the edges are stored, D-dn); `via` only on methods, not in a type's roll-up; `overrides` left out of `used by` as in `usage_eval::users`; members' `overrides` kept in a roll-up but ordered after the usage kinds (review alternative: the list stays twice as long) | Dynamic dispatch: a call to `I#m` can run any override below it, whatever the depth, and on `argus` the cronus consumers are called only through `MessageConsumer#perform(T)` (`UserMessageDispatcher#performMessage` :123) — without `via` their `used by` would be empty. Listing overriders gives an interface method its implementations, which a flow trace needs next (`project.md`: "links to every place that uses it"); the eval keeps scoring them apart (`overridden_by`), so its numbers do not change. `trace` (6.6) follows the same chain |
+| D-ds (6.5) | **A type's `uses` rolls up its members' and nested types' outgoing edges**, without the ones ending inside the type, the mirror of `used by`'s roll-up; grouped by the used symbol's file, with the lines in the shown type's file. Review (F2, F3): without its members' `overrides` (the type's `extends` / `implements` says it), and an `instantiate` of a type is left out when the same source and line also instantiates one of that type's constructors (`new T(..)` with a declared constructor stores both edges); `used by` needs no such rule, the two edges merge there | Only the type's own edges (header, fields, annotations) | `project.md` promises "direct `used_by` and `uses`" of a symbol: the roll-up is still direct (no transitive hop), and a type's own edges alone miss everything its methods call — the dependencies an agent or engineer asks about; children are printed without lists (D-dt), so the roll-up is the only place they show |
+| D-dt (6.5) | **Format and cap:** the lists belong to the shown symbol only (not its children, which would repeat them), after its tickets and before the children, as `- used by:` / `- uses:` field lines; per file its path, then one line per symbol and link (`fqn`, the kind unless `call`, `ambiguous`, `via I#m`, `:line, line`, `[entry: @A]`), files by path, lines by first line; an empty list is `- used by: none in main sources` (review F6: test code is not indexed, D-dv; a bare `none` reads as dead code) or `- uses: none`. **`uses` is titled `- uses (lines in this symbol's file):`** (review F1): its file headers are the used symbols' files, its lines the shown symbol's, so an agent would otherwise open `SecurityMethodsCache.java:20` for a mention on line 20 of the consumer; one title per list costs less than ` at` on every line. Each list is capped at **20 entries** (lines with a symbol, not files) with `… N more`; `-k`/`--limit N` (1–100) changes it — the flag `search` and `eval` use for "how many" | Cap by files; no flag (fixed cap); lists under every child; target member named in a type's roll-up; `uses` lines as ` at :20` per entry, or `uses` grouped by line | 20 keeps the default output short — on `argus` only 2 + 4 of 654 lists are longer after the review (Measurements) — and `-k` lets an agent see the rest without a new convention; the error and range follow `search -k` (exit 2). Naming the member a type's user reaches would lengthen every line; open #50 |
+| D-du (6.5) | The read side of the edges lives in **`src/usage_query.rs`** (`used_by`, `uses`, `Usage`, `entry_point`, `ENTRY_ANNOTATIONS`), apart from the resolver (`usages`) and the eval (`usage_eval`), so `trace` reuses the CTEs and the entry-point test. Entry points: method annotations by simple name (qualified or with arguments), `@Scheduled`, `@RequestMapping`, `@Get/Post/Put/Delete/PatchMapping`, `@EventListener`, `@ExceptionHandler`, `@PostConstruct`, `@PreDestroy`, `@Bean`, several joined (`@ExceptionHandler` and `@PreDestroy` added in the review, F5); `public static void main(String[])` (or `String...`) by fqn and signature; types never | Detection in `show`; by fqn suffix only; Spring's meta-annotations (`@Schedules`, `@TransactionalEventListener`, listener annotations of messaging libraries such as `@KafkaListener`/`@SqsListener`, none on `argus`) | The list is `usages.md`'s plus `@ExceptionHandler` (the framework calls it on an exception, no caller in code) and `@PreDestroy` (the partner of `@PostConstruct`). On `argus` the framework-called methods are 10 `@Scheduled`, 14 `@Bean`, 11 `@PostConstruct`, 25 mappings, 2 `@ExceptionHandler`, 1 `main` (the developer's "`argus` uses only these" missed the two `@ExceptionHandler`s, review F5); no meta-annotations. An annotation by simple name can be a project's own of that name — acceptable for a label. `usage_eval::users` keeps its own query (excludes `overrides`, no `via`), unchanged |
+| D-dv (6.5, open #45) | **#45 decided: test callers are not indexed in Phase 6**; they belong to the Later test-code indexing item (`plan.md`), first as sources of usages only (rows marked as test, never described, embedded or searched; `used by` / `trace` list them apart). `reference.md` says test callers never show | Index test files for edges now | `edges.src_id` references `symbols`, so test sources need symbol rows, which `search`, `describe` (LLM cost), `eval` and the golden sets would all have to skip; that is a schema and pipeline change beyond 6.5–6.7. `project.md`'s "what a change can break" arguably includes tests, but the T4 gap (#42) is a main-code caller; 6.7 shows whether main-code usages suffice |
+| D-dw (6.5 review, F4) | **Usage lines keep full fqns, `via` included** (`via com.acme…MessageConsumer#perform(T)`, not `via MessageConsumer#perform(T)`); `plan.md` 6.5 now reads `via <fqn of I#m>`. The token cost of the repeated package is open #51 for 6.7 | Members relative to the file's top-level type, as `search`'s file view does (−28 to −35 % bytes on `argus` lists); only `via` shortened, as the plan's `via I#m` wording had it | Every printed symbol is something an agent copies into `show` / `trace`, which need the exact fqn (AGENTS.md: symbols are identified by fqn in the CLI); a relative `via` would be the one name in the output an agent cannot paste. Whether the bytes matter is measured in the 6.7 trial, not guessed |
 
 ## Open questions
 
 | # | Question | Raised at | Status |
 | --- | --- | --- | --- |
-| 45 | Test sources are not indexed, so `used by` and `trace` never show test callers ("who relies on it" stops at main code). Index test files for edges only (as sources of usages, not as symbols or descriptions)? | 6 plan | open — decide after 6.5 |
+| 45 | Test sources are not indexed, so `used by` and `trace` never show test callers ("who relies on it" stops at main code). Index test files for edges only (as sources of usages, not as symbols or descriptions)? | 6 plan | **decided (6.5, D-dv):** deferred to the Later test-code indexing item (edge sources only), nothing built in Phase 6 |
 | 46 | Show usages in the `search` file view (e.g. `used by N` or the callers' files under a hit) so an agent sees the caller without a second command? Costs output size on every query | 6 plan | open — after 6.7, depending on whether agents call `trace` / `show` on their own |
 | 47 | Callers in the description prompts (plan Later): a member's callers could sharpen what and why, but every prompt changes and the whole LLM cache misses (≈ 20 min on `argus`) | 6 plan | open — after 6.7 |
 | 48 | Substitute a super type's type arguments in inherited members (`SecurityMethodAddMessage extends SecurityDataMessageBearer<SecurityData>` → `getPayload()` returns `SecurityData`) and in receivers' generic types (`Box<Item>#get()`)? Today a type variable stops the chain (`usages.md`, where resolution stops): on `argus` every message consumer's `message.getPayload().getUserId()` is unresolved. Also a **bounded** type variable (`<T extends UserDataMessageBearer> void sendAsync(T message)` → `message.getMessageType()`): its erasure, the bound, is as precise as a declared type, but 6.1 keeps only the type variables' names (6.3 review L3) | 6.3 | **closed (6.4, D-dp):** super-type arguments are substituted in inherited members (return types, fields, Lombok/record accessors) and in `overrides`; a method's bounded type variable types its variables by the bound — the 3 generics misses of the usage golden set are gone (+8 correct edges on `argus`). A receiver's own type arguments (`Box<Item>#get()`) and class-level bounds stay out → #49 |
 | 49 | A receiver's own type arguments and lambda parameter types (`List<UserToken> tokens; tokens.removeIf(t -> t.getId()…)`, `events.forEach(e -> e.toWebResponse())`): `Ty` keeps no type arguments and an untyped lambda parameter has no type, so the call is unresolved. All 3 misses of the 6.4 usage golden set (3 of 91 users), at most 13 of `argus`'s 1386 call sites. Model type arguments on `Ty` plus the parameter types of common JDK functional interfaces (`forEach`, `removeIf`, `stream().map/filter/anyMatch`), or leave it to SCIP? | 6.4 | open — after 6.7: only if the agent trial shows a caller missing for this reason |
+| 50 | A type's `used by` line names the user and the lines, not which member of the type it uses (`…Dispatcher#dispatch(..) :76` under `SecurityDataEventDispatcherConfig` could be `getQueueName()` or the getter). Name the member (`→ #getX()`), at the cost of longer lines, or leave it to `show` of the member? | 6.5 | open — after 6.7, if agents misread a type's users |
+| 51 | Usage lists repeat the full package in every fqn under a file header that already contains it (`show` of `AbstractCache -k 100`: 6595 bytes, 4275 without the package, −35 %; `SecurityDataAddEventConsumer` −28 %). Print members relative to the file's top-level type, as `search`'s file view does, at the cost of names an agent cannot paste into `show` / `trace` unchanged (D-dw)? | 6.5 review | open — after 6.7, on the trial's token cost |
