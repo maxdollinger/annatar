@@ -201,15 +201,27 @@ async fn run(cli: &Cli) -> Result<()> {
                 stats.unreadable
             );
             println!(
-                "edges: {} ({} extends, {} implements, {} instantiate, {} reference); {} unresolved type mentions ({} names); {} ms",
+                "edges: {} ({} extends, {} implements, {} instantiate, {} reference, {} call); {} unresolved type mentions ({} names); {} ms",
                 stats.edges(),
                 stats.edges_extends,
                 stats.edges_implements,
                 stats.edges_instantiate,
                 stats.edges_reference,
+                stats.edges_call,
                 stats.unresolved_types,
                 stats.unresolved_type_names,
                 stats.edges_time.as_millis()
+            );
+            println!(
+                "call sites: {} ({} resolved to a member, {} implicit, {} ambiguous, {} unresolved)",
+                stats.calls_resolved
+                    + stats.calls_implicit
+                    + stats.calls_ambiguous
+                    + stats.calls_unresolved,
+                stats.calls_resolved,
+                stats.calls_implicit,
+                stats.calls_ambiguous,
+                stats.calls_unresolved
             );
             println!(
                 "tickets: {} keys, {} cached, {} fetched, {} unavailable, {} failed, {} not fetched; {} Jira requests",

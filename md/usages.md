@@ -83,7 +83,7 @@ A qualified name (`Outer.Inner`, `com.acme.Foo`) resolves its first part this wa
 
 ### Names in expressions
 
-A simple name in an expression (`config`, `queue`, `LOGGER`): local variable → parameter → field of the current type and its indexed superclasses → field of an enclosing type → static import.
+A simple name in an expression (`config`, `queue`, `LOGGER`): local variable → parameter → field of the current type and its indexed superclasses → field of an enclosing type → static import. Locals and parameters are block-scoped and typed by their declaration; the fields of an anonymous or local class are variables in its body; Lombok's `@Slf4j` `log` is a library `Logger`.
 
 ### Members
 
@@ -93,12 +93,12 @@ A member is looked up through the **static type of its receiver**:
 | --- | --- |
 | `this`, none (`m()`) | the current type, then enclosing types |
 | `super` | the superclass |
-| a local, parameter or field | its declared type; `var` from a `new T()` or cast initializer |
+| a local, parameter or field | its declared type; `var` from its initializer's type (`new T()`, a cast, a resolved call) |
 | `new T(..)`, `(T) x` | `T` |
 | `T.m()`, `T.X` | `T` (static) |
 | a call `a.b()` | the declared return type of the resolved `b` |
 
-The member is looked up in that type, then its superclasses and interfaces in the index.
+The member is looked up in that type, then its indexed superclasses, then its interfaces (a class's method wins over an interface's, as in `javac`); a method overridden nearer (same name, parameter count and simple types, a type variable of the farther one matching any type) is left out, so `x.publish(e)` on a class overriding `I<T>#publish(T)` is one edge, to the override; two overloads of one type never hide each other. An unqualified `m()` is looked up in the innermost class around the call that has a member `m` (an anonymous or local class by its indexed super types), then in the static imports; every class has `Object`'s methods (`toString()`, `equals(..)`, …) and every enum `Enum`'s (`compareTo(..)`), so such a call never goes past the innermost class. The edge's line is the line of the method's name, so a chain over several lines gives each call its own line.
 
 The dispatcher example, step by step:
 
@@ -112,9 +112,11 @@ The dispatcher example, step by step:
 Members the compiler generates are not in the index. A call to one resolves to its **owner type** (`reference`) and carries its type on through a chain:
 
 - Lombok `@Getter`, `@Setter`, `@Data`, `@Value` on the type or the field: `getX()` / `isX()` / `setX(..)` → field `x`, its declared type continues the chain;
-- Lombok `@Builder`: `T.builder()` → `T`;
+- Lombok `@Builder` (and `@SuperBuilder`): `T.builder()` and `toBuilder()` → `T`'s builder, every builder method (a field's setter whatever its `setterPrefix`, a `@Singular` adder) → the builder again, `build()` → `T`, `Object`'s methods their JDK type; a method of a builder class written in the source (`T.TBuilder`) is a `call` to it;
 - records: the accessor `r.name()` → the component's type; the canonical constructor;
-- enums: `values()`, `valueOf(..)`.
+- enums: `values()`, `valueOf(..)`, `name()`, `ordinal()`;
+- annotation elements: `ann.type()` on an indexed `@interface` (elements are not symbols);
+- a constructor that is not declared (the default one, Lombok's `@…ArgsConstructor`, a record's canonical one): `new T(..)` keeps only its `instantiate` edge to `T`; an implicit `super(..)` is a `reference` to the superclass. When `T` declares constructors and none takes the arguments, the call counts unresolved, unless `T` is a record or has a Lombok constructor annotation.
 
 `argus` uses `@Getter` (22 imports), `@Data` (5), `@Builder` (20) and `@RequiredArgsConstructor` (25; its final fields are already field `reference`s); it has no records.
 
@@ -122,13 +124,19 @@ Members the compiler generates are not in the index. A call to one resolves to i
 
 Candidates by argument count (varargs: at least n − 1), then by the simple type names of the arguments whose types are known. When more than one candidate is left: an edge to each, marked `ambiguous`, rather than a guess.
 
+An argument's type is known for literals, `new T(..)`, casts, typed variables, fields and resolved calls, and for a few JDK results that often decide an overload (`toString()`, `String.valueOf(..)`, `Collections.singletonList(..)`, `List.of(..)`, …). An argument fits a parameter when the types are equal (an exact match), when it is an indexed subtype, a number for a number or box (or for `Number`, `Comparable`, `Serializable`), `null` for a reference type, or when either side is unknown or a library type that could be a super type; a `String`, a box or `UUID` parameter takes nothing else (final types, also not an indexed type), a primitive no reference. As in Java, the candidates of fixed arity are tried first (a varargs method taking an array), the varargs ones only when none fits. Every candidate is checked, a single one too: when no candidate takes the arguments, the call goes to a method the index does not have (from `Object` or a library superclass) and makes no edge. Of several candidates, the most exact matches win — but only when every argument's type is known; an unknown argument (a lambda parameter, a library chain) leaves them all, ambiguous. A method reference names no arity: every method of that name is a candidate (`Util::twice` with two overloads is two ambiguous edges).
+
 ### Where resolution stops
 
 No edge, counted as unresolved:
 
 - a chain through a library type: `repo.findById(id).map(..)` stops after `findById`, because `Optional#map` is not in the index; same for `Stream`, `List#get`;
 - an untyped lambda parameter: `list.forEach(m -> m.consume())` (a method reference `forEach(this::dispatch)` does resolve);
-- a generic type variable: a method returning `T`.
+- a generic type variable: a method returning `T` (`Bearer<T>#getPayload()` called on a `SecurityMethodAddMessage extends Bearer<SecurityData>`: the type argument is not substituted);
+- a method that may be inherited from a library: a call on an indexed type that does not have it (`repository.findById(..)` on a Spring Data interface, `getClass()`), and an unqualified `m()` in a class whose superclass chain leaves the index (`class Worker extends Thread`, `new TimerTask() { .. }`) — the search stops there instead of trying the enclosing class;
+- calls in an anonymous or local class to its own methods (they are not symbols), and unqualified `Object` / `Enum` methods in a class that does not declare them;
+- a receiver typed by a bounded type variable (`<T extends Msg> void send(T m) { m.type(); }`): the bound is not in the facts (open #48);
+- a pattern variable outside its `if`'s then-branch (`if (!(o instanceof Foo f)) return; f.go();`): Java's flow scoping is not followed.
 
 `argus` has 35 lambdas and 15 `.stream()` chains; 6.4 measures how many call sites this costs.
 
@@ -218,7 +226,7 @@ Authoritative wording and *done when* in [`plan.md`](./plan.md), Phase 6.
 ## Measuring
 
 - **Usage golden set** (6.4): about 15 `argus` symbols — types, public and private methods, an interface method, a Lombok getter, a T4 consumer — with their true direct users in main sources, from an IDE's *Find usages*. Kept outside git like `golden-argus.toml` (D-bl) and checked against the index first, so a renamed symbol fails loudly. Reported: precision and recall of direct users per symbol and overall; every miss classified (lambda, library chain, generics, other).
-- **Coverage:** the share of call sites resolved, unresolved and ambiguous, in the `index` summary.
+- **Coverage:** the share of call sites resolved to a member, implicit (a generated member: only a `reference` to its type), ambiguous and unresolved, in the `index` summary.
 - **Agent trial** (6.7): T4 *with* arm, 5 runs, the D-cs protocol and grading, with a prompt variant describing `used by` and `trace`. Success: the dispatcher in 5 of 5 answers at no higher cost than the 5.5 runs.
 
 ## Alternatives and later work
