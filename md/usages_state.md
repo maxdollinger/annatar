@@ -19,11 +19,81 @@ unique across both files.
 | | |
 | --- | --- |
 | Phase | 6 — Usages — **done** (2026-10-04; 6.1–6.7 and the 6.3a module split done): `edges`, `used by`/`uses` in `show`, `annatar trace`, from tree-sitter without a build (D-cu, confirmed) |
-| Step | 6.7 agent trial (T4) on usages — **done** (graded blind; reviewed, findings fixed): dispatcher 5/5, full marks 5/5 (4/5 under a strict reading), no measurable cost increase vs 5.5 (mean +7 %, median −8 %, p = 1.0); #42 closed. Phase 6 complete. After it: `show` without history (D-eh), measured by a full 40-run re-run of the agent trial — kept (D-ei): with vs without −48 % tokens, −26 % cost, 39 vs 34 / 40 (strict 38), no correctness loss, `show` output −21 % on the calls made (replay); reviewed, findings fixed; next: open items / `plan.md` Later with the product owner |
-| Last updated | 2026-10-04 (D-eh agent trial: full re-run, both arms, D-ei) |
+| Step | 6.7 agent trial (T4) on usages — **done** (graded blind; reviewed, findings fixed): dispatcher 5/5, full marks 5/5 (4/5 under a strict reading), no measurable cost increase vs 5.5 (mean +7 %, median −8 %, p = 1.0); #42 closed. Phase 6 complete. After it: `show` without history (D-eh), measured by a full 40-run re-run of the agent trial — kept (D-ei): with vs without −48 % tokens, −26 % cost, 39 vs 34 / 40 (strict 38), no correctness loss, `show` output −21 % on the calls made (replay); reviewed, findings fixed. Then a test build with `show --history` disabled (D-ej): a small with-arm re-run (T2–T4 × 3) found no correctness change (18/18) but agents replace `--history` with `git log` on the why-tasks: T2 / T3 cost +67 / +46 %, T4 unchanged (exploratory, n = 3) — so `--history` stays; next: open items / `plan.md` Later with the product owner |
+| Last updated | 2026-10-05 (D-ej re-run recorded; `--history` kept) |
 | Baseline | `argus` index and warm cache in `.annatar-local/argus/` (rerun with `--offline`: 0 chat calls); 5.5 T4 *with* runs for 6.7 in `.annatar-local/agent-trial/main-55/` |
 
 ### Done
+
+- **Agent re-run on `show` without `--history` (D-ej), small, with arm
+  only.** *Protocol:* a D-ej amendment appended to the private
+  `protocol.md` before any run (fixed 22:05:30, before the first run):
+  T2, T3, T4 × 3 reps = 9 runs (`main-ej/`), rep-major; *with* =
+  `run.py --with-prompt nohistory` (new: the `brief` prompt with only the
+  `show` bullet changed to "description, parent, children, file and
+  lines.", no `--history`; every other line byte-identical, +1 Python
+  test, 20); Claude Code 2.1.289, `claude-sonnet-5` in every run's
+  `modelUsage`, effort, tools, limits, task prompts, key, rubric and
+  strictness as D-eh; `/Repos/argus` at 8f4664a, `git status` unchanged
+  after every run, auto-memory empty; index `data-real` unchanged. Wrapper
+  `bin-ej/annatar` execs a *copy* of a fresh release build of 1b8c4f5
+  (`bin-ej/annatar-1b8c4f5`, per the D-eh wrapper note); checked through
+  it: `show --history` exits 2 (unexpected argument), `show` of the T4
+  consumer prints no commits / tickets (2707 B), `trace` reaches
+  `processMessages() [entry: @Scheduled]`. Baseline: the D-eh *with* runs
+  of T2–T4 (`main-eh/`, 5 each, `brief` prompt, `--history` available),
+  ≈ 0.5 h older. *Grading:* blind, by a separate grader subagent: the 9
+  new answers among the 15 D-eh *with* T2–T4 answers, re-shuffled, new
+  codes, `annatar` → `[index]` (`blind-ej*`). It gave all 15 old answers
+  their published grades (15 / 15, flags included). Four borderlines, all
+  read by me before unblinding, all kept: the old "423-type" T2 answer
+  (strict 1, as in D-eh), an old T3 naming the endpoint by method but not
+  path, a new T3 glossing GREENLAND_ADMIN / SUPER_ADMIN as "org admins /
+  super admins" (strict 1), and the old T4 without the fresh read (1).
+  *Results* (D-ej n = 3 vs D-eh n = 5; mean, median [range]; tokens in
+  thousands; exact two-sided Mann-Whitney 3 vs 5 with mid-ranks, smallest
+  possible p = 0.036, for information only):
+
+  | task | run | tokens | cost $ | tool calls | Bash / Read | show / `--history` | `git` calls | wall s | score |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | T2 | D-ej | 188.3, 159 [154–252] | 0.130 [0.106–0.163] | 9.0 [8–11] | 7.0 / 2.0 | 1.3 / – | 3.3 [3–4] | 25 | 6/6 (reason 3/3) |
+  | | D-eh | 87.3, 78 [73–110] | 0.078 [0.065–0.103] | 5.6 [5–7] | 3.6 / 2.0 | 1.4 / 1.2 | 0 | 17 | 10/10 (reason 5/5) |
+  | T3 | D-ej | 137.3, 145 [121–145] | 0.078 [0.065–0.088] | 6.7 [6–7] | 5.0 / 1.7 | 1.3 / – | 2.7 [2–3] | 22 | 6/6 (reason 3/3) |
+  | | D-eh | 72.4, 69 [67–85] | 0.053 [0.050–0.058] | 4.4 [3–5] | 2.6 / 1.8 | 1.0 / 1.0 | 0 | 15 | 10/10 (reason 5/5) |
+  | T4 | D-ej | 198.5, 195 [171–230] | 0.170 [0.141–0.198] | 10.3 [7–13] | 8.0 / 2.0 | 9.0 / – | 0 | 30 | 6/6 (dispatcher 3/3, fresh read 3/3) |
+  | | D-eh | 185.4, 187 [148–233] | 0.175 [0.158–0.200] | 9.8 [7–13] | 6.6 / 2.8 | 6.4 / 2.4 | 0 | 29 | 9/10 (5/5, 4/5) |
+
+  *Cost:* T2 tokens +116 %, cost +67 %, tool calls +61 % (p = 0.036 /
+  0.036 / 0.036); T3 +90 / +46 / +52 % (p = 0.036 / 0.036 / 0.018); T4
+  +7 / −3 / +5 % (p = 0.79 / 1.0 / 1.0); T2–T4 together tokens +52 %,
+  cost +23 %. Every D-ej run is above every D-eh run on T2 / T3 tokens
+  and cost. On T2 D-ej is costlier than D-eh's *without* arm ($0.100,
+  152 k tokens; T3 *without* $0.125). *Why:* no run tried `--history`
+  (0 usage errors), but **every T2 and T3 run (6 / 6) went to `git`
+  instead** — `git log -p --follow`, `git log -L`, `git log --grep=GRLD-…`,
+  `git show <sha>` (2–4 calls per run; D-eh *with* 0 in all 15) — and
+  quoted the ticket from the commit message (GRLD-98118, GRLD-85889). The
+  `git log -p` output is larger than `--history`'s condensed tickets
+  (cache creation T2 18.7 vs 11.8 k). T4 asks no why and used no `git`;
+  `show` calls 9.0 vs 6.4 (p = 0.07). *Correctness:* 18 / 18 (strict
+  17 / 18) vs D-eh 29 / 30 (the one 1 is T4's fresh read); T2 and T3
+  reasons 3/3 each, T4 dispatcher and fresh read 3/3. *Spend:* $1.13 for
+  9 runs (estimate ≈ $1, abort $4; a watcher was set at $3.5), grader ≈
+  61 k subagent tokens. *Limits:* n = 3, one repository, a ≈ 0.5 h
+  window, the same kind of LLM grades; the effect is large and every run
+  agrees, but the size is rough. *Verdict:* removing `--history` lost no
+  correctness on these tasks, but on why-questions agents replace it with
+  raw `git` history and pay ≈ +50–70 % per run for it; D-ej rationale
+  updated, #56 note. `--history` kept (D-ej).
+
+- **`show --history` disabled for a test, then kept** (product owner,
+  2026-10-04/05, D-ej). A build with the CLI flag removed (commit 1b8c4f5,
+  `show` never printing commits or tickets, code kept) was measured by the
+  re-run above, then dropped by the product owner: `show --history` stays
+  as in D-eh. The run used the `nohistory` prompt of the dropped trial
+  commit cd6d5bb (the `brief` prompt with the `show` bullet ending
+  "description, parent, children, file and lines."); `run.py` in the
+  repository does not have it, the protocol amendment quotes it.
 
 - **Agent trial on `show` without history (D-eh), full re-run** (product
   owner: "repeat the benchmark in full"). *Protocol:* a D-eh amendment
@@ -951,6 +1021,8 @@ unique across both files.
 - The D-eh trial is done (D-ei: keep `show` without history). Open
   from it: #55 (agents opt into `--history` on half their `show` calls),
   #56 (a task whose reason is only in tickets, to test D-eh's risk).
+- The D-ej re-run is done: why-tasks cost more without `--history`
+  (agents use `git log`), so `--history` stays (D-ej).
 - Phase 6 is complete (6.7 reviewed and committed); `plan.md` has no
   further step. The next work is chosen with the product owner from the
   open items and `plan.md` Later — e.g. a multi-hop agent task to measure
@@ -974,6 +1046,7 @@ unique across both files.
 | 6.7 Agent trial (T4) on usages | done | `run.py --with-prompt usages` (files + one bullet on `used by` / `uses` / `trace`, D-ed), `trace` counted apart, +2 Python tests; README agent snippet; 6.7 protocol amendment; T4 × 5 + T1–T3 × 1, *with* arm, `main-67/`; blind grading 30/30 old grades agree; T4 dispatcher 5/5 (5.5: 3/5), full marks 5/5 (2/5), cost +7 % / tokens −10 % (n.s.), `show` 6.4 vs 3.4, `trace` 0; T1–T3 all 2; $1.28; D-ed–D-eg, #42 closed, #46/#47/#49/#50/#51 decided, open #53; review: 11 findings, all addressed — mechanism 3/5 via the consumer's `used by` (one hit via a `LOG_PREFIX` reference, one via search), cost "no measurable increase" (mean +7 %, median −8 %, p = 1.0; cache creation +21 %), T4-with-5 strict 4/5, D-eg premise, prompt cues, deviations disclosed (post-hoc note in `protocol.md`), README scope, doc drift, test CLI order; new open #54 |
 | `show` without history | done | default `show` prints description, usages, parent, children; `--history` adds commits and tickets (D-eh); −47 % output on `argus`; `run.py --with-prompt brief`; agent trial: next row |
 | D-eh agent trial (full re-run) | done | protocol amendment before any run; T1–T4 × 5 × both arms (40, `main-eh/`), `--with-prompt brief`, fresh build of 2e05233; `run.py` counts `show --history` apart (+2 Python tests); blind grading 20/20 old grades agree; with vs without −48 % tokens, −26 % cost (per task significant on T3 only), −49 % tool calls, 39 vs 34 / 40 (strict 38), T2 reason 5/5 vs 0/5 (p = 0.008), T4 dispatcher 5/5 both, full marks 4/5 vs 5/5; `--history` in 14/20 runs (T2, T3 every run), 24 of 48 `show` calls; replay: `show` output −21 % (T4 −24 %) vs the same calls with history; T4 vs 6.7 −25 % tokens / −18 % cost (n.s.); drift: new *without* T1/T2 a third fewer tokens than 5.4 (n.s.); $4.29; D-ei, open #55, #56; review: 7 findings, all addressed — T2/T3 reasons were in the default descriptions, so D-eh's risk was not tested (F1, #56); replay replaces "barely reaches" (F2); borderline disclosure, strict 38/40 (F3); full secondary set (F4); T1/drift wording (F5); README (F6); parser prefixes, `__pycache__/`, wrapper note (F7) |
+| D-ej agent re-run (small) | done | protocol amendment before any run; *with* only, T2–T4 × 3 (9, `main-ej/`), `--with-prompt nohistory` (in the dropped commit cd6d5bb), copied fresh build of 1b8c4f5 (`show --history` exits 2, a test build, dropped); blind grading among the 15 D-eh *with* T2–T4 answers, 15 / 15 old grades agree; 18 / 18 (strict 17); 0 `--history` attempts, but `git log` / `git show` in 6 / 6 T2 / T3 runs; vs D-eh *with*: T2 cost +67 %, T3 +46 % (p = 0.036 each, exploratory), T4 −3 %; $1.13; D-ej: `--history` kept, #56 updated |
 
 ## Measurements
 
@@ -990,6 +1063,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | `show` list sizes on `argus` (654 symbols, `-k 100`) | 6.5 | after the review (members' `overrides` out of type roll-ups, no type `instantiate` beside its constructor's): `used by`: empty 230, median 1 entry, > 20 entries 2 (max 29, `DynamoDBEvent`; `AbstractCache` 18); `uses`: empty 289, median 1, > 20 4 (max 27, `RoleRelationsUpdatedMessageConsumer`); ≈ 14 ms per `show` including process start, so the default cap 20 cuts 2 + 4 lists. Before the review: `used by` > 20 for 5 (max 36, `AbstractCache`, half of it its subclasses' `overrides`), `uses` > 20 for 5 (max 31) |
 | `trace` sizes on `argus` (654 symbols) | 6.6 | after the review (D-eb shallowest expansion), `-k 10`: **default `--depth 6`**: only the root line (no callers) 237, median 3 lines / 538 bytes, p90 37 lines / 8.4 KB, max 75 lines / 16.6 KB (`DynamoDBEvent`), > 20 lines 109, 1.46 MB in all; a `@Scheduled` reached in 238 traces, cut by the depth 36 (33 of them on a `…Dispatcher#` line); a `… N more` in 20; a `(see below)` in 44 (76 lines). By depth (`-k 10`; reaching `@Scheduled` / cut / cut on a dispatcher line / p90 / max / total): 4: 165 / 136 / 92 / 7.2 KB, 27 L / 13.6 KB, 56 L / 1.20 MB; 5: 206 / 76 / 60 / 8.1 KB, 33 L / 15.7 KB, 68 L / 1.37 MB; **6: 238 / 36 / 33 / 8.4 KB, 37 L / 16.6 KB, 75 L / 1.46 MB**; 8: 261 / 2 / 2 / 8.8 KB, 38 L / 19.9 KB, 82 L / 1.50 MB; `--depth 10 -k 100`: 262 / 0, max 103 lines / 23.6 KB (`DynamoDBEvent`), no trace reaches depth 10. ≈ 235 bytes per line, most of it the full path and fqn (#51). The T4 trace 830 bytes, 4 lines; the type `SecurityDataAddEventConsumer` 1947 bytes, 8 lines; `DynamoDBEventService#publishAsync(DynamoDBEvent)` 43 lines / 9.4 KB (all unchanged from depth 4). Before the review (depth 4, `cut` re-expansion only at the limit): reaching `@Scheduled` 162, cut 141, same p90 / max; `--depth 4 -k 20` max 84 lines / 20.6 KB. Before D-dy (type nodes followed, depth 4): max 75 lines / 17.6 KB (`AuthDataEvent`), > 20 lines 97. ≈ 8 ms per trace including process start |
 | `show` without history: agents (D-eh trial) | after 6 | 40 runs, with / without (mean per run): tokens 102 / 198 k, cost $0.091 / $0.123, tool calls 6.05 / 11.9, score 39 / 34 of 40; T2 reason 5/5 / 0/5; T4 dispatcher 5/5 / 5/5, full marks 4/5 / 5/5; `show --history` in 14 of 20 *with* runs (T1 1, T2 5, T3 5, T4 3), 24 of 48 `show` calls; `show` output read per run T1–T4 2.9 / 6.0 / 3.6 / 43.2 KB (from `--history` 1.3 / 5.1 / 3.6 / 22.3; 6.7 T4 46.7); replay of the same calls all with / none with `--history` 3.3 / 6.4 / 3.6 / 56.9 and 2.6 / 3.3 / 1.5 / 33.2 KB, total 55.7 vs 70.2 KB (−21 %, T4 −24 %); T4 vs 6.7: tokens 185 vs 247 k (p = 0.22), cost $0.175 vs 0.214 (p = 0.42); `trace` 0; spend $4.29 |
+| `show` without `--history`: agents (D-ej re-run) | after 6 | 9 *with* runs (T2–T4 × 3) vs D-eh *with* (× 5), mean per run: tokens T2 / T3 / T4 188 / 137 / 199 k vs 87 / 72 / 185 k, cost $0.130 / 0.078 / 0.170 vs 0.078 / 0.053 / 0.175, tool calls 9.0 / 6.7 / 10.3 vs 5.6 / 4.4 / 9.8; `git` calls 3.3 / 2.7 / 0 vs 0 / 0 / 0; score 18 / 18 vs 29 / 30; `--history` attempts 0; spend $1.13 |
 | T4: dispatcher named / full marks / cost vs 5.5 | 6.7 | **dispatcher 5/5 (5.5: 3/5, Fisher p = 0.44; 5.4 symbols 1/5, p = 0.048), full marks 5/5 (2/5, p = 0.17; symbols 0/5, p = 0.008; 4/5 under a strict reading of T4-with-5, p = 0.52 / 0.048), fresh read 5/5 (3/5)**; per run tokens 266 / 174 / 402 / 204 / 191 k, mean 247 k (275 k, −10 %, MW p = 0.42), cost $0.214 (0.200): no measurable increase (mean +7 %, median −8 %, p = 1.0), tool calls 13.2 (14.8, p = 0.41); exploratory: Reads 3.6 (6.2), search 3.4 (3.6), `show` 6.4 (3.4, p = 0.12), `trace` 0, cache creation 35 k (29 k, +21 %, the larger `show` output), wall 33 s (37 s). Dispatcher first seen in the consumer's `used by` in 3 runs, in an incidental `reference` (`LOG_PREFIX`) in `AuthDataEventService`'s `used by` in 1, in a search result in 1. T1–T3 once each: score 2, 72.8 / 78.0 / 74.8 k tokens. `show` output read per T4 run 46.7 KB (26.3 KB), usage sections 14.9 KB, package prefixes in them 4.3 KB; no `trace` call, so no run hit the depth. Spend $1.28 |
 
 ## Decisions and tradeoffs
@@ -1037,6 +1111,7 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | D-eg (6.7, #51) | **Usage lists keep full fqns** (D-dw stands) | Members relative to the file's top-level type, as `search` prints them | The package prefixes in the usage sections the T4 agents read were 4.3 KB per run (≈ 1.1 k tokens, < 2 % of a run's tokens even when re-read on later turns). The fqns the agents passed to `show` were mostly copied from earlier output (about half from usage lines), which a relative name would break; 2 typed ones for an inherited member failed (→ #54, not a naming issue). The usage sections do cost: the T4 cost rose +7 % (n.s.) through cache creation from the larger `show` output (D-ee), but the prefixes are a small part of it |
 | D-eh (after 6, product owner) | **`show` prints no commits and tickets unless `--history` is given.** The description condenses them; `show` is about what a symbol does and where it is used | Keep them (the 5.4 finding: ticket-only reasons found 5/5 with Annatar vs 0/5 without); dedupe a member's history against its parent's; shorten dates and merge commits under their tickets | Product-owner call: description and usages carry the value; −47 % `show` output on `argus` (the 6.7 cost rise came from `show` output). The reasons stay reachable through the description (built from tickets and commits) and `--history`. Risk: an agent no longer sees a ticket-only reason the description dropped (T2) — measured by the next trial; `project.md`'s `show` row updated |
 | D-ei (D-eh trial) | **Keep D-eh (`show` without history by default).** In the full re-run no correctness was lost: the T2 reason 5/5 (vs 0/5 without, p = 0.008; 5/5 in 5.4 / 5.5), T3 5/5, the T4 dispatcher 5/5 (as 6.7); 39 / 40 vs 34 / 40 without (38 / 40 under a strict reading). Agents asked for `--history` on every T2 / T3 run | Revert to history by default (the 5.4 argument: a reason the description dropped stays visible); keep D-eh and drop `--history` from the agent prompt | Nothing measured favours a revert. But the trial did **not** test D-eh's risk: the T2 and T3 reasons were already in the default descriptions (`search`'s file view on T2, `show` on T3), so `--history` was asked for but never needed (→ #56). The cost case is partial: on the `show` calls agents made, D-eh cut the output by 21 % (T4 24 %, replay), about half of what it could, since agents put `--history` on half their `show` calls; T4's −25 % tokens / −18 % cost vs 6.7 is n.s. The case for keeping it is the product owner's (a `show` about what a symbol does and who uses it), with the trial showing no correctness loss. Caveats: one repository, 5 runs per cell, the same kind of LLM grades (20 / 20 old grades matched), the arm inferable from `[index]` in some answers, the *without* arm drifted (T1 / T2 a third fewer tokens than 5.4, n.s.) |
+| D-ej (after the D-eh trial, product owner) | **`show --history` stays** (D-eh unchanged: no history by default, `--history` opt-in). Disabling it entirely was tried as a test build (1b8c4f5: no CLI access, code kept) and measured, then dropped by the product owner | Disable `--history` (no CLI access, code kept); a compact ticket line in the default `show` (key + purpose) | The test build was the product owner's idea: agents added `--history` to half their `show` calls (#55), giving back half of D-eh's saving. **Measured** (D-ej re-run, *with* only, T2–T4 × 3 vs D-eh *with* × 5, exploratory): correctness unchanged (18 / 18; T2 / T3 reasons 3/3), no agent tried `--history`, but on the why-tasks every agent read raw `git` history instead (`git log -p` / `-L` / `--grep`, `git show`; 2–4 calls per run, 0 in D-eh): T2 cost +67 %, T3 +46 % (tokens +116 / +90 %, every run above every D-eh run), T4 (no why) unchanged. So `--history` did not buy correctness on these tasks but was the cheaper way to the ticket (≈ $0.03–0.05 per why-question). n = 3, one repository |
 
 ## Open questions
 
@@ -1052,5 +1127,5 @@ Filled by 6.2–6.7, so the numbers of the phase sit in one place.
 | 52 | `trace`'s default depth 4 cuts 141 of 654 `argus` traces (`-k 100`; 85 at 5, 46 at 6, 2 at 8, none at 10), and of the 669 cut lines in them most fall on the message dispatchers (pactum, cronus, cives, janus: `performMessage` / `dispatch` / `receiveAndDispatchMessages`, one or two hops below their `@Scheduled` `processMessages`) — the T4 pattern, for a symbol a few calls below a consumer — then `AuthDataService#preWarm(UUID)` (35). Raise the default (6 cuts a third as many, at more output) or keep 4 and let agents pass `--depth`? | 6.6 | **closed (6.6 review, F2): default depth 6** (D-ea): after D-eb, 4 → 6 raises the traces reaching `@Scheduled` 165 → 238 and lowers the cut ones 136 → 36 (dispatcher lines 92 → 33) for p90 7.2 → 8.4 KB; 6.7 records whether any trial trace still ends at the depth |
 | 53 | No agent called `trace` in 6.7 (0 of 8 runs, though the prompt named it): on T4 one `used by` hop reaches the dispatcher's file and the rest is in that file. Does `trace` help agents where several hops are needed (a blast-radius task: "what breaks if this changes", `project.md`), or should `show`'s `used by` point to it? | 6.7 | open — Later: needs a multi-hop agent task; nothing built |
 | 54 | `show` of a member inherited from a supertype, named through the subtype (`show '…AuthDataEventService#publishAsync(AuthDataCacheUpdateEvent)'`, declared in `DynamoDBEventService`), is "not found in the index": 2 of 32 `show` calls in the 6.7 T4 runs, both typed by the agent. Resolve it to the declaring type's member, or suggest it in the error? Agent friction (`project.md` agent quality) | 6.7 review | open — Later; nothing built |
-| 55 | Agents add `--history` to half their `show` calls (24 of 48 in the D-eh trial, lumpy: 12 on T4, 7 of them in one run; T4 3 of 5 runs, where the flow needs no history), so D-eh realises about half of its possible `show` saving (replay: −21 % of the agents' `show` output, −42 % possible on T4). Is the prompt's "`--history` adds … purpose" clause the trigger (a why-question invites it)? Options: leave it, word the clause by use ("for why a symbol was built or changed"), or trim history itself (dedupe a member's history against its parent's, the D-eh alternative) | D-eh trial | open — nothing built; needs a prompt variant run (T2 + T4) to separate the wording from the task |
-| 56 | The D-eh trial did not test its own risk: the T2 / T3 reasons were in the default descriptions, so no agent needed `--history`. Does an agent still find a reason that is **only** in tickets (not in any description or search output) when `show` hides history by default? Needs a task built on such a reason (find one in `argus` by checking descriptions against tickets) | D-eh trial review (F1) | open — nothing built; needs a new task, run *with* × 5 (and *without* as control) |
+| 55 | Agents add `--history` to half their `show` calls (24 of 48 in the D-eh trial, lumpy: 12 on T4, 7 of them in one run; T4 3 of 5 runs, where the flow needs no history), so D-eh realises about half of its possible `show` saving (replay: −21 % of the agents' `show` output, −42 % possible on T4). Is the prompt's "`--history` adds … purpose" clause the trigger (a why-question invites it)? Options: leave it, word the clause by use ("for why a symbol was built or changed"), or trim history itself (dedupe a member's history against its parent's, the D-eh alternative) | D-eh trial | open — nothing built; the D-ej re-run shows the opt-in is the cheaper path for why-questions, so trimming the flag's use is not a goal by itself; a prompt variant run (T2 + T4) would still separate the wording from the task |
+| 56 | The D-eh trial did not test its own risk: the T2 / T3 reasons were in the default descriptions, so no agent needed `--history`. Does an agent still find a reason that is **only** in tickets (not in any description or search output) when `show` hides history by default? Needs a task built on such a reason (find one in `argus` by checking descriptions against tickets) | D-eh trial review (F1) | open — nothing built; needs a new task, run *with* × 5 (and *without* as control). Note (D-ej re-run): with `--history` gone, agents fetch the ticket themselves through `git log` / `git show` (6 / 6 T2 / T3 runs) and still found both reasons; a ticket-only reason missing from the descriptions might be found the same way, at the cost measured there. With `--history` kept, the task tests D-eh |
