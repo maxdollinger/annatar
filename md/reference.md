@@ -23,8 +23,6 @@ annatar search "who deletes expired tokens"   # the 5 files whose symbols match 
 annatar search --symbols "who deletes expired tokens"   # the 10 symbols whose descriptions match best
 annatar search -k 3 --kind method --role repository "delete expired tokens"
 annatar --path src/main/java/com/acme/token search "delete expired tokens"   # only symbols in files under the prefix
-annatar eval golden.toml                  # retrieval quality: top-1 / top-5 / MRR of a golden set
-annatar eval-usages usages.toml           # usage quality: precision / recall of each symbol's direct users
 ```
 
 Results go to stdout, logs (`-v`, `RUST_LOG`) to stderr, without colours unless stderr is a terminal. A failing command prints one line, `error: …`, on stderr and exits with 1 (2 for a usage error such as an unknown `--kind`); warnings logged on the way (e.g. a retried request) may come before it.
@@ -115,36 +113,5 @@ com.acme.flow.AddConsumer#consume(Message) [method] src/main/java/com/acme/flow/
 The first line is the symbol, `fqn [kind] file:start-end`. Below it, indented two spaces per level, one line per caller: its fqn, then each way it reaches the symbol above — the edge kind unless `call`, `ambiguous`, `via` the fqn of the overridden method it calls, the lines of the mentions — joined by `; `; the first carries the caller's file, unless it is the file of the symbol it calls, the line it is indented under (`:14, 15` is in `Dispatcher.java`). Under each caller its own callers, depth first. `trace` follows `call`, `instantiate` and `reference` edges, and a method's callers include those of every method it overrides, as in `used by`; `extends`, `implements` and `overrides` are not followed. A type as the symbol traced starts from the callers of the type, its members and nested types (without the ones inside it, as `show`'s `used by`); below it nothing is rolled up, and a type that only mentions the symbol above (a field, a parameter of its header, an annotation) ends its branch with `[type, not followed]` — the members using that field appear as callers of their own; `trace` the type for its users. A type whose field initializer or initializer block calls or instantiates the symbol above runs that code whenever it is constructed: it is marked `[initializer]` and followed through the code constructing it (`new T(..)`, calls of its constructors). Each symbol is expanded once, at its shallowest level (the first such line, depth first), so the depth never hides a caller the tree reaches higher up: a later copy prints `(see above)`, an earlier, deeper one `(see below)`; cycles and diamonds end. An entry point is marked `[entry: @Scheduled]` (the annotations `show` names) on every copy; its callers in code, if any (an inter-bean `@Bean` call, a mapping method reused), are traced like any other's, so usually it ends the branch. A branch ends at a symbol without callers (`[no callers in main sources]`, left out after an entry point; test code is not indexed) or at the depth, `[N callers beyond depth D]` (`--depth`, default 6, 1 to 10). Each symbol lists at most `-k` callers (`--limit`, default 10, 1 to 100), the rest as `… N more`. Out-of-range values are usage errors (exit 2), an unknown fqn an error (exit 1). `trace` reads only `index.db`, one query per symbol reached.
 
 A golden set (questions with the fqns that answer them, the benchmark retrieval is measured against) is a TOML file of `[[question]]` tables (`text`, `expect` = the fqn the question is about first, then acceptable alternates, optional `kind` and `note`; see `src/golden.rs` and `tests/fixtures/golden/sample.toml`). A real set names a private repository's symbols and stays out of git (`.annatar-local/` is ignored). Check it against a full index (a run without `--path`) with `ANNATAR_GOLDEN_SET=<set.toml> ANNATAR_GOLDEN_DATA_DIR=<data dir holding index.db> cargo test real_golden_set -- --ignored`: it fails on any expected fqn the index does not hold and on a first fqn of another kind.
-
-`annatar eval <golden.toml>` measures retrieval against a golden set: it runs that check first (any problem is the error, nothing is searched), then searches every question exactly like `annatar search --symbols "<question>"` (no filter, `-k` hits, default 10, at least 5 because the summary counts top-5) and like `annatar search "<question>"` (the same number of files) and prints one line per question and six summary lines:
-
-```text
-eval: embedding_model=bge-m3:latest dim=1024 parent_description=false k=10
-1. 1 1 file 1 1 [members] com.acme.token.TokenCleanup#deleteExpiredTokens()
-2. 3 1 file 1 1 [types] com.acme.token.TokenCleanup top=com.acme.token.TokenCleanup#deleteExpiredTokens()
-3. - - file 4 2 [types] com.acme.user.User top=com.acme.user.UserService
-all 3: primary top-1 1 top-5 2 mrr 0.444; any top-1 2 top-5 2 mrr 0.667
-types 2: primary top-1 0 top-5 1 mrr 0.167; any top-1 1 top-5 1 mrr 0.500
-members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
-files all 3: primary top-1 2 top-5 3 mrr 0.750; any top-1 2 top-5 3 mrr 0.833
-files types 2: primary top-1 1 top-5 2 mrr 0.625; any top-1 1 top-5 2 mrr 0.750
-files members 1: primary top-1 1 top-5 1 mrr 1.000; any top-1 1 top-5 1 mrr 1.000
-```
-
-the index's embedding settings and `k`; per question its number, the rank of the first expected fqn (primary), the best rank of any expected fqn (`-` = not in the top `k`), after `file` the rank of the primary's file and the best rank of a file holding any expected fqn among the `k` files of the file output, `types` or `members` (by the primary fqn), the primary fqn and, when it is not first, the first hit; then for all questions, types and members the number of questions, top-1 and top-5 counts and the mean reciprocal rank (a miss counts 0, so MRR depends on `k`), for the primary and for any expected fqn, first by symbol, then (`files …`) by file. It needs the `[ollama]` section like `search` and takes no `--path`.
-
-`annatar eval-usages <usages.toml>` measures the edges against a usage golden set: a TOML file of `[[symbol]]` tables (`fqn`, `users` = the true direct users, optional `overridden_by` on a method, `kind` and `note`; see `src/usage_eval.rs` and `tests/fixtures/golden/usages.toml`; a real set stays out of git like a golden set). A direct user is the symbol an edge starts at: the innermost method or constructor around a mention (lambdas and anonymous classes included), else the type; a type's users roll up those of its members and nested types, without the ones inside the type; every kind but `overrides` counts, and the overriding methods are scored apart when `overridden_by` is given. It first checks every fqn of the set against the index (any missing symbol, user or overrider, or a symbol of another kind, is the error naming the entry as `symbol N`, nothing is scored), then prints per symbol `P precision R recall (hits/expected, N found) [types|members] fqn` with the `missed` and `extra` users under it (and `overridden by: …` when listed), then the same pooled over all symbols, types and members (each symbol–user pair counts once, so a user listed under two symbols counts twice) and over the overriders; `-` is a ratio over nothing:
-
-```text
-1. P 1.000 R 0.500 (1/2, 1 found) [members] com.acme.Consumer#consume(AddMessage)
-   missed com.acme.Dispatcher#retry(Message)
-   overridden by: P 1.000 R 1.000 (1/1, 1 found)
-all 1: P 1.000 R 0.500 (1/2, 1 found)
-types 0: P - R - (0/0, 0 found)
-members 1: P 1.000 R 0.500 (1/2, 1 found)
-overridden by 1: P 1.000 R 1.000 (1/1, 1 found)
-```
-
-It reads only `index.db` (no `[ollama]` section needed) and takes no `--path`.
 
 `--path <PREFIX>` is for fast iteration on part of the repo, not for refreshing a slice: a `--path` run still replaces the whole `index.db`, which then holds only that prefix (empty if the prefix matches nothing), and its `edges` only the usages between symbols under it. The run logs a warning saying so, and that usages from outside the prefix are missing; run `annatar index` without `--path` to get the full index back.

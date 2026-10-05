@@ -8,22 +8,18 @@ use clap::error::ErrorKind;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
 use annatar::config::Config;
-use annatar::golden::GoldenSet;
 use annatar::search::{self, Filter, QueryEmbedder};
 use annatar::store::{IndexReader, Store};
 use annatar::summaries::Summarizer;
 use annatar::symbols::{Role, SymbolKind};
 use annatar::tickets::TicketFetch;
-use annatar::usage_eval::{self, UsageSet};
-use annatar::{eval, indexer, show, trace};
+use annatar::{indexer, show, trace};
 
 /// Index a codebase by intent: what each symbol does and why it exists.
 #[derive(Debug, Parser)]
-#[command(name = "annatar", version, about)]
+#[command(name = "annatar", version, about, disable_help_subcommand = true)]
 struct Cli {
-    /// Limit the run to paths under this prefix, for fast iteration. `index`
-    /// still replaces the whole index.db, which then holds only this prefix;
-    /// `search` matches only symbols in files under it.
+    /// Limit `index` and `search` to paths under this prefix.
     #[arg(long, global = true, value_name = "PREFIX")]
     path: Option<PathBuf>,
 
@@ -46,100 +42,59 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Rebuild the index from the repository.
+    /// Build the index for the current repository.
     Index {
-        /// Make no Jira requests, even when Jira is configured; tickets
-        /// already in cache.db are still used.
+        /// Make no Jira requests; cached tickets are still used.
         #[arg(long)]
         offline: bool,
-        /// Make no chat or embedding calls; summaries, descriptions and
-        /// embeddings already in cache.db are still used, the rest get none.
+        /// Make no chat or embedding calls; cached results are still used.
         #[arg(long)]
         no_llm: bool,
     },
-    /// Print a symbol and its children, with its entry-point annotations
-    /// and its direct usages: `used by` (for a type also its members' and
-    /// nested types' users, for a method also the callers of the methods it
-    /// overrides, `via`) and `uses`, grouped by file as `fqn [kind] :lines`.
-    /// The ticket and commit history only with `--history`.
+    /// Print the information about a symbol: its members and usages
+    /// `--history` adds its git and ticket history
+    #[command(verbatim_doc_comment)]
     Show {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository`.
         fqn: String,
-        /// Entries listed per usage list (default 20, at most 100); the
-        /// rest are counted as `… N more`.
+        /// Entries per usage list (default 20, at most 100).
         #[arg(short = 'k', long, value_name = "N", default_value_t = show::DEFAULT_LIMIT, value_parser = parse_show_limit)]
         limit: usize,
-        /// Also list each symbol's commits and tickets (with the model's
-        /// summary and purpose); without it the description stands for them.
+        /// Add the git and ticket history.
         #[arg(long)]
         history: bool,
     },
-    /// Print the transitive callers of a symbol as an indented tree: per
-    /// line a caller as `fqn [kind] [via I#m] file:lines` (the file left out
-    /// when it is the file of the symbol it calls), its own callers below
-    /// it. Follows `call`, `instantiate` and `reference` edges and the
-    /// callers of the methods a method overrides (`via`); a type is traced
-    /// through its members' and nested types' callers. Each symbol is
-    /// expanded once, where it is shallowest (`(see above)` / `(see
-    /// below)`); entry points are marked (`[entry: @A]`); a branch ends at a
-    /// symbol without callers or the depth.
+    /// Print everything that calls a symbol, up to the entry points.
     Trace {
         /// Fully qualified name, e.g. `com.acme.user.UserRepository#find(Long)`.
         fqn: String,
         /// Caller levels below the symbol (default 6, at most 10).
         #[arg(long, value_name = "N", default_value_t = trace::DEFAULT_DEPTH, value_parser = parse_depth)]
         depth: usize,
-        /// Callers listed per symbol (default 10, at most 100); the rest are
-        /// counted as `… N more`.
+        /// Callers per symbol (default 10, at most 100).
         #[arg(short = 'k', long, value_name = "N", default_value_t = trace::DEFAULT_LIMIT, value_parser = parse_show_limit)]
         limit: usize,
     },
-    /// Search symbol descriptions by meaning and print the files of the
-    /// best matches: per file `rank. score path`, its top-level type as
-    /// `kind fqn [role] :start-end` with its description, then its members
-    /// and nested types with their lines; the best matching symbols end with
-    /// `*score`. `--symbols` prints the matching symbols instead.
+    /// Find the code that matches a plain-language query.
     Search {
         /// Plain-language query.
         query: String,
-        /// Only symbols of this kind can match (repeatable); the file output
-        /// still prints each file of a match whole.
+        /// Only symbols of this kind can match (repeatable).
         #[arg(long, value_name = "KIND", value_parser = PossibleValuesParser::new(SymbolKind::ALL.map(|kind| kind.as_str())))]
         kind: Vec<String>,
-        /// Only types with this Spring role and their methods and
-        /// constructors can match (repeatable); the file output still prints
-        /// each file of a match whole.
+        /// Only types with this Spring role and their members can match (repeatable).
         #[arg(long, value_name = "ROLE", value_parser = PossibleValuesParser::new(Role::ALL.map(|role| role.as_str())))]
         role: Vec<String>,
-        /// Number of results: files (default 5, at most 20), or symbols
-        /// with `--symbols` (default 10, at most 100).
+        /// Number of files (default 5, at most 20), or symbols with
+        /// `--symbols` (default 10, at most 100).
         #[arg(short = 'k', long, value_name = "N", value_parser = parse_limit)]
         limit: Option<usize>,
-        /// Print the most similar symbols, each as `rank. score fqn [kind]
-        /// role=… file:start-end` with its description on the next line.
+        /// Print the matching symbols instead of files.
         #[arg(long)]
         symbols: bool,
     },
-    /// Score retrieval against a golden set: every question runs through
-    /// `search --symbols` and `search`; prints per question the rank of its
-    /// first expected fqn and the best rank of any (`-` = not in the top N),
-    /// the same for their files, then top-1, top-5 and MRR for all
-    /// questions, types and members, by symbol and by file.
-    Eval {
-        /// The golden set (TOML, see `golden`).
-        golden: PathBuf,
-        /// Hits searched per question; at least 5, as the report counts top-5.
-        #[arg(short = 'k', long, value_name = "N", default_value_t = search::DEFAULT_LIMIT, value_parser = parse_eval_limit)]
-        limit: usize,
-    },
-    /// Score the usages (`edges`) against a usage golden set: prints per
-    /// symbol the precision and recall of its direct users with the missed
-    /// and extra ones, the overriding methods when the set lists them, then
-    /// precision and recall over all symbols, types and members.
-    EvalUsages {
-        /// The usage golden set (TOML, see `usage_eval`).
-        set: PathBuf,
-    },
+    #[command(hide = true)]
+    Help { command: Option<String> },
 }
 
 fn parse_limit(text: &str) -> Result<usize, String> {
@@ -165,10 +120,6 @@ fn parse_depth(text: &str) -> Result<usize, String> {
     }
 }
 
-fn parse_eval_limit(text: &str) -> Result<usize, String> {
-    parse_limit_from(text, eval::MIN_LIMIT)
-}
-
 fn parse_limit_from(text: &str, min: usize) -> Result<usize, String> {
     match text.parse::<usize>() {
         Ok(limit) if (min..=search::MAX_LIMIT).contains(&limit) => Ok(limit),
@@ -179,9 +130,30 @@ fn parse_limit_from(text: &str, min: usize) -> Result<usize, String> {
     }
 }
 
+fn print_help(name: Option<&str>) {
+    let mut command = Cli::command();
+    command.build();
+    let _ = match name {
+        None => command.print_help(),
+        Some(name) => match command.find_subcommand_mut(name) {
+            Some(subcommand) if !subcommand.is_hide_set() => subcommand.print_help(),
+            _ => command
+                .error(
+                    ErrorKind::InvalidSubcommand,
+                    format!("unrecognized subcommand '{name}'"),
+                )
+                .exit(),
+        },
+    };
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Help { command } = &cli.command {
+        print_help(command.as_deref());
+        return ExitCode::SUCCESS;
+    }
     if let Command::Search {
         limit: Some(limit),
         symbols: false,
@@ -406,32 +378,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 );
             }
         }
-        Command::Eval { golden, limit } => {
-            if cli.path.is_some() {
-                anyhow::bail!("eval scores the whole index and takes no --path");
-            }
-            let ollama = config.ollama.as_ref().context(
-                "eval needs an [ollama] section with the embedding_model the index was built with",
-            )?;
-            let set = GoldenSet::load(golden)?;
-            let reader = IndexReader::open(&config.data_dir).await?;
-            let embedder = QueryEmbedder::from_config(ollama).await?;
-            let outcomes = eval::evaluate(reader.connection(), &embedder, &set, *limit).await?;
-            print!(
-                "{}",
-                eval::settings_line(reader.connection(), *limit).await?
-            );
-            print!("{}", eval::format_report(&outcomes));
-        }
-        Command::EvalUsages { set } => {
-            if cli.path.is_some() {
-                anyhow::bail!("eval-usages scores the whole index and takes no --path");
-            }
-            let set = UsageSet::load(set)?;
-            let reader = IndexReader::open(&config.data_dir).await?;
-            let outcomes = usage_eval::evaluate(reader.connection(), &set).await?;
-            print!("{}", usage_eval::format_report(&outcomes));
-        }
+        Command::Help { .. } => unreachable!("help is handled before the config is loaded"),
     }
     Ok(())
 }

@@ -60,6 +60,37 @@ fn text(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn help_works_as_a_command_without_being_listed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let top = annatar(dir.path(), &["help"]);
+    let show = annatar(dir.path(), &["help", "show"]);
+    let unknown = annatar(dir.path(), &["help", "nope"]);
+
+    assert!(top.status.success(), "{}", text(&top.stderr));
+    assert_eq!(
+        text(&top.stdout),
+        text(&annatar(dir.path(), &["--help"]).stdout)
+    );
+    assert!(
+        !text(&top.stdout).contains("  help "),
+        "{}",
+        text(&top.stdout)
+    );
+    assert!(show.status.success(), "{}", text(&show.stderr));
+    assert_eq!(
+        text(&show.stdout),
+        text(&annatar(dir.path(), &["show", "--help"]).stdout)
+    );
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        text(&unknown.stderr).starts_with("error: unrecognized subcommand 'nope'"),
+        "{}",
+        text(&unknown.stderr)
+    );
+}
+
+#[test]
 fn results_go_to_stdout_logs_and_errors_to_stderr() {
     let dir = workspace();
 
@@ -454,183 +485,6 @@ async fn with_vectors(
         order.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
     }
     (served, order)
-}
-
-#[tokio::test]
-async fn eval_scores_a_golden_set_through_search() {
-    let dir = workspace();
-    let index = annatar(dir.path(), &["index", "--no-llm"]);
-    assert!(index.status.success(), "{}", text(&index.stderr));
-    let (served, order) = with_vectors(dir.path()).await;
-    let mut files: Vec<&str> = Vec::new();
-    for (_, file) in &order {
-        if !files.contains(&file.as_str()) {
-            files.push(file);
-        }
-    }
-    let golden =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/sample.toml");
-    let set = annatar::golden::GoldenSet::load(&golden).unwrap();
-
-    let eval = annatar(dir.path(), &["eval", "-k", "20", golden.to_str().unwrap()]);
-
-    assert!(eval.status.success(), "{}", text(&eval.stderr));
-    let rank = |fqn: &str| order.iter().position(|(other, _)| other == fqn).unwrap() + 1;
-    let file_rank = |fqn: &str| {
-        let file = &order.iter().find(|(other, _)| other == fqn).unwrap().1;
-        files.iter().position(|other| other == file).unwrap() + 1
-    };
-    let mut expected =
-        "eval: embedding_model=embed dim=3 parent_description=false k=20\n".to_string();
-    for (number, question) in set.questions().iter().enumerate() {
-        let primary = rank(question.primary());
-        let any = question.expect().iter().map(|fqn| rank(fqn)).min().unwrap();
-        let primary_file = file_rank(question.primary());
-        let any_file = question
-            .expect()
-            .iter()
-            .map(|fqn| file_rank(fqn))
-            .min()
-            .unwrap();
-        let group = if question.primary().contains('#') {
-            "members"
-        } else {
-            "types"
-        };
-        expected.push_str(&format!(
-            "{}. {primary} {any} file {primary_file} {any_file} [{group}] {}",
-            number + 1,
-            question.primary()
-        ));
-        if primary != 1 {
-            expected.push_str(&format!(" top={}", order[0].0));
-        }
-        expected.push('\n');
-    }
-    let stdout = text(&eval.stdout);
-    assert!(
-        stdout.starts_with(&expected),
-        "{stdout}\nexpected:\n{expected}"
-    );
-    let summaries: Vec<&str> = stdout.lines().skip(set.questions().len() + 1).collect();
-    assert_eq!(summaries.len(), 6, "{stdout}");
-    assert!(
-        summaries[0].starts_with("all 5: primary top-1 "),
-        "{stdout}"
-    );
-    assert!(summaries[1].starts_with("types 2: "), "{stdout}");
-    assert!(summaries[2].starts_with("members 3: "), "{stdout}");
-    assert!(
-        summaries[3].starts_with("files all 5: primary top-1 "),
-        "{stdout}"
-    );
-    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 5);
-}
-
-#[test]
-fn eval_fails_on_a_golden_symbol_missing_from_the_index() {
-    let dir = workspace();
-    let index = annatar(dir.path(), &["index", "--no-llm"]);
-    assert!(index.status.success(), "{}", text(&index.stderr));
-    std::fs::write(
-        dir.path().join("golden.toml"),
-        "[[question]]\ntext = \"Who lists users?\"\nexpect = [\"com.acme.sample.UserController#list()\", \"com.acme.sample.Gone\"]\n",
-    )
-    .unwrap();
-
-    let eval = annatar(dir.path(), &["eval", "golden.toml"]);
-
-    assert_eq!(eval.status.code(), Some(1));
-    assert_eq!(text(&eval.stdout), "");
-    assert_eq!(
-        text(&eval.stderr),
-        "error: the golden set does not match the index: com.acme.sample.Gone is not in the index (\"Who lists users?\")\n"
-    );
-}
-
-#[test]
-fn eval_rejects_limits_below_five() {
-    let dir = workspace();
-    for args in [
-        &["eval", "-k", "4", "golden.toml"][..],
-        &["eval", "-k", "101", "golden.toml"][..],
-    ] {
-        let output = annatar(dir.path(), args);
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert_eq!(text(&output.stdout), "");
-        assert!(
-            text(&output.stderr).contains("expected a number from 5 to 100"),
-            "{}",
-            text(&output.stderr)
-        );
-    }
-}
-
-#[test]
-fn eval_takes_no_path() {
-    let dir = workspace();
-
-    let eval = annatar(dir.path(), &["--path", "src", "eval", "golden.toml"]);
-
-    assert_eq!(eval.status.code(), Some(1));
-    assert_eq!(
-        text(&eval.stderr),
-        "error: eval scores the whole index and takes no --path\n"
-    );
-}
-
-#[test]
-fn eval_usages_scores_the_edges_without_ollama() {
-    let dir = workspace();
-    let index = annatar(dir.path(), &["index", "--no-llm"]);
-    assert!(index.status.success(), "{}", text(&index.stderr));
-    let set = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/usages.toml");
-
-    let eval = annatar(dir.path(), &["eval-usages", set.to_str().unwrap()]);
-
-    assert!(eval.status.success(), "{}", text(&eval.stderr));
-    let stdout = text(&eval.stdout);
-    assert!(
-        stdout
-            .starts_with("1. P 1.000 R 1.000 (4/4, 4 found) [types] com.acme.sample.UserService\n"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.ends_with(
-            "all 4: P 1.000 R 1.000 (12/12, 12 found)\n\
-             types 2: P 1.000 R 1.000 (11/11, 11 found)\n\
-             members 2: P 1.000 R 1.000 (1/1, 1 found)\n\
-             overridden by 1: P - R - (0/0, 0 found)\n"
-        ),
-        "{stdout}"
-    );
-}
-
-#[test]
-fn eval_usages_fails_on_a_renamed_symbol_and_takes_no_path() {
-    let dir = workspace();
-    let index = annatar(dir.path(), &["index", "--no-llm"]);
-    assert!(index.status.success(), "{}", text(&index.stderr));
-    std::fs::write(
-        dir.path().join("usages.toml"),
-        "[[symbol]]\nfqn = \"com.acme.sample.UserService#lookup(Long)\"\nusers = []\n",
-    )
-    .unwrap();
-
-    let eval = annatar(dir.path(), &["eval-usages", "usages.toml"]);
-    let with_path = annatar(dir.path(), &["--path", "src", "eval-usages", "usages.toml"]);
-
-    assert_eq!(eval.status.code(), Some(1));
-    assert_eq!(text(&eval.stdout), "");
-    assert_eq!(
-        text(&eval.stderr),
-        "error: the usage golden set does not match the index: com.acme.sample.UserService#lookup(Long) is not in the index (\"symbol 1\")\n"
-    );
-    assert_eq!(with_path.status.code(), Some(1));
-    assert_eq!(
-        text(&with_path.stderr),
-        "error: eval-usages scores the whole index and takes no --path\n"
-    );
 }
 
 #[tokio::test]
