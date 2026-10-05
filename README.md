@@ -13,6 +13,10 @@ Annatar maps a codebase by **intent**: what each class, method and function does
 - **Fewer tokens** for coding agents, which find relevant code directly
 - **Better agentic coding**, with changes that respect intent and don't break callers
 
+## Key finding
+
+Early tests show that an agent using Annatar spent **roughly half the tokens** and cost **around 30% less** than the same agent without it, without losing correctness. Details and caveats under [POC findings](#poc-findings).
+
 ## POC scope
 
 For this proof of concept, Annatar targets:
