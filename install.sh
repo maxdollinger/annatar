@@ -11,6 +11,16 @@ err() {
   exit 1
 }
 
+confirm() {
+  ( : </dev/tty ) 2>/dev/null || return 0
+  printf '%s' "$1" >/dev/tty
+  read -r answer </dev/tty || answer=""
+  case "$answer" in
+    "" | y | Y | yes | Yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 need() {
   command -v "$1" >/dev/null 2>&1 || err "'$1' is required but not installed"
 }
@@ -40,9 +50,25 @@ target="$arch-$os"
 asset="$BIN-$target.tar.gz"
 
 if [ "$VERSION" = "latest" ]; then
-  base="https://github.com/$REPO/releases/latest/download"
-else
-  base="https://github.com/$REPO/releases/download/$VERSION"
+  url="$(curl -fsSLo /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" ||
+    err "could not look up the latest release"
+  case "$url" in
+    */tag/*) VERSION="${url##*/tag/}" ;;
+    *) err "could not look up the latest release" ;;
+  esac
+fi
+base="https://github.com/$REPO/releases/download/$VERSION"
+
+if [ -x "$INSTALL_DIR/$BIN" ]; then
+  installed="$("$INSTALL_DIR/$BIN" --version 2>/dev/null | cut -d ' ' -f 2)" || installed=""
+  if [ "$installed" = "${VERSION#v}" ]; then
+    echo "$BIN $installed is already installed at $INSTALL_DIR/$BIN."
+    exit 0
+  fi
+  if ! confirm "$BIN ${installed:-(unknown version)} is installed at $INSTALL_DIR/$BIN. Update to ${VERSION#v}? [Y/n] "; then
+    echo "Update cancelled."
+    exit 0
+  fi
 fi
 
 tmp="$(mktemp -d)"
