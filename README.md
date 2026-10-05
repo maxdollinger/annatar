@@ -39,19 +39,25 @@ You need:
 
 - **git** on `PATH`. The repository to index must be a git checkout (history and ticket keys come from it).
 - **Ollama**, running and reachable, with a chat model and an embedding model pulled:
+
   ```sh
   ollama pull qwen3.8
   ollama pull bge-m3
   ```
+
 - **Jira API token** (optional, but without it descriptions get no ticket context). Set it in the environment, never in the config file:
+
   ```sh
   export ANNATAR_JIRA_TOKEN=...
   export ANNATAR_JIRA_EMAIL=you@example.com   # Jira Cloud
   ```
 
+  A scoped Cloud token needs only the scope `read:jira-work` and works only through the Atlassian gateway: `base_url = "https://api.atlassian.com/ex/jira/<cloudId>"`.
+
 ## First index run
 
 1. **Create `annatar.toml`** in the folder you run `annatar` from, or pass `--config <file>`. Relative paths resolve against the file's folder:
+
    ```toml
    repo = "/path/to/your/repo"
    data_dir = ".annatar"           # index.db + cache.db
@@ -65,12 +71,15 @@ You need:
    chat_model = "qwen3.8:latest"
    embedding_model = "bge-m3:latest"
    ```
+
    All options are explained in this repository's [`annatar.toml`](./annatar.toml).
 2. **Add the data directory to `.gitignore`** (`.annatar/`).
 3. **Run the index:**
+
    ```sh
    annatar index
    ```
+
    The first run is slow: the LLM describes every class and method (≈ 2 s per symbol with a local 27B model, ≈ 20 min for 650 symbols). To try one package first: `annatar index --path src/main/java/com/acme/user`.
 
 Rerun `annatar index` whenever the code changes. It rebuilds the index from scratch, but LLM results are cached in `cache.db`, so only new or changed code costs time.
@@ -107,7 +116,3 @@ On one Java/Spring repository (654 symbols, 69 tickets).
 - **Usages** are precise: precision 1.000, recall 0.972 on 54 hand-checked symbols; calls inside lambdas and into libraries stay unresolved.
 - **Agents** (Claude Code, 4 tasks × 5 runs, with vs without): about half the tokens and tool calls, a quarter lower cost (significant on one task of four), 39 vs 34 of 40 correct. Reasons that live in tickets were found only with Annatar (5/5 vs 0/5). With `used by`, all agents found the step in a call chain that search had made them skip before (5/5, earlier 1–3/5). Agents never called `trace`.
 - **Caveats:** small samples, one repository, tasks written by the same author; usages miss reflection, configuration wiring, message brokers and test callers.
-
-## Releasing
-
-Run the **release** workflow in GitHub Actions. It builds the Linux and macOS binaries and publishes them with `install.sh`, tagged `v<version>` from `Cargo.toml` unless you give a tag.
